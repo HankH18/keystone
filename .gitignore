@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+dashboard/dist/
+.vite/
+playwright-report/
+test-results/
+.pnpm-store/
+
+# Env & secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Generated data (regenerated deterministically by `recon.seed`)
+fixtures/*
+!fixtures/.gitkeep
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+
+# CodeGraph index
+.codegraph/
+
+# Confidential source brief — local reference only, never redistributed
+docs/project_*.pdf
+# Process/orchestration docs — the brief excludes process journals from the repo
+docs/TASKS.md
+docs/EXECUTION.md
+# Agent tooling dropped into the workspace — not part of the deliverable
+.agents/
+.claude/skills/
+skills-lock.json

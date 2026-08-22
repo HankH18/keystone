@@ -1,0 +1,28 @@
+@import 'tailwindcss';
+
+/*
+ * Keystone design system (T-0 scaffold).
+ * Tailwind v4: configuration is CSS-first via @theme; there is no
+ * tailwind.config.js and no PostCSS config — @tailwindcss/vite does the work.
+ * Palette/spacing tokens land here in T-10; this file stays intentionally bare.
+ */
+
+@theme {
+  --font-sans:
+    ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica,
+    Arial, sans-serif;
+  /* Confidence/count columns must line up: tabular numerals (T-10, R11). */
+  --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+}
+
+/* Respect users who ask for less motion — WCAG AA by contract, not intention. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

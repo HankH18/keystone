@@ -1,0 +1,56 @@
+[project]
+name = "keystone-service"
+version = "0.1.0"
+description = "Keystone cross-source reconciliation service (package `recon`)."
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "pydantic>=2",
+    "pydantic-settings",
+    "sqlalchemy>=2",
+    "psycopg[binary,pool]",
+    "alembic",
+    "pyyaml",
+    "httpx",
+    "anthropic",
+    "python-dotenv",
+    "structlog",
+    "typer",
+]
+
+[project.scripts]
+recon = "recon.__main__:main"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "pytest-asyncio",
+    "ruff",
+    "hypothesis",
+    "freezegun",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["recon"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.coverage.run]
+source = ["recon"]
+branch = true

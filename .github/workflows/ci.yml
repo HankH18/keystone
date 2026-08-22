@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# A new push to the same ref cancels the previous run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  service:
+    name: service (python 3.12)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: service
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: keystone
+          POSTGRES_PASSWORD: keystone
+          POSTGRES_DB: keystone
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U keystone -d keystone"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      # Service containers are reachable on localhost from the runner.
+      DATABASE_URL: postgresql://keystone:keystone@localhost:5432/keystone
+      # Deterministic, offline defaults: no provider keys exist in CI.
+      LOG_MODE: safe
+      LLM_PROVIDER: mock
+      EMBEDDING_PROVIDER: mock
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+          enable-cache: true
+          cache-dependency-glob: "service/uv.lock"
+
+      # Service containers get no docker-entrypoint-initdb.d mount, so the
+      # equivalent of infra/initdb/01-extensions.sql is applied here to keep
+      # CI's database identical to the local one. Idempotent; migrations (T-3)
+      # also create what they need.
+      - name: Create extensions (mirror of infra/initdb/01-extensions.sql)
+        run: |
+          docker exec ${{ job.services.postgres.id }} \
+            psql -U keystone -d keystone \
+            -c "CREATE EXTENSION IF NOT EXISTS vector;" \
+            -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+
+      - name: uv sync
+        run: uv sync
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: pytest
+        run: uv run pytest
+
+  dashboard:
+    name: dashboard (node 22)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: dashboard
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # pnpm must be installed BEFORE setup-node, or `cache: pnpm` cannot find it.
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: dashboard/pnpm-lock.yaml
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: pnpm lint
+        run: pnpm lint
+
+      - name: pnpm test
+        run: pnpm test
+
+      - name: pnpm build
+        run: pnpm build

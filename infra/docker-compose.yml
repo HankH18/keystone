@@ -1,0 +1,41 @@
+# Keystone local infrastructure.
+#
+# Postgres 16 + pgvector. Host port is 55432 (NOT 5432) to avoid colliding with
+# any system Postgres. Everything in the app reads DATABASE_URL; never hardcode a DSN.
+#
+#   docker compose -f infra/docker-compose.yml up -d
+#   docker compose -f infra/docker-compose.yml exec -T postgres psql -U keystone -d keystone
+
+name: keystone
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: keystone-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: keystone
+      POSTGRES_PASSWORD: keystone
+      POSTGRES_DB: keystone
+      # Deterministic collation: text ordering must not vary by host locale.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      - "55432:5432"
+    volumes:
+      - keystone-pgdata:/var/lib/postgresql/data
+      # Runs once, only when the data volume is empty (first boot).
+      - ./initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keystone -d keystone"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    command:
+      - postgres
+      - -c
+      - max_connections=200
+
+volumes:
+  keystone-pgdata:
+    name: keystone-pgdata
