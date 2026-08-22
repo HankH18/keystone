@@ -50,6 +50,10 @@ select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 testpaths = ["tests"]
 addopts = "-q --strict-markers"
 asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "manifest: seed-generator manifest minimums (A.1 volumes, A.4 counts, A.5 ratios)",
+    "determinism: same seed => byte-identical output tree, across subprocesses",
+]
 
 [tool.coverage.run]
 source = ["recon"]

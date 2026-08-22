@@ -8,7 +8,7 @@ UV      := uv --directory service
 PNPM    := pnpm --dir dashboard
 
 .DEFAULT_GOAL := help
-.PHONY: help up down db-shell seed serve dash suite test lint fmt
+.PHONY: help up down db-shell seed seed-dev serve dash suite test lint fmt
 
 help: ## Show this help
 	@grep -hE '^[a-z-]+:.*?## ' $(MAKEFILE_LIST) | awk -F':.*?## ' '{printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
@@ -26,8 +26,11 @@ db-shell: ## Open psql inside the running Postgres container
 
 ## --- application ----------------------------------------------------------
 
-seed: ## Generate the deterministic dataset + golden exports (dev profile)
-	$(UV) run python -m recon.seed --profile dev
+seed: ## Generate the graded dataset + committed golden/ exports (full profile)
+	$(UV) run python -m recon.seed --profile full
+
+seed-dev: ## Inner-loop dataset (~6k records) into .scratch/ -- never the committed tree
+	$(UV) run python -m recon.seed --profile dev --out ../.scratch/seed-dev
 
 serve: ## Run the FastAPI service on :8000 with reload
 	$(UV) run uvicorn recon.app:create_app --factory --reload --port 8000

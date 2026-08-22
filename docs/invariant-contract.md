@@ -830,6 +830,24 @@ generator/detector drift with no check to catch it. Values are always `canon_val
 
 A key absent from a type's row may not be emitted; a key present in it is required.
 
+**PINNED — the VALUE construction of the three multi-valued keys (ruling 16).** The
+fingerprint hashes the map, so pinning a key without pinning how its value is built
+leaves the two sides free to hash different bytes for the same conflict. All three are
+sequences and reach `canon_value`'s sequence case (§2.5):
+
+| key | value |
+|---|---|
+| `C1.paid_payment_refs` | the sorted `payments:payment:<id>` refs of the person's `paid` payments |
+| `C4.student_guardian_email_norms` | the sorted `norm_email` values of the student's `guardian_email` and `guardian2_email`, NULLs dropped |
+| `C9.deal_person_refs` | **one `anchor_ref` (§4.1) per person** in the mispointed deal's `D2`-resolved person set, sorted — **not** each person's identity-ref set, and not a `person_key` |
+
+`C9.deal_person_refs` is `anchor_ref`s because §5.5 pins C9's `entity_refs` as the
+*enrollment's* person's refs while the mispointed deal's person "appears in
+`observed_values`" — one entry per person is what makes the map's cardinality equal the
+person-set cardinality the predicate tested. Expanding to identity refs would make a
+household deal's entry vary with how many contact records each sibling happens to carry,
+which is not a property C9 is about.
+
 ### 5.5 The catalogue
 
 Detection is evaluated on **generation 3**. Every FP-guard cell cites the §10 construction constraint
@@ -1163,6 +1181,8 @@ golden/manifest-summary.json           counts per conflict type + every A.1/A.4/
   §5.4's field-exactness assertions.
 
 **`golden/clean-sample.json`**
+- The 1,000 entities are a **random draw** (A.6's word) made with the run's own seeded PRNG over
+  the sorted conflict-free population — never a stride walk, which samples construction order.
 - A clean-sample entity is **FLAGGED iff any detected conflict's `entity_refs` INTERSECTS that entity's
   identity refs.** Every such intersection is reported as one false positive. This is the strict reading:
   nothing hides behind a ref-set-equality technicality.
@@ -1178,12 +1198,25 @@ counts asserted **individually**: 40,000 / 15,000 / 25,000 / 22,000 / 18,000.
 separators=(",", ":"))` and a trailing newline. JSONL lines are individually sorted-key encoded and files
 are emitted in a fixed, sorted record order. **Two runs at the same seed must be byte-identical**
 (`sha256` of the whole tree).
-- The seed entrypoint **sets and asserts `PYTHONHASHSEED=0`**.
+- The seed entrypoint **sets and asserts `PYTHONHASHSEED=0`**. "Sets" is literal: the variable is
+  read at interpreter start-up, so `recon/seed/__main__.py` re-`exec`s **once** (guarded by a
+  sentinel) with it in the environment and then asserts the value it ended up with. A caller who
+  passes `PYTHONHASHSEED=random` therefore cannot reach the generator at that hash seed.
 - No `set` or `dict`-keys iteration may reach an output or a selection decision without an explicit
   `sorted()`.
 - `golden/conflicts.json` elements are sorted by `(type, tuple(sorted(entity_refs)))`;
   `golden/clean-sample.json` by identity-ref tuple.
 - The determinism check runs the seed twice in two subprocesses and diffs the tree.
+- **Seed entropy reaches the ADDRESSING, not only the values.** Which records carry which conflict
+  is drawn through the run's own `random.Random(seed)`, so `--seed <n>` moves every primary key in
+  every golden entry, `golden/clean-sample.json` included. `fixtures/malformed/cases.jsonl` is the
+  **only** emitted file that is identical across seeds; a second seed-invariant file is a defect
+  (A.5 forbids conflicts that are "uniformly distributed ... or resolvable by one clever join", and
+  a fixed index partition is exactly that at the addressing level). The committed determinism test
+  asserts every other file differs.
+- **The committed `golden/` tree is regenerated and diffed** against a fresh
+  `--profile full --seed <DEFAULT_SEED>` run, per file by `sha256`, in the test suite CI runs. A
+  stale committed golden set is a build failure, not a silent grading hazard.
 
 ---
 
@@ -1194,9 +1227,17 @@ A.1's five volumes; the brief's floor is ≥100,000) share one code path.
 
 - The dev profile scales **conflict volumes only**: A.4 conflict-class counts and A.1 volumes scale by the
   same ratio, with a floor of 5 per class so all 14 classes stay exercised.
-- **Structural minimums that are not conflict classes are NOT scaled** and are identical in both profiles:
-  malformed cases (≥20), re-asserting/oscillating fields (≥25), multi-child households, deal-less
-  orphans. `fixtures/malformed/cases.jsonl` and the oscillation set are byte-identical across profiles.
+- **Structural minimums that are not conflict classes are NOT scaled** and are identical in both
+  profiles: malformed cases (≥20, emitted as 24) and re-asserting/oscillating fields (≥25).
+  `fixtures/malformed/cases.jsonl` and the oscillation-set size are identical across profiles.
+- **Multi-child households and deal-less orphans DO scale** — flagged in §12 **D-13**. A.4's floors
+  (≥1,000 households of 2–4 children, ≥3,000 leads) exceed the entire dev student budget of 1,250,
+  so holding them at their `full` values is not constructible. Both are asserted against A.4's
+  floors on `full` and asserted merely non-degenerate on `dev`.
+- The oscillation set spans **at least two distinct `field_path`s**, so R4/R16's A→B→A scan is never
+  exercised on one path alone.
+- All of this is asserted by `sc_structural_minimums` and `sc_oscillation_spread`, so the clause is
+  enforced rather than narrated.
 - **All gates, benchmarks, and the committed `golden/` files are `full`.**
 
 ### 9.1 The manifest self-check
@@ -1292,7 +1333,7 @@ relaxation at all. This is the definition the word carries everywhere else in th
 | `G4` | Dot and `+alias` local-part variation is emitted **only** on `gmail.com` / `googlemail.com`. On every other domain, all addresses belonging to one person are byte-identical after `norm_email` — **except** the 250 planted C4, whose variant address is deliberately on a non-gmail domain so it cannot normalize back (§5.6 C4). No other plant relaxes this. | `sc_email_variant_domain` |
 | `G5` | (a) Within any shared-guardian-email group, `(first_norm, last_norm)` is unique across children. (b) Globally, the `namedob` key `(first_norm, last_norm, dob_norm)` **resolves to at most one *person*** — at most one `appdb.student`, and at most one `crm.contact` **per person** — except the exact tuples the C3 planter (2 contacts, 1 student) and the C10 planter (2 students, allowlisted) registered. **A contact and the student it represents sharing the tuple is required, not a violation:** `G1` draws the contact's name from the student and `contact.dob` is present on ~70% and equal, so ≈15,000 record pairs share a triple by construction — and `L3` (§4.2) links on exactly that triple, so a record-level uniqueness reading would make `L3` unfireable and the 250 C4 plants unplantable. Records whose `dob_norm` is `None` are compared on `(first_norm, last_norm)` alone for this test and must likewise resolve to at most one person. Name corpus pinned at `NAME_CORPUS_MIN` (2,000 × 1,000 = 2×10⁶ pairs against 43,175 name-bearing records, load factor 2.2%) so rejection sampling terminates. | `sc_namekey_unique` |
 | `G6` | Every non-planted payment satisfies one of `P1..P3`. A payment omits **both** `external_ref` and the `metadata` name pair only when it is a planted C2. The self-check runs `P1..P3` over the emitted fixtures and asserts `count(unattributable) == planted C2 count`. | `sc_payment_attributable` |
-| `G7` | Planted C11 pairs are `≤ C11_PLANT_MAX_SECONDS` (300s) apart. **Every** legitimate same-person, same-`type`, same-`amount_cents` repeat payment is `≥ LEGIT_REPEAT_MIN_SECONDS` (1200s) apart. Sibling simultaneous `fee` payments are permitted and resolve to different persons. | `sc_repeat_guard_band` |
+| `G7` | Planted C11 pairs are `≤ C11_PLANT_MAX_SECONDS` (300s) apart. **Every** legitimate same-person, same-`type`, same-`amount_cents` repeat payment is `≥ LEGIT_REPEAT_MIN_SECONDS` (1200s) apart. Sibling simultaneous `fee` payments are permitted and resolve to different persons. **The guard's population is required to be non-empty**: a budgeted set of two-child tri-source households pays two identical `deposit`s inside C11's 600s window — costing no extra payment record, since the two base payments already exist — so a detector that drops C11's "both resolve to the same person" clause produces a loud false-positive population rather than one stray pair. | `sc_repeat_guard_band`, `sc_c11_guard_population` |
 | `G8` | No 3-or-more-way collision is ever created: exactly two contacts per C3 email collision and exactly two payments per C11 key collision, so the pair count is never ambiguous. | `sc_no_nway_collision` |
 | `G9` | Deals are allocated **from the C1 invariant, not from a volume target**: *every* person with (≥1 `paid` payment ∧ ≥1 enrollment) has ≥1 `D2`-linked deal **except** (a) the planted C1 set (500) and (b) the 75 C8 children dropped from `crm`, who have no gen-3 CRM contact and therefore cannot appear in any `associated_contact_ids` — their mechanically-implied C1 is suppressed by `PRECEDENCE` 8 (§12 D-6). The two sets are disjoint, so the deal-less-with-payment population is exactly **575**. C1 plants sit in single-child households so no household deal can reach them. Every C9 plant's household retains a live gen-3 `D2` deal, so a stale pointer never manufactures a C1. | `sc_deal_coverage` |
 | `G10` | No person has a `paid` payment and zero enrollments. | `sc_paid_implies_enrollment` |
@@ -1315,7 +1356,7 @@ relaxation at all. This is the definition the word carries everywhere else in th
 | `G27` | Malformed cases are **structural only** and live exclusively in `fixtures/malformed/cases.jsonl`; `duplicate PK` is exercised on a CRM contact only; the oversized case is exactly `MAX_PAYLOAD_BYTES + 1` bytes; no malformed record is counted in any §5 total. | `sc_malformed_isolation` |
 | `G28` | No identity ref sampled into `golden/clean-sample.json` appears in the `entity_refs` of **any** entry in `golden/conflicts.json`. | `sc_clean_sample_disjoint` |
 | `G29` | `deal.pipeline` equals the `program` of the household's **anchor enrollment** — the enrollment of `household_anchor_student(k)` (§4.8), which is deterministic for a 2–4 child household where "primary" is not — on **every** deal, planted or not, and is always a value in the committed vocabulary. No plant relaxes it; no rule compares it (§5.9). | `sc_pipeline_consistency` |
-| `G30` | `PYTHONHASHSEED=0` is set and asserted; no unsorted `set`/`dict` iteration reaches an output or a selection decision; two subprocess runs at the same seed produce a byte-identical tree. | `sc_determinism` |
+| `G30` | `PYTHONHASHSEED=0` is set and asserted; no unsorted `set`/`dict` iteration reaches an output or a selection decision; two subprocess runs at the same seed produce a byte-identical tree. **`sc_determinism` evaluates its clauses at run time and may never be a literal:** (a) it asserts `PYTHONHASHSEED == '0'`; (b) it re-reads every file the run just emitted and asserts its `sha256` equals the value `fixtures/manifest.json` is about to claim; (c) it replays the whole of pass 2 — `recon.er.resolve`, the sweep and `build_golden` — over a **shuffled** gen-3 snapshot and requires the three golden documents byte-identical, which is what turns "no unsorted iteration reaches a selection decision" into an assertion. Byte-identity across two *subprocesses* is the one clause delegated to `tests/seed/test_determinism.py`, because a process cannot observe another process's hash seed. | `sc_determinism` |
 | `G31` | **Two-pass seeding.** Pass 1 constructs and materializes all source records (clean + planted). Pass 2 runs the **actual `recon/er.py` cascade** over those records and derives **every** `entity_refs` value in `golden/` from `conflict_refs` applied to that output. **Plantability assertion:** (a) for every planted conflict, every link the conflict's rule presumes exists in `entity_links` and was made by the **expected `method`** (§4.7); (b) the derived refs are byte-identical to the refs being written; (c) the **§9.1(b) construction sweep** — one assertion per conflict class, evaluated over **every** generation-3 entity, planted, unsampled and clean alike, and explicitly **not** merely over `golden/clean-sample.json` — finds exactly the planted population for that class, before and after the `PRECEDENCE` filter. The sweep uses the shared `normalize`/`reference`/`er` modules only; the generator still **never** executes `rules/*.sql`. **An unplantable conflict, or a surplus of one in any sweep column, FAILS THE SEED RUN; it is never written into `golden/`.** | `sc_plantability`, `sc_construction_sweep` |
 | `G32` | `golden/conflicts.json` is written through the same `PRECEDENCE` filter the detector applies, and `(type, tuple(sorted(entity_refs)))` is unique across the file. | `sc_precedence_filtered`, `sc_golden_key_unique` |
 | `G33` | The §11 allocation holds exactly: the five A.1 volumes, `tri_source_student_fraction ∈ [0.68, 0.72]`, `fully_consistent_entity_fraction ≥ 0.85`, all fourteen A.4 minimums, and A.5's ≥10% compound ratio over **surviving** entries. | `sc_volumes_and_ratios` |
@@ -1559,6 +1600,8 @@ Every place this contract interprets or reinterprets a normative brief paragraph
 | **D-10** | A.4: "Multi-child households: ≥1,000 households with 2–4 children" | 3,000 multi-child households. | Not a divergence in kind — the brief states a minimum — but it is a forced one: at 1,000 households the 15,000-deal budget cannot cover the paid+enrolled population (§11.7). Recorded so the number is not mistaken for an arbitrary choice. |
 | **D-12** | A.1 record volumes (40,000 / 15,000 / 25,000 / 22,000 / 18,000) | The five volumes are asserted on the **generation-3** snapshot. Generations 1–2 carry 75 extra CRM contacts, 50 extra deals and 75 extra payments — the records deliberately deleted before gen 3 to represent C8's dropped sibling and C9's non-existent deal. | Under D-9's snapshot semantics a deletion is representable **only** as presence in an earlier generation and absence from gen 3. Asserting the A.1 volumes on gen 1 instead would force gen 3 to 39,925 / 14,950 / 17,925 and break §§11.4/11.6/11.7, which already net the deletions to the A.1 figures. |
 | **D-11** | `docs/TASKS.md` T-2 non-goal: "generator never imports detector code other than `normalize`" | **Superseded.** `recon/er.py` joins `recon/normalize.py` and `recon/reference.py` on the shared-module list; the generator runs the real ER cascade in pass 2 (`G31`). | Discovered-reality pivot. Not a brief divergence — an internal-doc divergence, recorded here so it is not re-litigated. Detection remains independently graded: the generator still never runs the invariant rules, and which conflicts exist and of what type remains independent ground truth from the plant record. |
+| **D-13** | A.4: "Multi-child households: **≥1,000**" and "**≥3,000** CRM contacts are legitimately deal-less leads", read by §9 as structural minimums identical in both profiles | Identical in both profiles for malformed cases and the oscillation set; **scaled with volume** for multi-child households and deal-less leads. `full` carries 3,000 households and 18,175 leads (both far above A.4); `dev` carries the same structures at 1/20 scale. | A.4's floors are stated "per 100k records". At the dev profile's 1,250 students, 1,000 multi-child households of 2–4 children would need ≥2,000 children — the clause is arithmetically unsatisfiable, not merely undesirable. §9 previously asserted the stronger reading with nothing binding it, so the dev profile silently scaled two of the four while the text said none scaled. Both readings are now asserted by `sc_structural_minimums`, whichever applies to the profile. |
+| **D-14** | §7 / A.4: "gen 1 = baseline; **gen 2 changes and adds records**; gen 3 = current state" | Generation 2 **changes** records (the oscillation set) and adds **none**. The only cross-generation deltas in the dataset are the ≥25 A→B→A `crm.contact` fields and the three deletion sets (75 contacts, 50 deals, 75 payments) present in gens 1–2 and absent from gen 3. | Under D-12 the A.1 volumes are asserted on the **generation-3** snapshot and §9.1(a) pins the gen-1 counts at exactly gen-3-plus-deletions (40,075 / 15,050 / 18,075). A record that first appears in gen 2 and survives into gen 3 would make the gen-1 count *lower* than that, contradicting a clause the self-check enforces; a record present only in gen 2 would change nothing observable, since invariants read generation 3 only. Recorded rather than papered over: the `raw_records` per-generation append path and the `source_generations` ledger are exercised with zero arrivals, and a future revision that wants arrivals must move §9.1(a)'s pinned gen-1 numbers first. |
 
 ---
 
@@ -1595,7 +1638,7 @@ Everything v1 asserted that v2 replaces. No v1 section was dropped; §§1–9 al
 
 ## 14. Pinned rulings (v2.1) — the ambiguity ledger
 
-Fifteen places where this document previously required an implementer to guess. Each is now normative
+Sixteen places where this document previously required an implementer to guess. Each is now normative
 text in the section named, and each is bound by a test that fails when the behaviour changes. They are
 collected here so a reader can confirm none was left to convention, and so a future edit that softens
 one is visible as a change to a numbered ruling rather than as a rewording.
@@ -1617,4 +1660,5 @@ one is visible as a change to a numbered ruling rather than as a rewording.
 | 13 | `round()` is banker's rounding, and `G39` forbids any amount at exactly half a cent so the tie-break is unobservable | §2.5, §1.2, §10 `G39` |
 | 14 | `norm_email` on a value with no `@`: trim / strip surrounding quotes / casefold only — never gmail logic | §2.1 |
 | 15 | `household_members` and `KEY_CLASSES` are **exported** shared symbols, with pinned key set and member ordering (resolves MINOR-5's sibling: an unexported shared symbol gets re-implemented) | §4.8, §2.1, §0 |
+| 16 | The **value** construction of the three multi-valued `observed_values` keys — `C9.deal_person_refs` in particular: one `anchor_ref` per resolved person, never identity refs and never a `person_key` | §5.4 |
 | — | `is_identity_ref(ref, *, payment_attributed=False)` — the payment clause is a scoped argument, not an assumption baked into the ref string (resolves MINOR-5) | §4.1 |

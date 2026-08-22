@@ -40,7 +40,10 @@ cd service && uv sync && cd ..
 # 5. Dashboard deps
 cd dashboard && pnpm install && cd ..
 
-# 6. Generate the deterministic dataset + golden exports        (T-2, not yet)
+# 6. Generate the graded 120k-record dataset + committed golden/ exports  (T-2)
+#    `make seed` is `--profile full --seed 20260822` (the canonical committed seed):
+#    it rewrites fixtures/ and golden/ byte-identically. `make seed-dev` is the
+#    ~6k-record inner-loop profile and writes to .scratch/, never to the repo tree.
 make seed
 
 # 7. Run the API on :8000                                        (T-4+, not yet)
@@ -64,7 +67,8 @@ Stop the database with `make down` (the data volume is kept).
 | `make up` | Start Postgres 16 + pgvector, wait for healthy |
 | `make down` | Stop the stack, keep the data volume |
 | `make db-shell` | `psql` into the running container |
-| `make seed` | Deterministic dataset + `golden/` exports _(T-2)_ |
+| `make seed` | Graded 120k dataset + `golden/` exports, `--profile full` _(T-2)_ |
+| `make seed-dev` | ~6k inner-loop dataset into `.scratch/` (never the repo tree) |
 | `make serve` | FastAPI service on `:8000` _(T-4+)_ |
 | `make dash` | Dashboard dev server _(T-10)_ |
 | `make suite` | Grading harness + scorecard _(T-14)_ |
@@ -104,8 +108,16 @@ docs/         SPEC / DESIGN / TASKS / EXECUTION + policy docs + scorecard
 ## Determinism
 
 The dataset is graded on reproducibility: the same `SEED` must produce a byte-identical dataset,
-conflict set, and confidence vector. The default seed lives in `.env.example` (`SEED`); changing
-it invalidates `golden/` and requires a regeneration. _(Details: T-2.)_
+conflict set, and confidence vector. The canonical committed seed is **20260822** (also in
+`.env.example` as `SEED`); changing it invalidates `golden/` and requires a regeneration.
+
+- `python -m recon.seed` sets and asserts `PYTHONHASHSEED=0` (re-`exec`ing once if the caller
+  set anything else), so hash randomization can never move a byte.
+- Only `--profile full` may write the repository's `fixtures/` and `golden/`; `--profile dev`
+  refuses unless an explicit `--out` is given.
+- `tests/seed/test_committed_golden.py` regenerates the full profile at the canonical seed and
+  asserts every committed `golden/*.json` matches sha256 — a stale committed golden set is a
+  test failure, not a silent grading hazard. _(Details: T-2.)_
 
 ---
 
