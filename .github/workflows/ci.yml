@@ -37,8 +37,18 @@ jobs:
           --health-retries 12
 
     env:
-      # Service containers are reachable on localhost from the runner.
+      # This job runs directly on the runner VM (no `container:`), so the
+      # postgres service container is reached through its PUBLISHED port on
+      # localhost — 5432, per the `ports:` mapping above. The hostname
+      # `postgres` would only resolve for a job that itself runs in a container
+      # on the same docker network, and 55432 is purely the local
+      # infra/docker-compose.yml host mapping. Neither applies here.
       DATABASE_URL: postgresql://keystone:keystone@localhost:5432/keystone
+      # The schema tests skip themselves when DATABASE_URL is unset. That is
+      # correct on a laptop and unacceptable here: it let 76 of 81 tests skip
+      # while CI reported success. This makes a database-less run a hard
+      # failure, so a green from this job means the tests actually executed.
+      KEYSTONE_REQUIRE_DB: "1"
       # Deterministic, offline defaults: no provider keys exist in CI.
       LOG_MODE: safe
       LLM_PROVIDER: mock
@@ -73,6 +83,12 @@ jobs:
 
       - name: ruff format --check
         run: uv run ruff format --check .
+
+      # Must precede pytest. Without it every schema test fails on "DATABASE_URL
+      # points at a database with no Keystone schema" — red, but for the wrong
+      # reason, and it would mask a real regression.
+      - name: alembic upgrade head
+        run: uv run alembic upgrade head
 
       - name: pytest
         run: uv run pytest

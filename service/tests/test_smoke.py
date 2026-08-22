@@ -36,12 +36,37 @@ def _run_suite(service_root: Path, *args: str) -> subprocess.CompletedProcess[st
     )
 
 
-def test_suite_module_exits_zero(service_root: Path) -> None:
+def test_suite_module_runs_its_checks_and_exits_non_zero(service_root: Path) -> None:
+    """The harness runs its registered checks and fails loudly on the unfinished one.
+
+    This assertion replaces ``returncode == 0`` plus ``"no checks yet"``, which
+    was an assertion that the check registry is EMPTY. That was T-0's scaffolding
+    contract (docs/TASKS.md, T-0 acceptance clause 4: *"``python -m recon.suite``
+    exists as a stub that exits 0 with 'no checks yet'"*) and it was replaced
+    when the first real check landed: ``recon.suite.mirror``'s
+    ``mirror-unchanged`` is registered in ``CHECKS``, and DESIGN.md pins the
+    harness as one that *"prints the scorecard and exits non-zero on any
+    failure"*. An assertion that the registry is empty cannot survive the
+    registry being populated, and keeping it would have meant either a red suite
+    forever or deleting the check.
+
+    What is asserted instead is the contract that holds today, and it is
+    deliberately not "exits with some code": exit status exactly 1, the
+    ``mirror-unchanged`` row present and FAILing, the reason naming the module
+    that does not exist yet rather than an infrastructure problem, the tally
+    line, and ``no checks yet`` gone. If the check were quietly unregistered to
+    make the suite green, every one of those goes red.
+    """
     result = _run_suite(service_root)
 
-    assert result.returncode == 0, result.stderr
+    assert result.returncode == 1, result.stderr
     assert "scorecard" in result.stdout.lower()
-    assert "no checks yet" in result.stdout
+    assert "mirror-unchanged" in result.stdout
+    assert "FAIL" in result.stdout
+    assert "not yet implemented" in result.stdout
+    assert "recon.reconciler" in result.stdout
+    assert "0/1 passed" in result.stdout
+    assert "no checks yet" not in result.stdout
 
 
 def test_suite_module_accepts_only_flag(service_root: Path) -> None:
