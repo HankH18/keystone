@@ -6,9 +6,10 @@ Normative for the seed generator (`recon.seed`), the entity-resolution layer (`r
 rule set (`rules/*.sql`), and the grading harness (`recon.suite`). It exists so the **generator and the
 detector cannot drift** (R23): both derive from this document and from the *same* code modules —
 
-- `recon/normalize.py` — normalization + match keys
+- `recon/normalize.py` — normalization + match keys, `QUOTE_CHARS`, `KEY_CLASSES`
 - `recon/reference.py` — enum maps, `GRADE_ORDER`, fee schedule, `COMPARED_FIELDS`, `SENSITIVE_FIELDS`,
-  `PRECEDENCE`, `canon_value`, `household_key`, `conflict_refs`, committed constants
+  `PRECEDENCE`, `canon_value`, `fingerprint`, `fix_target`, `household_key`,
+  `household_members_appdb`, `household_members`, `conflict_refs`, committed constants
 - `recon/er.py` — the `L` / `P` / `D` / `E` cascades, `entity_links`, `entity_link_candidates`
 
 Neither side may re-implement any of the three.
@@ -72,7 +73,8 @@ construction (§10 `G26`). C11's window uses `occurred_at` only.
 
 `amount` is the **only** float-typed field in §1. It never reaches `canon_value` as a float: it is
 converted to `Money(round(amount * 100))` at the `stg_crm_deal` boundary and materialized as
-`amount_cents` (§2.5).
+`amount_cents` (§2.5). `round()` is **banker's rounding** and no generated amount may sit on a
+half-cent boundary, so the tie-break can never decide a graded byte (§2.5 ruling 13, `G39`).
 
 ### 1.3 App DB (Postgres) — `student`
 `id` (uuid5), `first_name`, `last_name`, `dob`, `grade`, `guardian_email`, `guardian2_email` (~60% null),
@@ -131,22 +133,64 @@ compute an ordinal. Normalization is materialized upstream by Python into `stg_*
 committed lint test greps the rule files for these tokens and fails the build.
 
 ### 2.1 Normalization (`recon/normalize.py`)
-- `norm_email(e)`: strip, casefold, drop surrounding quotes/backticks. **Only** for `gmail.com` /
-  `googlemail.com`: remove `.` in the local part and truncate at `+`. Never for any other domain
-  (universal dot-stripping collapses legitimately distinct addresses → false positives).
-- `norm_name(s)`: strip, collapse internal whitespace, strip stray `` ` `` `'` `"`, casefold, NFKD-fold
-  accents. **Never** merges different spellings (`Jon` ≠ `John`).
+- `norm_email(e)`: strip, drop **surrounding** quotes/backticks, strip again, casefold. **Only** for
+  `gmail.com` / `googlemail.com`: truncate the local part at `+` and remove `.` from it. Never for any
+  other domain (universal dot-stripping collapses legitimately distinct addresses → false positives).
+- `norm_name(s)`: casefold, NFKD-fold accents (drop combining marks), casefold again, remove every
+  `QUOTE_CHARS` character **wherever it occurs**, collapse internal whitespace, trim. **Never** merges
+  different spellings (`Jon` ≠ `John`).
 - `norm_enum(field, v)`: table-driven from §2.3. Unknown value → `None` **plus** an `unchecked` note;
   never raises.
 - `norm_dob(v)`: `YYYY-MM-DD` or `None`.
 - `match_keys(entity)`: ordered, deterministic — `("ext", <hard id>)`, `("email", norm_email)`,
   `("namedob", (first_norm, last_norm, dob_norm))`. Candidates only; **never** an automatic merge.
+  `KEY_CLASSES = ("ext", "email", "namedob")` is the committed key-class vocabulary (§4.7) and is
+  **exported** from `recon/normalize.py`.
 - **Idempotence is a property test**: `f(f(x)) == f(x)` for every `norm_*`.
+
+**PINNED — `QUOTE_CHARS`, the committed A.3 quote-dirt set (ruling 7).** Exactly these **seven**
+characters, in this committed order, exported from `recon/normalize.py`:
+
+```
+QUOTE_CHARS = "\"'`‘’“”"      # " ' ` U+2018 U+2019 U+201C U+201D
+```
+
+The four curly quotes are part of the committed set, not an implementer's addition: A.3 sprinkles
+typographic quotes through the CRM export and a three-character set would leave `‘Maria’` un-normalized.
+
+**PINNED — quote handling is deliberately ASYMMETRIC between `norm_name` and `norm_email` (ruling 6).**
+This is load-bearing and must not be "made consistent":
+
+| function | quote treatment | consequence |
+|---|---|---|
+| `norm_name` | remove every `QUOTE_CHARS` character **ANYWHERE in the string** | `O'Brien` and `OBrien` normalize **equal** — the same person, spelled two ways, links |
+| `norm_email` | strip `QUOTE_CHARS` from the **SURROUNDING** ends only, never from the interior | `o'brien@corp.com` and `obrien@corp.com` normalize **unequal** — two different mailboxes stay different |
+
+Removing quotes from the interior of an address is the same false-positive class as universal
+dot-stripping (§2.1's gmail scoping, `G4`): it collapses distinct mailboxes belonging to distinct people
+against the clean majority, which is the hardest-graded population. A name is a human spelling of one
+identity; an address is a routing key. The asymmetry is the point.
+
+**PINNED — `norm_email` on a value with no `@` (ruling 14).** Trim, strip surrounding quotes, casefold —
+and **nothing else**. The gmail local-part rules are **never** applied to a value that has no domain to
+scope them to, and the value is never "repaired" into an address. The result is returned verbatim (a
+value that is empty once trimmed is `None`, so a NULL `guardian2_email` stays NULL rather than becoming
+`""` and colliding). The domain is taken with `rpartition("@")`, so the **last** `@` separates it and a
+stray interior `@` can never change the domain.
+
+**PINNED — `match_keys` with a null DOB (ruling 10).** No `namedob` key is emitted unless `first_norm`,
+`last_norm` **and** `dob_norm` are **all** non-`None`. A `(first, last, None)` key is never emitted, in
+any shape, on any entity. Consequence for §4.7: `entity_link_candidates` therefore carries **no**
+`key_class='namedob'` row for a record with a missing or unparseable DOB — such a record is reachable
+only by `ext` or `email`. This is intended: `L3` (§4.2) requires both DOBs non-null, so a partial
+`namedob` key could only manufacture candidate pairs no cascade rule is allowed to accept, and `R-010`
+(C10), which is evaluated over `entity_link_candidates`, would see a `namedob` resolution that no link
+rule could ever have made.
 
 ### 2.2 Committed constants
 | symbol | value |
 |---|---|
-| `KEYSTONE_NS` | fixed uuid5 namespace, committed literal |
+| `KEYSTONE_NS` | **`17733ea0-28dd-5aeb-a266-c62b3689def8`** — fixed uuid5 namespace, committed literal (ruling 1) |
 | `MAX_PAYLOAD_BYTES` | `262144` (256 KiB) — the adapter rejects any single JSONL line exceeding this with the documented 4xx; §7's oversized case is generated at `MAX_PAYLOAD_BYTES + 1` bytes |
 | `PAID_IMPLYING_STAGES` | `{deposit_paid, enrolled}` |
 | `ENROLLMENT_GRADE_FLOOR` | `"K"` (→ `GRADE_ORDER` 0) |
@@ -155,9 +199,49 @@ committed lint test greps the rule files for these tokens and fails the build.
 | `LEGIT_REPEAT_MIN_SECONDS` | `1200` |
 | `NAME_CORPUS_MIN` | `2000` first names × `1000` last names |
 
+**PINNED — `KEYSTONE_NS` is a committed constant, never re-derived (ruling 1).**
+
+```
+KEYSTONE_NS = UUID("17733ea0-28dd-5aeb-a266-c62b3689def8")
+```
+
+Its **derivation, recorded for provenance only**, is
+`uuid5(NAMESPACE_DNS, "keystone.invariant-contract.v2")`. That expression is how the literal was
+obtained once; it is **not** how any code obtains it. `recon/reference.py` holds the literal and every
+`uuid5` in the system hangs off that literal.
+
+The reason this is a constant and not an expression: `KEYSTONE_NS` determines **every `person_key`**
+(§4.1) and **every `appdb.student.id`** (§1.3). Re-deriving it from a seed string means the seed string
+is the real constant, and a whitespace change, a `v2`→`v3` rename or a different namespace argument in
+either the generator or the detector silently re-keys the entire dataset — every student PK, every
+`person_key`, every `field_lineage` row and therefore R16's oscillation dedup. A committed literal
+cannot drift; a re-derivation can. A test asserts **both** the literal **and** that the recorded
+derivation still reproduces it, so the provenance note can never rot into a false claim.
+
 ### 2.3 Committed enum maps
 - **grade** (values): `PK, K, 1..12`. Accepts `Grade 4`, `4`, `4th`, `Fourth`, `grade4`, `Kindergarten`,
   `KG`, `Pre-K`.
+
+  **PINNED — the grade variant families are a CLOSED set (ruling 11).** The eight examples above are
+  examples; the committed table is exactly the families below and **nothing else**. Every raw value is
+  first folded to a *variant key* — NFKD, casefold, drop combining marks, drop every `QUOTE_CHARS`
+  character, then delete all whitespace, `_` and `-` — and looked up in that table.
+
+  | canonical | committed variant family (before folding) |
+  |---|---|
+  | `PK` | `PK`, `Pre-K`, `PreK`, `Pre K`, `Pre-Kindergarten`, `Prekindergarten` |
+  | `K` | `K`, `KG`, `Kindergarten`, `Grade K` |
+  | `1`…`12` | `<N>`, `Grade <N>`, `<N>th` (`1st`/`2nd`/`3rd` for 1–3), `<word>` (`first`…`twelfth`), `Grade <N>th`, `Grade <word>` |
+
+  Because separators are deleted by the folding, `Grade 4`, `grade4`, `GRADE-4` and `grade_4` are one
+  variant key, not four table rows. The table is built at import and **refuses to be ambiguous**: two
+  families folding to the same variant key raise at import rather than resolving by table order.
+
+  **Generator constraint.** The generator may draw grade dirt **only** from this closed set. A
+  well-formed grade string outside it (`"Yr 4"`, `"Form IV"`, `"4e"`) normalizes to `None`, which makes
+  the `grade` comparison `unchecked` (§5.1) rather than a comparison — the planted C6 becomes an
+  unchecked non-event and a golden entry silently turns into a false negative. Drawing outside the
+  closed set is a construction bug, not tolerable dirt.
 - **`GRADE_ORDER`** (ordinal — pinned because *string* comparison is wrong here: `'PK' < 'K'` is FALSE and
   `'1' < 'K'`, `'10' < 'K'`, `'12' < 'K'` are all TRUE):
   ```
@@ -167,6 +251,18 @@ committed lint test greps the rule files for these tokens and fails the build.
   `grade_ord` is materialized as a `stg_*` column. A property test asserts every canonical grade value
   has an ordinal and that `GRADE_ORDER` is injective.
 - **state**: 50-state code map; `TX`/`Tx`/`TEXAS`/`texas` → `TX`. Used by no rule (§1.1).
+
+  **PINNED — exactly the 50 states, and nothing else (ruling 12).** `STATE_VALUES` has **50** entries:
+  the fifty United States' USPS codes. It contains **no `DC`**, no territory (`PR`, `GU`, `VI`, `AS`,
+  `MP`), no `AA`/`AE`/`AP` military codes and no Canadian province. Each code accepts exactly two
+  variants — the code itself and the state's full English name — under the same folding as `grade`
+  (case, whitespace, `_`, `-`), which is what makes `TX`, `Tx`, `TEXAS`, `texas`, `  Texas ` and
+  `New-Hampshire` all resolve.
+
+  **Generator constraint: the generator must not emit `DC`**, nor any other value outside the committed
+  50, in `crm.contact.state`. `crm.contact.state` exists solely to exercise a committed normalizer under
+  unit test (§1.1 reason (c)); an emitted `DC` would normalize to `None` and make that field's only
+  reason for existing untestable.
 - **program**: `Lower School | Middle School | Upper School | Summer Academy`, accepting case,
   leading/trailing whitespace and `_`/`-`/space variants. Used for **both** `enrollment.program` and
   `payment.metadata.program`; materialized as `program_norm` in `stg_enrollment` and `stg_payment`.
@@ -235,13 +331,15 @@ or written to `observed_values`:
 ```
 canon_value(v) -> str
   None        -> "\N"
-  bool        -> "true" | "false"
+  bool        -> "true" | "false"                    # dispatched BEFORE int (bool is a subclass of int)
   int         -> decimal, no separators
   Money(cents)-> integer cents, decimal   # the explicit wrapper type in recon/reference.py
   float       -> FORBIDDEN; raises ValueError
   date        -> "YYYY-MM-DD"
-  timestamp   -> "YYYY-MM-DDTHH:MM:SSZ", normalized to UTC
-  str         -> as-is, with "\x1f" and "\" backslash-escaped
+  timestamp   -> "YYYY-MM-DDTHH:MM:SSZ", normalized to UTC, SECOND precision
+  str         -> as-is, with "\", "\x1f" and "\x1e" backslash-escaped
+  sequence    -> NORMATIVE, see below   # list | tuple | set | frozenset
+  anything else -> raises TypeError; never a Python `repr`
 ```
 
 `money` is **not** a Python type and is therefore not a dispatch case: the only money-shaped value in the
@@ -249,6 +347,89 @@ pinned schemas is `crm.deal.amount` (dollars, float), which is converted to `Mon
 at the `stg_crm_deal` boundary (column `amount_cents`) and only ever reaches `canon_value` in that form.
 A bare `float` reaching `canon_value` **raises** rather than serializing non-deterministically, so the
 §5.4 fingerprint is defined for every value any conflict can carry.
+
+**PINNED — the string escape set and its order.** Exactly three characters are escaped, in exactly this
+order: every backslash becomes two backslashes **first**, then every raw `\x1f` (US, §5.4's intra-section
+joiner) becomes the four text characters `\x1f`, then every raw `\x1e` (RS, the sequence joiner below)
+becomes the four text characters `\x1e`. The backslash pass must run first or the escaping stops being
+reversible. Nothing else is escaped — an email, a name or a ref passes through byte-identical.
+Consequences that are asserted: `canon_value(None) != canon_value("\N")`, no canonical form of a string
+ever contains a raw `\x1f` or a raw `\x1e`, and distinct strings always have distinct canonical forms.
+
+**PINNED — the SEQUENCE case is NORMATIVE, not an implementer extension (ruling 2).** §5.4 pins three
+inherently multi-valued `observed_values` keys — `C1.paid_payment_refs`,
+`C4.student_guardian_email_norms` and `C9.deal_person_refs` — so a serializer with no sequence case is
+an incomplete serializer, and "each side joins them itself" is precisely the generator/detector drift
+this module exists to prevent. `list`, `tuple`, `set` and `frozenset` are **one** case; a sequence is a
+sorted **multiset**, so element order never reaches the digest.
+
+```
+_ELEMENT_SEPARATOR = U+001E (RS)     # committed once, here
+
+canon_value(seq) = RS + concat( e + RS  for e in sorted(elements) )
+
+    elements      = [ escape_element(canon_value(item)) for item in seq ]
+    escape_element = replace each backslash with two backslashes,
+                     THEN replace each raw RS byte with the four TEXT characters  \ x 1 e
+                     (in that order -- the backslash pass must run first)
+    sorted        = ascending by code point, over the ESCAPED element encodings
+```
+
+Worked, so a re-implementer lands on the same bytes: `canon_value([]) == "\x1e"`;
+`canon_value(["a"]) == "\x1ea\x1e"`; `canon_value(["b","a"]) == canon_value({"a","b"}) == "\x1ea\x1eb\x1e"`.
+
+**The encoding is INJECTIVE, and that is a graded property, not a nicety.** The leading `\x1e`, the
+per-element trailing `\x1e` and the escaping of `\x1e` inside every element are each load-bearing:
+
+- **`\x1e` must be in the string escape set.** Without it `canon_value(["a\x1eb"])` and
+  `canon_value(["a","b"])` are the same bytes — two structurally different `observed_values` maps
+  collapsing to one **fingerprint**, which is the idempotency key R16's oscillation dedup and the whole
+  proposal pipeline are keyed on. A collision there silently suppresses a real second proposal.
+- **Elements are re-escaped when embedded**, so a nested sequence's own separators cannot be mistaken
+  for the outer sequence's: `canon_value([["a"],["b"]]) != canon_value(["a","b"])`.
+- **The leading marker plus a trailing marker per element** makes a sequence self-delimiting and
+  distinguishable from every scalar: no scalar canonical form contains a raw `\x1e` (the string case
+  escapes it; the others are digits, letters, `-`, `:`, `T`, `Z` or `\N`). Hence
+  `canon_value([]) != canon_value("")`, `canon_value([""]) != canon_value([])` and
+  `canon_value(["a"]) != canon_value("a")`.
+
+The one conflation `canon_value` **does** accept is between *scalar types* with the same text —
+`canon_value(True) == canon_value("true")`, `canon_value(1) == canon_value("1")`,
+`canon_value(Money(1)) == canon_value(1)`. This is safe and intended: §5.4 pins the `observed_values`
+key set per conflict type and each key carries one fixed type, so no key can present two types.
+Injectivity is required **within a type**, and between a sequence and everything else.
+
+**PINNED — timestamps (ruling 4).** Two clauses, both normative:
+
+1. **Naive is UTC.** A `datetime` with `tzinfo is None` is interpreted as **already UTC** and stamped
+   `Z`. It is **never** interpreted in the local zone of whatever machine happens to run the job — the
+   generator and the detector must produce the same bytes on a laptop in `America/Chicago` and in a
+   container at `UTC`, and §1's `created_at`/`updated_at`/`occurred_at`/`refunded_at` are all ISO-8601 Z
+   values whose naive form has already lost only the marker, not the zone. An aware `datetime` is
+   converted with `astimezone(UTC)` first.
+2. **Second precision; microseconds are TRUNCATED, not rounded.** The pinned format is exactly
+   `%Y-%m-%dT%H:%M:%SZ`. `2010-04-05T01:02:03.999999+00:00` canonicalizes to `2010-04-05T01:02:03Z`.
+   Rounding would let a sub-second difference move a value across a second boundary and change a
+   fingerprint; truncation is monotone and reproducible. Sub-second precision is not carried anywhere in
+   this contract — C11's window (`600s`) and C13's recency clause both compare whole seconds.
+
+**PINNED — money rounding (ruling 13).** `Money.from_dollars(amount) = Money(round(amount * 100))`, and
+Python's `round()` is **banker's rounding** (round-half-to-even), *not* half-up and *not* truncation:
+`round(0.5) == 0`, `round(1.5) == 2`, `round(2.5) == 2`. The distinction from truncation is the common
+case and is graded — `int(0.29 * 100) == 28` where `round(0.29 * 100) == 29`, because `0.29 * 100` is
+`28.999999999999996` in IEEE-754. Using `int()` would mis-state one cent on a large fraction of the
+15,000 deals.
+
+The half-cent tie-break itself is pinned but must be **unobservable**:
+
+> **Generator constraint (`G39`).** No `crm.deal.amount` may sit at exactly a half-cent boundary — i.e.
+> `amount * 100` may never be an exact `.5` in IEEE-754 (`0.125`, `0.375`, `12.005`, …). Every generated
+> amount is drawn from the fee schedule (§2.3, whole cents) or from a C12 offset in whole cents, so the
+> constraint is met by construction and asserted by `sc_amount_no_half_cent`.
+
+The tie-break rule is therefore committed (so the code is defined for every input) yet can never decide
+a graded byte. This is deliberate: half-to-even is correct but surprising, and a dataset that exercised
+it would make the golden set depend on a rule a reviewer would read as a bug.
 
 Conflict rows are assembled in Python from SQL rule output; `rules/*.sql` never build fingerprint or
 `observed_values` strings.
@@ -302,6 +483,29 @@ A **source ref** is one of: `crm:contact:<crm_id>`, `crm:deal:<deal_id>`, `appdb
 **Identity refs** are `appdb:student:<id>` and `crm:contact:<crm_id>`, plus — and only for a payment that
 the cascade attributes to **no** person — that payment's own `payments:payment:<id>`. Deals and
 enrollments are never identity refs.
+
+**PINNED — the shape of `is_identity_ref` (resolving MINOR-5).** The payment clause is a **scoped**
+clause, so the predicate takes the scope as an argument rather than pretending the ref string carries
+it:
+
+```
+is_identity_ref(ref, *, payment_attributed: bool = False) -> bool
+
+  appdb:student:      -> True   always
+  crm:contact:        -> True   always
+  payments:payment:   -> True   iff  payment_attributed is False   # "attributed to NO person"
+  crm:deal:           -> False  always
+  appdb:enrollment:   -> False  always
+```
+
+The default is `payment_attributed=False` because the only place a `payments:payment:` ref legitimately
+appears **inside a person's ref set** is the §5.2 entity "each payment attributed to no person"; a
+payment the cascade *did* attribute contributes its ref to that person's ref set as evidence, never as
+identity. `anchor_ref` therefore reads the default and is correct: a payment ref reaching it is, by
+construction, an unattributed payment's own ref. Passing `payment_attributed=True` is how a caller that
+knows the payment resolved states so, and it makes the C2/C11 refs of §5.4 — which are payment refs —
+non-identity for the clean-sample probe. The flag scopes **only** the payment class; it can never make a
+student or contact ref non-identity.
 
 ```
 anchor_ref(person) = the single lowest-sorted identity ref of the person, under the source preference
@@ -429,6 +633,32 @@ household_members(k)       = household_members_appdb(k)
   one `program`. Committed as `recon/reference.py:household_anchor_student`.
 - Committed as `recon/reference.py:household_key` and imported by generator and detector alike.
 
+**PINNED — `household_members` is EXPORTED, not left as a definition (ruling 15).** All three of
+`household_key`, `household_members_appdb` and **`household_members`** are committed callables in
+`recon/reference.py` and are on its `__all__`. §0's rule is that neither side may re-implement a shared
+symbol, and an unexported symbol that this document nevertheless defines is exactly a symbol a consumer
+will re-implement — the R23 drift this contract exists to prevent. The same applies to
+`KEY_CLASSES` (§2.1, §4.7), which is exported from `recon/normalize.py`.
+
+Its pinned shape:
+
+```
+household_members(students, contacts=()) -> dict[household_key, tuple[member, ...]]
+```
+
+- **The key set is exactly the `household_key` values of the supplied STUDENTS.** A household is defined
+  by app-DB students; a CRM contact whose `norm_email` matches no student's `household_key` is a
+  deal-less lead (§11.4, `G11`) and is a member of **no** household. It never creates a key.
+- Members are ordered **app-DB students first**, ascending by `appdb:student:<id>` ref — so `[0]` is
+  `household_anchor_student(k)`, identically to `household_members_appdb` — **then** CRM contacts,
+  ascending by `crm:contact:<crm_id>` ref. Both orderings are total, so the result never depends on
+  input order.
+- A contact matching a key contributes **one** member per contact record, so a planted C3 duplicate pair
+  (two contacts, one student — §5.6 C3) contributes two contact members. This is a *record* view, not a
+  person view: `|household_members_appdb(k)|` — never `|household_members(k)|` — is what `P3`'s "exactly
+  one child" and C8's "≥2 children" evaluate (above), and mixing the two would let a C3 duplicate change
+  a household's child count.
+
 The generator gives every child in a household the same `guardian_email` **value** (dirty variants are
 fine — they normalize equal), which makes the detector's inference exact (§10 `G1`).
 
@@ -439,10 +669,29 @@ fine — they normalize equal), which makes the detector's inference exact (§10
 ### 5.1 Comparison semantics (normative)
 A `COMPARED_FIELDS` comparison is evaluated **only when both sides normalize to a non-`None` value**.
 `None` on either side yields `verdict='unchecked'` for that comparison and is **never** a disagreement.
-The two `None` causes are **disjoint and exhaustive**, and each has its own pinned reason (§5.8):
-`detail.reason='missing_operand'` when the source value was **NULL**, and
-`detail.reason='unmapped_enum'` when the source value was **present but `norm_enum` could not map it**
-(§7). Both codes are reachable inside `R-006`/`R-014`; neither is ever a conflict.
+
+**PINNED — the `None` causes are THREE, disjoint and exhaustive (ruling 5).** v1 named two, which left
+a present-but-unparseable non-enum value — an unparseable `crm.contact.dob`, a `crm.contact.first_name`
+that is nothing but quote characters — with no reason it truthfully fits: it is not `missing_operand`
+(the source value was **not** NULL) and it is not `unmapped_enum` (no enum was consulted; `norm_dob` and
+`norm_name` are not table-driven). Whichever of the two an implementer picked would be a false statement
+in `detail.reason`, and the generator and detector would pick differently. The closed set is:
+
+| the operand normalized to `None` because… | pinned `detail.reason` |
+|---|---|
+| the source value was **NULL** | `missing_operand` |
+| the source value was **present** and the row is **enum-mapped** (`grade`, `stage`, `lifecycle`) but `norm_enum` could not map it (§7) | `unmapped_enum` |
+| the source value was **present** and the row is **not enum-mapped** (`name_first`, `name_last`, `dob`) and its normalizer returned `None` | `unparseable_value` |
+
+Which of the three applies is a function of **the comparison row** and **whether the source value was
+NULL** — never of a guess about the value's contents. The row's kind is pinned by §2.4's mapper column:
+`norm_enum`-driven rows report `unmapped_enum`, `norm_name`/`norm_dob` rows report `unparseable_value`.
+
+**Reason precedence when BOTH operands are `None`.** One comparison emits one reason, so the causes are
+ordered: `missing_operand` > `unparseable_value` > `unmapped_enum`. A NULL operand is the most specific
+and least ambiguous statement available, so it is reported whenever either side is NULL.
+
+All three codes are reachable inside `R-006`/`R-014`; none is ever a conflict.
 
 The SQL form is pinned as `a IS NOT NULL AND b IS NOT NULL AND a <> b`. The committed rule lint
 additionally **fails any `rules/*.sql` containing `IS DISTINCT FROM`**.
@@ -484,12 +733,66 @@ source (§10 `G24`).
 ```
 fingerprint = sha256(
     type
-  | "\x1f".join(sorted(entity_refs))
-  | "\x1f".join(sorted(disagreeing_fields))
+  | "\x1f".join(sorted(canon_value(r) for r in entity_refs))
+  | "\x1f".join(sorted(canon_value(p) for p in disagreeing_fields))
   | "\x1f".join(f"{k}={canon_value(v)}" for k, v in sorted(observed_values.items()))
 )
 ```
 `observed_values` is a **map**; `canon_value` (§2.5) is used by both sides.
+
+**PINNED — the exact wire format (ruling 3).** Someone re-deriving the digest from this document alone
+must land on the same bytes, so every byte of the payload is normative and none of it is a formatting
+choice:
+
+| element | pinned value | notes |
+|---|---|---|
+| hash | **`sha256`**, lower-case hex, **64 characters** | never `sha512`, never `blake2`, never a truncation |
+| payload encoding | **UTF-8**, no BOM | the payload is built as one `str` and encoded once |
+| **section separator** | the single literal character **`\|`** (U+007C VERTICAL LINE) | exactly four sections, joined by **three** separators; no surrounding whitespace, no trailing separator |
+| section 1 | `type` **verbatim**, e.g. `C11` | the committed `CONFLICT_TYPES` spelling: upper-case `C`, no zero padding, never the `R-0NN` rule id |
+| **intra-section joiner** | the single character **`\x1f`** (U+001F, US) | used inside sections 2, 3 and 4; an empty section is the empty string |
+| section 2 | `sorted(canon_value(r) for r in entity_refs)` joined by `\x1f` | each ref **escaped by `canon_value`** (§2.5) first, then sorted ascending by code point over the **escaped** encodings, **after** de-duplication (§5.5's per-type shape) |
+| section 3 | `sorted(canon_value(p) for p in disagreeing_fields)` joined by `\x1f` | same escaping and ordering as section 2; empty (`""`) for every type but C6 / C14 |
+| **section 4 item form** | **`f"{k}={canon_value(v)}"`** | the key **verbatim**, then one literal `=` (U+003D), then the canonical value. No space either side of the `=`, no quoting of `k`, no `repr`, no JSON |
+| section 4 ordering | `sorted(observed_values.items())` — **by key**, ascending by code point | the map is hashed, so the key set is pinned per type (table above) and an unpinned key is drift |
+
+**PINNED — sections 2 and 3 are ESCAPED, and the payload is therefore INJECTIVE.** Every element of
+sections 2, 3 and 4 passes through `canon_value` (§2.5) before it is joined, so no element can contain a
+raw `\x1f` and the four sections are unambiguously decodable from the payload. Embedding a ref verbatim
+between `\x1f` joiners is exactly the defect §2.5 spells out for sequences: without the escaping,
+
+```
+fingerprint("C8", ["appdb:student:a\x1fappdb:student:b"], ...)
+  ==  fingerprint("C8", ["appdb:student:a", "appdb:student:b"], ...)
+```
+
+— one ref carrying the joiner and two separate refs hash to the **same** digest. Those are two different
+conflicts over two different populations sharing one fingerprint, and the fingerprint is the idempotency
+key R16's oscillation dedup and the whole proposal pipeline are keyed on; a collision there silently
+suppresses a real second proposal. Two independent guards close it: **`make_ref` refuses any
+`natural_key` containing a control character (`\x00`–`\x1f`)**, so a colliding ref is not constructible,
+and the payload escapes its elements anyway for a ref that reaches the hash without passing through
+`make_ref`.
+
+Sorting is over the **escaped** encodings, matching §2.5's sequence case. No committed ref and no
+`COMPARED_FIELDS` path contains a backslash, `\x1f` or `\x1e`, so escaped and raw order coincide for
+every value this contract can produce and **no committed digest literal moves** — but only one of the two
+orders may be pinned, and it is this one.
+
+A worked example, byte for byte — `type="C8"`, one ref, no disagreeing fields, three observed values:
+
+```
+payload = "C8" + "|" + "appdb:student:s7" + "|" + "" + "|"
+        + "dropped_source=crm"        + "\x1f"
+        + "eligible_member_count=3"   + "\x1f"
+        + "household_key=parent@corp.com"
+fingerprint = sha256(payload.encode("utf-8")).hexdigest()
+```
+
+Note that section 3 is present and empty, so the payload contains `...s7||dropped_source...` — three
+separators, always. Golden digest literals for a table of representative conflicts are committed in the
+test suite; they are what makes this table enforceable rather than decorative, because a serialization
+change that no structural assertion notices still moves every digest.
 
 The harness matches a detected conflict to a golden entry on `(type, tuple(sorted(entity_refs)))`. For
 every matched pair it **additionally** asserts equality of `sorted(disagreeing_fields)`,
@@ -582,6 +885,31 @@ written, and by the named checks in §10.
 | C14 | 30 name-only, 10 dob-only, 10 stage-only. Every name/DOB plant carries `contact.external_id == student.id` (`L1` is the only cascade rule that can link a pair whose names or DOBs disagree). Stage-only plants sit in single-child households so no sibling inherits the disagreement. |
 
 ### 5.7 Precedence (committed in `recon/reference.py:PRECEDENCE`, imported by generator *and* detector)
+
+**PINNED — the matching predicate is `entity_refs` set INTERSECTION (ruling 9).** For every suppression
+rule below (rules 2–8), a surviving **winner** entry suppresses a **loser** entry **iff**
+
+```
+set(loser.entity_refs) ∩ winner_refs  ≠  ∅
+```
+
+where `winner_refs` is the union of the `entity_refs` of every surviving entry of the winner's type,
+**filtered by that rule's ref-class prefix where the rule names one**. It is **not** ref-set equality,
+**not** subset containment, **not** a match on the person's anchor ref, and **not** a re-resolution
+through `entity_links`. Set intersection is the same predicate §8 uses to flag a `golden/clean-sample`
+entity ("FLAGGED iff any detected conflict's `entity_refs` INTERSECTS that entity's identity refs"), and
+using one predicate in both places is what keeps the suppression count and the false-positive count
+consistent. Equality would fail immediately: C7 carries `identity refs + appdb:enrollment:<id>` while
+C13 carries `identity refs + payment ref + enrollment ref`, so rule 5 would never fire and the C7
+population would come out at 400 instead of 300.
+
+**PINNED — rule 2 is keyed ONLY on the collapsed `crm:contact:` ref (ruling 9).** C10's `entity_refs`
+are exactly three (§5.5): `crm:contact:<id>` and **two different students'** `appdb:student:<id>`. Only
+the contact ref may enter `winner_refs` for rule 2. Including the student refs would suppress C6/C14/C4
+on **student B** — a person the collapse did not damage, who retains its own separate linked contact
+(`G21`) and whose conflicts are ordinary golden entries. That is a false-negative machine, and it is why
+rule 2 alone carries a ref-class filter while rules 3–8 take the winner's whole ref set.
+
 1. **C14 over C6** — if a person's disagreeing paths are *entirely* sensitive, the conflict is C14 and
    `R-006` must not also emit C6 for that person. Mixed sets emit C6 only, with the sensitive paths listed
    in `disagreeing_fields` (the proposal is still `sensitive_hold`).
@@ -642,7 +970,8 @@ one producing it:
 |---|---|
 | `no_rule_in_scope` | the synthetic `R-000` row (this section) |
 | `missing_operand` | one side of a comparison is `None` because the **source value was NULL** (§5.1) |
-| `unmapped_enum` | one side is `None` because `norm_enum` **could not map a present value** (§5.1, §7) |
+| `unmapped_enum` | one side of an **enum-mapped** comparison row (`grade`, `stage`, `lifecycle`) is `None` because `norm_enum` **could not map a present value** (§5.1, §7) |
+| `unparseable_value` | one side of a **non-enum** comparison row (`name_first`, `name_last`, `dob`) is `None` because `norm_name` / `norm_dob` **could not parse a present value** (§5.1, ruling 5) |
 | `enrollment_unattributed` | `R-013` only, and `R-012` only when its `metadata.program` fallback is also null/unmappable (§4.4) |
 | `deal_unresolved` | `R-009`: `crm_deal_id` names a live deal whose `D2` person set is empty (§5.5 C9) |
 | `source_incomplete` | §5.3: an absence rule skipped because its source's gen-3 load is incomplete |
@@ -717,6 +1046,43 @@ pinned, or "all 250 C4 proposals are `sensitive_hold`" is a hope rather than a c
 | **C4** | **`crm.contact.email`** — the disagreeing field | `sensitive_hold` |
 | C1, C3, C5, C7, C8, C11, C12, C13 | no field write — evidence-only proposal | `escalated` for human review |
 | C10 | no field write — human merge review | `escalated` |
+
+**PINNED — how the fix target is chosen when a disagreeing set MIXES sensitive and non-sensitive paths,
+and which SIDE the template writes (ruling 8, resolving MINOR-8).** The table above says "the disagreeing
+**sensitive** path itself", which names a *set*; the classifier is a pure function of **one** path, so
+the selection must be pinned or the two sides pick differently. `fix_target(type, paths)` is the single
+committed selector and it resolves in this order:
+
+1. **Partition the disagreeing paths by comparison ROW, not by path.** "Mixed" in §5.6 means a
+   `name_*`/`dob` **row** together with a `grade` or `lifecycle` row. A row is *wholly sensitive* when
+   **both** its endpoints are in `SENSITIVE_FIELDS` (§2.4's partition table): `name_first`, `name_last`,
+   `dob` and `stage` are wholly sensitive; `grade` and `lifecycle` are not.
+2. **If any wholly-sensitive row is disagreeing, the target is one of ITS paths** and the proposal is
+   `sensitive_hold`. The sensitive half of a mixed set decides the classification — a mixed C6 is never
+   auto-appliable on the strength of its `grade` half.
+3. **Otherwise the target is the eligible (`AUTO_APPLY_ELIGIBLE`) path** of the disagreeing set —
+   `crm.contact.grade` or `crm.contact.lifecycle_stage`.
+4. **Ties within a step are broken by taking the CRM-side path**, then by code point.
+
+**PINNED — C6 and C14 fix templates write the CRM side.** Whenever the chosen row has one CRM endpoint
+and one app-DB endpoint, the template writes the **`crm.*`** path. This is the convention §6 already
+establishes everywhere else and it is not decoration:
+
+- the eligible rows are already CRM-only — `crm.contact.grade`, and `crm.contact.lifecycle_stage` which
+  §6 pins as "eligible **only** when the proposal writes the CRM side and leaves `appdb.student.status`
+  untouched";
+- C4's committed target is `crm.contact.email`, not the guardian email on the app-DB side;
+- C2 and C9 write the *pointer* on the side that is stale, and the app DB is the system of record for
+  identity fields under §4.6 survivorship (`app DB > CRM > payments`). A reconciler that writes the
+  app-DB endpoint is proposing to overwrite the authoritative record with the less authoritative one.
+
+**This corrects the implementation, which selected `sorted(sensitive_paths)[0]`.** Byte order puts
+`appdb.*` before `crm.*` on every wholly-sensitive row (`appdb.student.dob` < `crm.contact.dob`,
+`appdb.enrollment.stage` < `crm.deal.stage`), so that selector always chose the app-DB side and
+contradicted §6's stated convention. Every affected proposal is still `sensitive_hold`, so nothing was
+mis-*classified* — but the proposed **target path** named the wrong record, and `AUTO_APPLY_ELIGIBLE`,
+the C4 prohibition below and D-7 are all written in terms of the target path. The committed default row
+for C14 is `crm.contact.first_name` for the same reason.
 
 **A C4 proposal may never be re-targeted at `crm.contact.external_id` to escape the classifier.** Writing
 the linkage field instead of the disagreeing field would silently reclassify all 250 C4 proposals as
@@ -958,6 +1324,7 @@ relaxation at all. This is the definition the word carries everywhere else in th
 | `G36` | C1 preconditions of §5.6 hold: single-child household, `paid` `deposit` at schedule amount, one enrollment at `deposit_paid`, `crm_deal_id IS NULL`, zero `D2` deals. | `sc_c1_preconditions` |
 | `G37` | C6/C14 plant composition of §5.6 holds, including the **80 mixed** C6 plants that combine a `name_*`/`dob` path with a `grade` or `lifecycle` path. | `sc_c6_c14_composition` |
 | `G38` | **A paid-implying stage is drawn only where a payment backs it.** Every enrollment whose `stage_funnel ∈ PAID_IMPLYING_STAGES` belongs to a student holding ≥1 `paid` payment of type `deposit`/`tuition` attributed to that enrollment by `E1`/`E2` — **except** exactly four named, budgeted populations: the 300 planted C7, the 100 planted C13 (`PRECEDENCE` 5), the 400 planted C5 (`PRECEDENCE` 4) and the 75 C8 children dropped from `payments` (`PRECEDENCE` 8), totalling **875**. Constructively: paid-implying stages are drawn **only** for children of payments-present (tri-source) households, so every `{appdb, crm}` and every `{appdb}`-only enrollment carries `stage_funnel ∈ {prospect, applied, waitlisted, withdrawn, refunded}` — 4,200 of the 4,600 partial-presence enrollments by `G16` + funnel-uniformity, and the remaining 400 are the C5 plants. Without this constraint C7's FP guard is a restatement of C7's own predicate and thousands of partial-presence enrollments fire it. | `sc_paid_stage_has_payment` |
+| `G39` | **No amount sits on a half-cent boundary (ruling 13).** For **every** `crm.deal.amount` — planted or not, no relaxation — `amount * 100` is never an exact `.5` in IEEE-754, so `Money(round(amount * 100))`'s half-to-even tie-break is **unobservable** in the emitted dataset. Constructively: every amount is a whole number of cents drawn from the fee schedule (§2.3) or offset from it by a whole number of cents (§5.6 C12). The tie-break stays committed so `canon_value`/`Money` are defined for every input, but no golden byte can ever depend on it. | `sc_amount_no_half_cent` |
 
 > **`G31` is the fix for the audit's fourth root cause.** In v1 the generator planted links by
 > construction while the detector had to earn them; a single link the detector failed to make turned one
@@ -1223,3 +1590,31 @@ Everything v1 asserted that v2 replaces. No v1 section was dropped; §§1–9 al
 | C6 min counted per unknown unit | **Pinned** to persons, one conflict per person per generation (§5.2) |
 | FP guards phrased as claims about the world | **Replaced** wholesale by §10's construction constraints, each cited from §5.5 |
 | `docs/DESIGN.md` interface/data-model lines for **ER output**, **survivorship tiebreak**, **fingerprint**, **`field_lineage` keying** and the **completeness ledger** | **Superseded**; this contract governs (§0 order of authority). DESIGN.md has been updated to point here. Its "Decisions & rationale" block is untouched. |
+
+---
+
+## 14. Pinned rulings (v2.1) — the ambiguity ledger
+
+Fifteen places where this document previously required an implementer to guess. Each is now normative
+text in the section named, and each is bound by a test that fails when the behaviour changes. They are
+collected here so a reader can confirm none was left to convention, and so a future edit that softens
+one is visible as a change to a numbered ruling rather than as a rewording.
+
+| # | ruling | pinned in |
+|---|---|---|
+| 1 | `KEYSTONE_NS` is the committed literal `17733ea0-28dd-5aeb-a266-c62b3689def8`; `uuid5(NAMESPACE_DNS, "keystone.invariant-contract.v2")` is recorded as provenance and is never re-derived by code | §2.2 |
+| 2 | The `canon_value` **sequence** case is normative, injective, and committed once | §2.5 |
+| 3 | The fingerprint wire format: `\|` section separator, `\x1f` intra-section joiner, `k=canon_value(v)` item form, verbatim type, sha256/UTF-8 | §5.4 |
+| 4 | Timestamps in `canon_value`: naive is UTC, second precision, microseconds truncated | §2.5 |
+| 5 | New `detail.reason` code `unparseable_value` for a present-but-unparseable **non-enum** operand; the `None` causes are three, disjoint, exhaustive and precedence-ordered | §5.1, §5.8 |
+| 6 | `norm_name` removes quote characters **anywhere**; `norm_email` strips **surrounding** only — asymmetric on purpose | §2.1 |
+| 7 | `QUOTE_CHARS` is the seven-character committed set, curly quotes included | §2.1 |
+| 8 | The C6/C14 fix-target selection when a disagreeing set is mixed, and that C6/C14 templates write the **CRM** side (resolves MINOR-8) | §6 |
+| 9 | The `PRECEDENCE` matching predicate is `entity_refs` set **intersection**; rule 2 is keyed only on the collapsed `crm:contact:` ref | §5.7 |
+| 10 | `match_keys` emits no `namedob` key unless first, last **and** dob are all present, and the consequence for `entity_link_candidates` | §2.1, §4.7 |
+| 11 | The grade variant families are a **closed** set the generator may not draw outside of | §2.3 |
+| 12 | `state` is exactly the 50 states — no DC, no territories — and the generator must not emit `DC` | §2.3 |
+| 13 | `round()` is banker's rounding, and `G39` forbids any amount at exactly half a cent so the tie-break is unobservable | §2.5, §1.2, §10 `G39` |
+| 14 | `norm_email` on a value with no `@`: trim / strip surrounding quotes / casefold only — never gmail logic | §2.1 |
+| 15 | `household_members` and `KEY_CLASSES` are **exported** shared symbols, with pinned key set and member ordering (resolves MINOR-5's sibling: an unexported shared symbol gets re-implemented) | §4.8, §2.1, §0 |
+| — | `is_identity_ref(ref, *, payment_attributed=False)` — the payment clause is a scoped argument, not an assumption baked into the ref string (resolves MINOR-5) | §4.1 |
