@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from recon import __version__
@@ -50,7 +51,25 @@ def test_suite_module_accepts_only_flag(service_root: Path) -> None:
     assert "no checks yet" in result.stdout
 
 
-def test_settings_defaults_are_env_driven_and_secret_free() -> None:
+def test_settings_defaults_are_env_driven_and_secret_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defaults must carry no DSN and no secret.
+
+    The environment is cleared first on purpose: the claim under test is about the
+    *code's* defaults, so reading an inherited DATABASE_URL (as CI legitimately
+    sets) would test the environment instead of the code.
+    """
+    for var in (
+        "DATABASE_URL",
+        "TRIGGER_SECRET",
+        "ANTHROPIC_API_KEY",
+        "LOG_MODE",
+        "LLM_PROVIDER",
+        "SEED",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
     settings = Settings(_env_file=None)
 
     assert settings.log_mode == "safe"
@@ -59,3 +78,14 @@ def test_settings_defaults_are_env_driven_and_secret_free() -> None:
     assert settings.database_url is None
     assert settings.trigger_secret is None
     assert settings.anthropic_api_key is None
+
+
+def test_settings_read_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The same fields must actually be env-driven, not merely absent."""
+    monkeypatch.setenv("DATABASE_URL", "postgresql+psycopg://u:p@h:5432/d")
+    monkeypatch.setenv("LOG_MODE", "full")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.database_url == "postgresql+psycopg://u:p@h:5432/d"
+    assert settings.log_mode == "full"
