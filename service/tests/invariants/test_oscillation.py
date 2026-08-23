@@ -232,21 +232,30 @@ def test_golden_carries_twenty_five_oscillating_c6_entries() -> None:
 
 
 def test_the_gen3_only_pipeline_cannot_answer_oscillating(invariant_run) -> None:
-    """**KNOWN GAP, deliberately asserted red-labelled rather than left silent.**
+    """**A boundary of THIS package's fixture, asserted rather than left silent.**
 
-    The suite ingests generation 3 only, nothing in the repository writes
-    `field_lineage`, and SS7's scan therefore has no input. The engine reports that
-    honestly -- `lineage.rows == 0`, so "no lineage to scan", not "scanned and found
-    none" -- but the answer it persists into the NOT NULL `conflicts.oscillating`
-    column is still 0 against golden's 25.
+    `tests/invariants/conftest.py::ingested_dsn` ingests generation 3 only and does
+    not materialize the identity/lineage layer, so `field_lineage` is empty in this
+    package's database and SS7's scan has no input. The engine reports that honestly
+    -- `lineage.rows == 0`, so "no lineage to scan", not "scanned and found none" --
+    but the answer it persists into the NOT NULL `conflicts.oscillating` column is
+    still 0 against golden's 25.
 
-    Owning ticket: whoever lands generations 1-2 ingest + `field_lineage` population
-    (SS3's `field_lineage(person_key, field_path, generation, value_canon,
-    source_ref)`). `tests/invariants/conftest.py::ingested_dsn` records the same
-    boundary. Nothing in the invariant engine can close it: the scan, its wiring and
-    its tests are all here and green -- the input is not.
+    **This is a property of the fixture, not a missing capability, and this
+    docstring used to say otherwise.** It read "nothing in the repository writes
+    `field_lineage`" and named an owning ticket for building it. That is an inverse
+    phantom control -- claiming a control is absent when it exists.
+    `recon.resolve.materialize(..., lineage_generations=(1, 2, 3))` writes it;
+    `tests/reconciler/conftest.py` builds a database with ~1,279,575 `field_lineage`
+    rows over three generations, and
+    `tests/reconciler/test_oscillation.py::test_the_committed_scan_finds_the_golden_25_without_a_test_planting_them`
+    finds exactly golden's 25 with it. The harness's `oscillation-dedup` row grades
+    the same thing end to end.
 
-    When that ticket lands this assertion is expected to FAIL, and
+    So what is still true, and all that is true, is local: **this** suite's fixture
+    is the gen-3-only one, and widening it here would re-ingest three generations for
+    a scan another package already covers. If that fixture ever does materialize
+    lineage, this assertion is expected to FAIL and
     :func:`test_detected_oscillation_matches_golden_once_lineage_exists` below is the
     one to un-skip.
     """
@@ -268,10 +277,12 @@ def test_detected_oscillation_matches_golden_once_lineage_exists(invariant_run) 
     assert invariant_run.lineage is not None
     if not invariant_run.lineage.had_input:
         pytest.skip(
-            "KNOWN GAP: `field_lineage` is empty because the suite ingests generation "
-            "3 only and nothing in the repository writes it yet (owning ticket: "
-            "generations 1-2 ingest + field_lineage population). SS7's A -> B -> A "
-            "scan is implemented and unit-tested in this file; it has no input."
+            "`field_lineage` is empty in THIS package's database: "
+            "tests/invariants/conftest.py ingests generation 3 only and does not "
+            "materialize the lineage layer, so SS7's A -> B -> A scan has no input "
+            "here. It is not a missing capability -- recon.resolve.materialize "
+            "writes field_lineage, and tests/reconciler runs the committed scan over "
+            "~1.28M real rows across three generations and finds golden's 25."
         )
     golden_keys = {
         (entry["type"], tuple(sorted(entry["entity_refs"])))
