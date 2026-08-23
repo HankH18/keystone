@@ -88,9 +88,35 @@ SET_STATUS = "UPDATE proposals SET status = CAST(:s AS proposal_status) WHERE id
 
 INSERT_PROPOSAL = (
     "INSERT INTO proposals (conflict_id, fingerprint, action, confidence, evidence, "
-    "created_run, target_canonical_id) "
-    "VALUES (:cid, :fp, CAST(:action AS jsonb), 0.95, '{}'::jsonb, :run, :target) RETURNING id"
+    "created_run, target_canonical_id, sensitive, status) "
+    "VALUES (:cid, :fp, CAST(:action AS jsonb), 0.95, '{}'::jsonb, :run, :target, "
+    "        :sensitive, CAST(:status AS proposal_status)) RETURNING id"
 )
+
+
+def _honest_birth(action: str) -> dict[str, object]:
+    """The ``sensitive`` / birth-``status`` pair a row carrying ``action`` must have.
+
+    Migration 0012's ``ck_proposals_sensitive_covers_write_set`` refuses a
+    proposal that claims ``sensitive = false`` while ``action->'set'`` names a
+    contract SS6 ``SENSITIVE_FIELDS`` path, and ``KS002`` then requires such a
+    row to be born ``sensitive_hold``. That is the *point* of 0012 and it is not
+    a narrowing of the vocabulary this file is about: the C4 template is still
+    expressible, as the ``sensitive_hold`` proposal contract SS6 says it is.
+
+    Derived from ``recon.reference`` rather than hard-coded per parameter, and it
+    tolerates a malformed ``action`` -- the negative cases below hand this file
+    deliberate garbage, and their subject is ``ck_proposals_action_vocabulary``,
+    which must be the constraint that rejects them.
+    """
+    from recon.reference import SENSITIVE_FIELDS
+
+    try:
+        written = json.loads(action)["set"]
+        sensitive = any(path in SENSITIVE_FIELDS for path in written)
+    except (TypeError, ValueError, KeyError):
+        sensitive = False
+    return {"sensitive": sensitive, "status": "sensitive_hold" if sensitive else "pending"}
 
 
 # ===========================================================================
@@ -121,6 +147,7 @@ class Approval:
                     "run": TEST_TAG,
                     "target": self.canonical_id,
                     "action": json.dumps({"set": sets}, sort_keys=True),
+                    **_honest_birth(json.dumps({"set": sets}, sort_keys=True)),
                 },
             ).scalar_one()
         with role_connection(ROLE_REVIEW_WRITER) as conn:
@@ -465,6 +492,7 @@ def test_an_unauthorised_citation_is_still_ks001_not_ks010(approval: Approval) -
                 "run": TEST_TAG,
                 "target": approval.canonical_id,
                 "action": '{"set": {"grade": "6"}}',
+                **_honest_birth('{"set": {"grade": "6"}}'),
             },
         ).scalar_one()
     assert approval.status(proposal_id) == "pending"
@@ -576,6 +604,7 @@ def test_recon_writer_cannot_insert_an_action_outside_the_vocabulary(
                 "run": TEST_TAG,
                 "target": approval.canonical_id,
                 "action": action,
+                **_honest_birth(action),
             },
         )
     assert_sqlstate(excinfo.value, CHECK_VIOLATION)
@@ -617,6 +646,7 @@ def test_the_vocabulary_admits_every_committed_fix_template(
                 "run": TEST_TAG,
                 "target": approval.canonical_id,
                 "action": action,
+                **_honest_birth(action),
             },
         ).scalar_one()
     assert stored == json.loads(action)
@@ -635,6 +665,7 @@ def test_the_vocabulary_binds_the_schema_owner_too(approval: Approval) -> None:
                     "run": TEST_TAG,
                     "target": approval.canonical_id,
                     "action": '{"set": "anything"}',
+                    **_honest_birth('{"set": "anything"}'),
                 },
             )
         finally:

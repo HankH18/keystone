@@ -422,6 +422,7 @@ ENTRY_POINTS: Final[tuple[str, ...]] = (
     "recon/seed/__main__.py",  # `python -m recon.seed`
     "recon/suite/__main__.py",  # `python -m recon.suite`
     "recon/bench/__main__.py",  # `python -m recon.bench`
+    "recon/invariants/__main__.py",  # `python -m recon.invariants`
     "migrations/env.py",  # alembic
 )
 

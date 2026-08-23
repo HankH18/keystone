@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -60,61 +61,82 @@ def test_health_reports_real_per_source_and_database_checks(client: TestClient) 
 
 
 def _run_suite(service_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run the harness with NO database and NO writable scorecard directory.
+
+    `DATABASE_URL` is removed deliberately. These are smoke tests: what they
+    assert is that the module runs, prints a scorecard and exits non-zero when a
+    row is red -- not what the graded pass finds. With a database configured the
+    same argv builds the real 100k pipeline, which takes minutes and belongs in
+    `tests/suite/`, not here. `KEYSTONE_SCORECARD_DIR` is redirected so a smoke
+    test can never overwrite the committed `docs/scorecard.*`.
+    """
+    env = dict(os.environ)
+    env.pop("DATABASE_URL", None)
+    env.pop("KEYSTONE_REQUIRE_DB", None)
+    env["KEYSTONE_SCORECARD_DIR"] = str(service_root / ".pytest_cache" / "smoke-scorecard")
     return subprocess.run(
         [sys.executable, "-m", "recon.suite", *args],
         cwd=service_root,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=180,
         check=False,
+        env=env,
     )
 
 
-def test_suite_module_runs_its_checks_and_exits_non_zero(service_root: Path) -> None:
-    """The harness runs its registered checks and fails loudly on the unfinished one.
+def test_suite_module_prints_a_scorecard_and_exits_non_zero_on_a_red_row(
+    service_root: Path,
+) -> None:
+    """The harness prints its scorecard and exits 1 when any row is red.
 
-    This assertion replaces ``returncode == 0`` plus ``"no checks yet"``, which
-    was an assertion that the check registry is EMPTY. That was T-0's scaffolding
-    contract (docs/TASKS.md, T-0 acceptance clause 4: *"``python -m recon.suite``
-    exists as a stub that exits 0 with 'no checks yet'"*) and it was replaced
-    when the first real check landed: ``recon.suite.mirror``'s
-    ``mirror-unchanged`` is registered in ``CHECKS``, and DESIGN.md pins the
-    harness as one that *"prints the scorecard and exits non-zero on any
-    failure"*. An assertion that the registry is empty cannot survive the
-    registry being populated, and keeping it would have meant either a red suite
-    forever or deleting the check.
+    **This replaces two assertions that no longer describe the repository, and
+    the evidence is in the repository rather than in a preference.** The previous
+    version asserted ``"not yet implemented" in stdout`` and ``"recon.reconciler"
+    in stdout`` -- i.e. that ``recon.reconciler`` DOES NOT EXIST, which was
+    ``recon.suite.mirror.reconciler_entrypoint``'s documented state until T-9
+    landed it. ``recon/reconciler.py`` is 1,400 lines with its own test package,
+    so that assertion was already failing before T-14 touched anything, and it
+    could only be made green again by deleting the reconciler.
 
-    What is asserted instead is the contract that holds today, and it is
-    deliberately not "exits with some code": exit status exactly 1, the
-    ``mirror-unchanged`` row present and FAILing, the reason naming the module
-    that does not exist yet rather than an infrastructure problem, the tally
-    line, and ``no checks yet`` gone. If the check were quietly unregistered to
-    make the suite green, every one of those goes red.
+    It also asserted ``returncode == 1`` for a full ``python -m recon.suite`` run
+    with no arguments. After T-14 registered the remaining fourteen rows, that is
+    an assertion that the whole graded harness is permanently red -- and a
+    120-second timeout on a run whose graded pass takes minutes.
+
+    What is asserted instead is the durable half of the original claim, and it is
+    still specific: the module runs, it prints a scorecard, a check that cannot
+    run is a **FAIL** carrying its reason (never a skip), and the process exits
+    non-zero. `tests/suite/` covers the registry and the individual rows.
     """
-    result = _run_suite(service_root)
+    result = _run_suite(service_root, "--only", "golden-diff", "--no-write")
 
-    assert result.returncode == 1, result.stderr
+    assert result.returncode == 1, result.stdout[-2000:]
     assert "scorecard" in result.stdout.lower()
-    assert "mirror-unchanged" in result.stdout
-    assert "FAIL" in result.stdout
-    assert "not yet implemented" in result.stdout
-    assert "recon.reconciler" in result.stdout
-    # The mirror-unchanged row must be the failing one. Deliberately NOT a
-    # suite-wide tally: "0/1 passed" asserted that the registry holds exactly
-    # one check, which T-8c ended by registering the graded spend-cap-burst
-    # row that SPEC gate 1 requires. Pin the row, not the count.
-    mirror_row = next(
-        line for line in result.stdout.splitlines() if line.startswith("mirror-unchanged")
-    )
-    assert "FAIL" in mirror_row, result.stdout
+    assert "SKIP" not in result.stdout
+    row = next(line for line in result.stdout.splitlines() if line.startswith("golden-diff"))
+    assert "FAIL" in row, result.stdout[-2000:]
+    assert "DATABASE_URL" in result.stdout, "the row must name the real cause"
     assert "no checks yet" not in result.stdout
 
 
-def test_suite_module_accepts_only_flag(service_root: Path) -> None:
+def test_suite_module_refuses_an_unknown_only_name(service_root: Path) -> None:
+    """A typo in ``--only`` must not select the empty set and report success.
+
+    **This replaces an assertion that a typo exits 0 with "no checks yet".** That
+    was T-0's scaffolding tolerance -- the flag's own help read "Unknown names
+    are ignored for now" -- and it is the harness's own failure mode: a run that
+    executed ZERO checks and returned success. T-14's contract is "exits non-zero
+    on any failure" over a registry of sixteen rows, and a misspelled ``--only``
+    is the cheapest way to get a green out of it. The name is echoed so the
+    operator can see which spelling was refused.
+    """
     result = _run_suite(service_root, "--only", "not-a-real-check-yet")
 
-    assert result.returncode == 0, result.stderr
-    assert "no checks yet" in result.stdout
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "not-a-real-check-yet" in combined, combined[-1000:]
+    assert "no checks yet" not in result.stdout
 
 
 def test_settings_defaults_are_env_driven_and_secret_free(

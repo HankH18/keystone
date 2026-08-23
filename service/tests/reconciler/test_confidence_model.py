@@ -59,10 +59,21 @@ def test_worked_example_grade_only_c6_linked_by_external_id() -> None:
 
 
 def test_worked_example_all_three_key_classes_agree() -> None:
-    """0.40 + 0.35 + 0.25 + 0.20 - 0.10 = 1.10, clamped to 1.0000.
+    """0.40 + 0.35 + 0.25 + 0.20 = 1.20 -> clamped to 1.0, THEN -0.10 = 0.9000.
 
-    The clamp is recorded on the score rather than hidden: a reviewer seeing 1.0
-    can tell from the packet whether the model reached it or was stopped there.
+    CONTRACT CHANGED, model v1 -> v2 (deliberate; see `confidence.yaml`'s version
+    note). This test previously asserted ``value == 1.0000`` with
+    ``clamped is True``: i.e. it pinned as correct the behaviour in which a
+    conflict's disagreement penalty changes the stored number by NOTHING because
+    the positive evidence had already saturated the clamp. R14 requires that
+    "partial/conflicting evidence lowers it", so the old expectation encoded the
+    defect as the contract. Measured on the graded store, 1,051 of 3,050
+    proposals were clamped and 191 of them carried a penalty that moved the
+    number by zero.
+
+    ``raw_total`` is unchanged (1.10) because it is still the ungrouped sum -- the
+    recorded terms still add up to a recorded number. What moved is where the
+    clamp is applied.
     """
     result = score(
         _signals(
@@ -74,8 +85,28 @@ def test_worked_example_all_three_key_classes_agree() -> None:
         )
     )
     assert result.raw_total == Decimal("1.10")
-    assert result.value == Decimal("1.0000")
-    assert result.clamped is True
+    assert result.positive_total == Decimal("0.80")
+    assert result.negative_total == Decimal("-0.10")
+    # The positive half saturated ...
+    assert result.evidence_total == Decimal("1.0000")
+    assert result.positive_clamped is True
+    # ... and the penalty still came off it.
+    assert result.value == Decimal("0.9000")
+    assert result.clamped is False
+
+    unpenalised = score(
+        _signals(
+            "C6",
+            hard_external_id_agreement=True,
+            normalized_email_agreement=True,
+            name_dob_exact=True,
+        )
+    )
+    assert unpenalised.value == Decimal("1.0000")
+    assert unpenalised.value - result.value == Decimal("0.1000"), (
+        "the disagreement penalty must be visible in the stored number even when "
+        "the positive evidence saturates -- this is the R14 clause v1 erased"
+    )
 
 
 def test_worked_example_evidence_only_conflict_with_corroboration() -> None:
@@ -415,3 +446,168 @@ def test_the_contradiction_clause_is_off_by_default() -> None:
         )
         == ()
     )
+
+
+# =====================================================================================
+# the clamp region -- where R14's "lowers it" clause was previously erased
+# =====================================================================================
+def _cube() -> list[Signals]:
+    """Every signal vector the model can be handed, for every committed type.
+
+    14 types x 2^4 boolean flags x 4 disagreeing-row counts x 2 oscillation
+    states = 1,792 vectors. The penalty tests below run over ALL of them rather
+    than over one hand-picked example in the unclamped interior, which is what
+    let the saturation defect survive a green suite: every committed penalty test
+    built a C6 with exactly one positive signal (0.40 + 0.35 = 0.75), so no case
+    came anywhere near ``clamp_max``.
+    """
+    from recon.reference import CONFLICT_TYPES
+
+    vectors: list[Signals] = []
+    for conflict_type in CONFLICT_TYPES:
+        for flags in range(2**4):
+            for rows in range(4):
+                for oscillating in (False, True):
+                    vectors.append(
+                        _signals(
+                            conflict_type,
+                            hard_external_id_agreement=bool(flags & 1),
+                            normalized_email_agreement=bool(flags & 2),
+                            name_dob_exact=bool(flags & 4),
+                            amount_date_corroboration=bool(flags & 8),
+                            disagreeing_field=rows,
+                            partial_evidence=bool(flags & 16),
+                            oscillation_observed=oscillating,
+                        )
+                    )
+    return vectors
+
+
+@pytest.mark.parametrize("signal", ["partial_evidence", "oscillation_observed"])
+def test_turning_a_penalty_on_strictly_lowers_every_score_above_the_floor(signal: str) -> None:
+    """R14's "partial/conflicting evidence lowers it", over the WHOLE cube.
+
+    This assertion fails against model v1: for the 1,051 clamped proposals in the
+    graded store, turning a penalty on left the quantized score identical. The
+    only permitted exception is the floor -- a score already at ``clamp_min``
+    cannot go lower, which is inherent to a bounded score rather than a defect,
+    and the test asserts that the exception is *only* ever the floor.
+    """
+    from dataclasses import replace
+
+    model = load_model()
+    checked = 0
+    for off in _cube():
+        if getattr(off, signal):
+            continue
+        on = replace(off, **{signal: True})
+        lower, higher = score(on).value, score(off).value
+        if higher == model.clamp_min:
+            assert lower == model.clamp_min
+            continue
+        assert lower < higher, (signal, off)
+        checked += 1
+    assert checked > 500, f"only {checked} non-floor comparisons -- the cube got smaller"
+
+
+def test_each_additional_disagreeing_row_strictly_lowers_it_even_when_saturated() -> None:
+    """The count penalty, over the whole cube, including the saturated region."""
+    from dataclasses import replace
+
+    model = load_model()
+    for vector in _cube():
+        fewer = score(replace(vector, disagreeing_field=vector.disagreeing_field)).value
+        more = score(replace(vector, disagreeing_field=vector.disagreeing_field + 1)).value
+        if fewer == model.clamp_min:
+            assert more == model.clamp_min
+            continue
+        assert more < fewer, vector
+
+
+def test_below_saturation_v2_is_arithmetically_identical_to_v1() -> None:
+    """The change must move ONLY the scores the clamp was flattening.
+
+    v1 was ``clamp01(base + sum(all))``. Wherever ``base + sum(positive)`` fits
+    inside the clamp window, v2 computes the same number -- which is what makes
+    this a repair of the saturated region rather than a new model.
+    """
+    from recon.confidence import clamp
+
+    model = load_model()
+    compared = 0
+    for vector in _cube():
+        result = score(vector)
+        if result.positive_clamped:
+            continue
+        v1_bounded, _ = clamp(result.raw_total, model)
+        assert result.value == v1_bounded.quantize(model.quantum, rounding=model.rounding), vector
+        compared += 1
+    assert compared > 500, f"only {compared} unsaturated vectors compared"
+
+
+def test_the_packet_carries_everything_needed_to_recompute_the_number() -> None:
+    """A reviewer holding one row must not need the repository to check it.
+
+    The packet previously carried no rounding mode, no decimal places, no clamp
+    window and no binding to the file that produced it -- so re-deriving the
+    number meant assuming ROUND_HALF_EVEN at 4 places over [0,1] and trusting an
+    integer ``version`` a human has to remember to bump.
+    """
+    from decimal import Decimal as D
+
+    packet = score(_signals("C6", hard_external_id_agreement=True, disagreeing_field=1)).as_dict()
+    precision = packet["precision"]
+    positive = sum(
+        D(term["contribution"]) for term in packet["terms"] if not term["weight"].startswith("-")
+    )
+    negative = sum(
+        D(term["contribution"]) for term in packet["terms"] if term["weight"].startswith("-")
+    )
+    evidence = min(
+        max(D(packet["base"]) + positive, D(precision["clamp_min"])), D(precision["clamp_max"])
+    )
+    total = min(max(evidence + negative, D(precision["clamp_min"])), D(precision["clamp_max"]))
+    recomputed = total.quantize(
+        D(1).scaleb(-precision["decimal_places"]), rounding=precision["rounding"]
+    )
+    assert recomputed == D(packet["confidence"])
+    assert len(packet["model_sha256"]) == 64
+    assert packet["model_sha256"] == load_model().digest
+
+
+def test_the_recorded_digest_is_the_sha256_of_the_model_file_bytes() -> None:
+    import hashlib
+
+    assert load_model().digest == hashlib.sha256(model_path().read_bytes()).hexdigest()
+
+
+# =====================================================================================
+# the two latent dict-order dependencies in the model accessors
+# =====================================================================================
+def test_a_second_corroborating_table_is_refused(tmp_path: Path) -> None:
+    """`corroborating_keys()` returns the FIRST such signal in YAML order.
+
+    With two, the graded number would depend on the order two keys happen to
+    appear in a file. Refuse the model instead of silently picking one.
+    """
+    import yaml
+
+    document = yaml.safe_load(model_path().read_text(encoding="utf-8"))
+    table = document["signals"]["amount_date_corroboration"]["corroborating_keys"]
+    document["signals"]["partial_evidence"]["corroborating_keys"] = table
+    source = tmp_path / "confidence.yaml"
+    source.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(ConfidenceModelError, match="more than one signal"):
+        load_model(source)
+
+
+def test_two_signals_claiming_one_key_class_are_refused(tmp_path: Path) -> None:
+    """`key_class_signals()` is last-write-wins; a duplicate would drop one."""
+    import yaml
+
+    document = yaml.safe_load(model_path().read_text(encoding="utf-8"))
+    document["signals"]["name_dob_exact"]["key_class"] = "ext"
+    source = tmp_path / "confidence.yaml"
+    source.write_text(yaml.safe_dump(document), encoding="utf-8")
+    with pytest.raises(ConfidenceModelError, match="key_class"):
+        load_model(source)

@@ -37,6 +37,7 @@ committed state wherever the demonstrated attack used committed state.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -96,9 +97,27 @@ REWRITE = (
 SET_STATUS = "UPDATE proposals SET status = CAST(:s AS proposal_status) WHERE id = :pid"
 INSERT_PROPOSAL = (
     "INSERT INTO proposals (conflict_id, fingerprint, action, confidence, evidence, "
-    "created_run, target_canonical_id) "
-    "VALUES (:cid, :fp, CAST(:action AS jsonb), 0.95, '{}'::jsonb, :run, :target) RETURNING id"
+    "created_run, target_canonical_id, sensitive, status) "
+    "VALUES (:cid, :fp, CAST(:action AS jsonb), 0.95, '{}'::jsonb, :run, :target, "
+    "        :sensitive, CAST(:status AS proposal_status)) RETURNING id"
 )
+
+
+def _honest_birth(sets: str) -> dict[str, object]:
+    """The ``sensitive`` / birth-``status`` pair a row writing ``sets`` must carry.
+
+    Migration 0012's ``ck_proposals_sensitive_covers_write_set`` refuses a
+    proposal that claims ``sensitive = false`` while ``action->'set'`` names a
+    contract SS6 ``SENSITIVE_FIELDS`` path, and ``KS002`` then requires such a
+    row to be born ``sensitive_hold``. Derived from ``recon.reference`` rather
+    than hard-coded per case, so a row here is honest for the same reason the
+    reconciler's rows are and stays honest if SS6 changes.
+    """
+    from recon.reference import SENSITIVE_FIELDS
+
+    written = json.loads(sets) if sets.strip() else {}
+    sensitive = any(path in SENSITIVE_FIELDS for path in written)
+    return {"sensitive": sensitive, "status": "sensitive_hold" if sensitive else "pending"}
 
 
 # ===========================================================================
@@ -130,6 +149,7 @@ class World:
                     "run": TEST_TAG,
                     "target": self.canonical_id,
                     "action": f'{{"set": {sets}}}',
+                    **_honest_birth(sets),
                 },
             ).scalar_one()
         self.proposals.append(proposal_id)

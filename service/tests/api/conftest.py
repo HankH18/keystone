@@ -1,14 +1,12 @@
-"""Fixtures for the entity query API (T-5).
+"""Fixtures for the client API suites: entities (T-5) and the review surface (T-11).
 
-The application is `recon.app.create_app()` with the entities router mounted here
-rather than in `recon/app.py`, which another ticket owns. That is the one line of
-wiring this ticket asks for::
-
-    app.include_router(entities_router)
-
-Everything else -- the RFC7807 handler, logging, the other routers -- comes from
-the real factory, so these tests exercise the real application and not a
-hand-built stand-in.
+The application is `recon.app.create_app()` and **nothing is mounted here**. It
+used to be: this file added `entities_router` itself, because `recon/app.py`
+belonged to another ticket -- which is exactly how that router shipped
+unreachable while every test covering it passed. T-11 mounts both routers in the
+factory, `tests/integration/test_route_table.py` guards the mount, and the extra
+`include_router` call is gone rather than left as a harmless duplicate: a fixture
+that mounts a router is a fixture that can hide an unmounted one.
 
 The committed demo keys are spelled out here for the same reason
 `tests/schema/test_api_clients_seed.py` spells them out: they are the credentials
@@ -55,14 +53,31 @@ def reader(dataset: Dataset) -> Engine:
 
 @pytest.fixture(scope="session")
 def api(dataset: Dataset) -> Iterator[TestClient]:
-    """The real application, with the entities router mounted."""
-    from recon.api.entities import router as entities_router
+    """The real application, exactly as `make serve` builds it."""
     from recon.app import create_app
 
-    app = create_app()
-    app.include_router(entities_router)
-    with TestClient(app) as client:
+    with TestClient(create_app()) as client:
         yield client
+
+
+@pytest.fixture(scope="session")
+def store() -> Any:
+    """The graded conflict + proposal store, in the same database as `dataset`.
+
+    Shared with `tests/apply` through `tests.apply.store`, which memoizes it per
+    process. One database for the whole run is not tidiness: `use_database()`
+    re-points the PROCESS at a DSN, so two suites each creating their own scratch
+    database would silently steal each other's engines.
+    """
+    from tests.apply.store import ensure_store
+
+    return ensure_store()
+
+
+@pytest.fixture(scope="session")
+def review_api(store: Any, api: TestClient) -> TestClient:
+    """The same application, guaranteed to have conflicts and proposals to serve."""
+    return api
 
 
 def _entity_in(reader: Engine, tenant: str) -> dict[str, Any]:

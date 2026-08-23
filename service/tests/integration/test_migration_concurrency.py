@@ -39,6 +39,12 @@ from tests.er.scratchdb import MAINTENANCE_DATABASE, SERVICE_ROOT
 #: failed in 9 of 12 attempts.
 CONCURRENCY = 4
 
+#: The revision `alembic upgrade head` must land on. Spelled out rather than
+#: derived, so a migration that exits 0 without running -- the way this test could
+#: lie -- is caught by a literal that does not move on its own.
+#: `test_the_pinned_head_is_alembics_head` keeps the literal honest.
+EXPECTED_HEAD = "0014_write_set_from_the_value"
+
 
 def _admin_dsn() -> str:
     url = make_url(os.environ["DATABASE_URL"]).set(
@@ -110,7 +116,7 @@ def test_all_of_them_really_reached_head(fresh_databases: list[str]) -> None:
     for name in fresh_databases:
         with psycopg.connect(_database_dsn(name)) as conn:
             head = conn.execute("SELECT version_num FROM alembic_version").fetchone()
-            assert head is not None and head[0] == "0011_link_provenance_index", (
+            assert head is not None and head[0] == EXPECTED_HEAD, (
                 f"{name} is at {head!r}, not at head"
             )
             granted = conn.execute(
@@ -151,3 +157,30 @@ def test_advisory_locks_do_not_span_databases() -> None:
     finally:
         with psycopg.connect(admin, autocommit=True) as conn:
             conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+
+
+def test_the_pinned_head_is_alembics_head() -> None:
+    """`EXPECTED_HEAD` must be the head of the real migration tree.
+
+    The literal above is what makes "reached head" falsifiable: derived from the
+    same place alembic derives it, the assertion would be satisfied by a database
+    that is at whatever the tree happens to say, including a tree with a broken
+    tail. So it stays a literal -- and this test is the alarm that says, in one
+    sentence, that a migration landed and the literal was not bumped with it.
+
+    It needs no server: `ScriptDirectory` reads `migrations/versions/` off disk.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config(str(SERVICE_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(SERVICE_ROOT / "migrations"))
+    heads = tuple(ScriptDirectory.from_config(config).get_heads())
+
+    assert heads == (EXPECTED_HEAD,), (
+        f"migrations/versions/ has head(s) {heads!r}, but this module pins "
+        f"{EXPECTED_HEAD!r}. A migration landed without the pin being bumped: "
+        "update EXPECTED_HEAD in the same commit that adds the revision, so "
+        "`test_all_of_them_really_reached_head` keeps checking a revision that "
+        "was written down on purpose."
+    )

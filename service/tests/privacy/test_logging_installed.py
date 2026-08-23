@@ -189,6 +189,14 @@ _ENTRY_POINT_DRIVERS: tuple[tuple[str, str], ...] = (
         "import recon.seed.__main__ as m\n"
         "try:\n    m.main(['--profile', 'not-a-profile'])\nexcept SystemExit:\n    pass\n",
     ),
+    (
+        # No DATABASE_URL in the probe's environment, so `main` reaches
+        # `parser.error` and exits -- after `configure_logging_once()`, which is
+        # the point. The cheapest path that still installs the chain.
+        "recon.invariants",
+        "import recon.invariants.__main__ as m\n"
+        "try:\n    m.main([])\nexcept SystemExit:\n    pass\n",
+    ),
 )
 
 

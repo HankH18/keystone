@@ -31,7 +31,28 @@ from recon.reference import CONFLICT_TYPES, OBSERVED_VALUE_KEYS
 # THE COMMITTED MODEL. Editing confidence.yaml without editing this block is a
 # red build; that is the entire point of the block.
 # ---------------------------------------------------------------------------------
-COMMITTED_VERSION = 1
+#: v1 -> v2: the clamp is applied to the positive half first and the penalties are
+#: subtracted after it. NO base and NO weight changed -- the block below is
+#: byte-identical to v1's -- so this bump records a change to WHERE the clamp is
+#: applied, which R14's "partial/conflicting evidence lowers it" clause required:
+#: under v1 a penalty on a saturated conflict moved the stored number by zero
+#: (191 of the graded 3,050 proposals). See `confidence.yaml`'s version note.
+COMMITTED_VERSION = 2
+
+#: The committed formula, verbatim. Pinned as a string because the shape of the
+#: arithmetic -- not only its constants -- is the thing R14 calls "committed".
+COMMITTED_FORMULA = "clamp01(clamp01(base[conflict_type] + sum(positive)) + sum(negative))"
+
+#: sha256 of `confidence.yaml`'s RAW BYTES. This is the pin that does NOT depend on
+#: a human remembering to bump an integer: any edit to the file at all -- a weight,
+#: a base, a derivation note, the formula -- turns this red. Every proposal carries
+#: the same digest in `evidence.confidence.model_sha256`, so a row written months
+#: ago names the exact bytes that scored it.
+#:
+#: To update after a DELIBERATE model change, from the repository root:
+#:     python3 -c "import hashlib,pathlib as p; \
+#:       print(hashlib.sha256(p.Path('confidence.yaml').read_bytes()).hexdigest())"
+COMMITTED_SHA256 = "48295047a1f3854228600d7f2b9e9e536450cc14a968702b8d9275779ea83bbf"
 
 COMMITTED_BASES = {
     "C1": "0.50",
@@ -123,6 +144,34 @@ def test_the_model_file_is_at_the_committed_path() -> None:
 
 def test_model_version_is_the_committed_one() -> None:
     assert load_model().version == COMMITTED_VERSION
+
+
+def test_the_committed_formula_is_unchanged(raw_document: dict) -> None:
+    """The SHAPE of the arithmetic is committed, not only its constants.
+
+    v1's single clamp let strong positive evidence buy immunity from every
+    penalty. Pinning the formula string means a future edit that puts the clamp
+    back where it was is a red build rather than a silent regression of R14.
+    """
+    assert raw_document["formula"] == COMMITTED_FORMULA
+    assert load_model().formula == COMMITTED_FORMULA
+
+
+def test_the_model_file_digest_is_the_committed_one() -> None:
+    """A weight edit is a red build whether or not the author bumps `version`.
+
+    `version` is an integer a human must remember to change; this is not. It also
+    binds every historical proposal to the exact bytes that scored it, because the
+    same digest is stamped into `evidence.confidence.model_sha256`.
+    """
+    import hashlib
+
+    on_disk = hashlib.sha256(model_path().read_bytes()).hexdigest()
+    assert on_disk == COMMITTED_SHA256, (
+        "confidence.yaml changed. If that was deliberate: bump `version`, update "
+        f"COMMITTED_SHA256 to {on_disk!r}, and update the literals in this file."
+    )
+    assert load_model().digest == COMMITTED_SHA256
 
 
 def test_every_base_is_the_committed_value(raw_document: dict) -> None:

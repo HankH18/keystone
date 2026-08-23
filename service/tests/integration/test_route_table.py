@@ -41,9 +41,13 @@ DESIGN_ENDPOINTS: dict[tuple[str, str], str] = {
     ("GET", "/api/entities/{key}"): "R10 -- the unified cross-source view",
     ("GET", "/api/conflicts"): "R11 -- conflict list, filters, pagination",
     ("GET", "/api/proposals"): "R11 -- proposal list, filters",
-    ("POST", "/api/proposals/{id}/approve"): "R11 -- reviewer decision",
-    ("POST", "/api/proposals/{id}/reject"): "R11 -- reviewer decision",
-    ("POST", "/api/proposals/{id}/apply"): "R24 -- the auto-apply path",
+    # DESIGN writes these as `{id}`; FastAPI's template carries the parameter's
+    # own name, and `recon.api.review` names it `proposal_id` because the module
+    # also serves `/api/conflicts/{conflict_id}` and one-letter path params are
+    # how two endpoints end up sharing a handler by accident.
+    ("POST", "/api/proposals/{proposal_id}/approve"): "R11 -- reviewer decision",
+    ("POST", "/api/proposals/{proposal_id}/reject"): "R11 -- reviewer decision",
+    ("POST", "/api/proposals/{proposal_id}/apply"): "R24 -- the auto-apply path",
     ("GET", "/api/incidents"): "R25 -- stretch #8 incident clusters",
     ("GET", "/api/scorecard"): "R11 -- dashboard reconciliation",
 }
@@ -52,13 +56,10 @@ DESIGN_ENDPOINTS: dict[tuple[str, str], str] = {
 #: that would own it. **This is a statement about the repository, not a waiver**:
 #: `test_the_unbuilt_endpoints_are_still_unbuilt` fails the moment one appears.
 NOT_BUILT_YET: dict[tuple[str, str], str] = {
-    ("GET", "/api/conflicts"): "no conflicts router exists in recon/api/",
-    ("GET", "/api/proposals"): "no proposals router exists in recon/api/",
-    ("POST", "/api/proposals/{id}/approve"): "no proposals router exists in recon/api/",
-    ("POST", "/api/proposals/{id}/reject"): "no proposals router exists in recon/api/",
-    ("POST", "/api/proposals/{id}/apply"): "no proposals router exists in recon/api/",
     ("GET", "/api/incidents"): "no incidents router exists in recon/api/",
-    ("GET", "/api/scorecard"): "no scorecard router exists in recon/api/",
+    # `/api/scorecard` was here until T-14 built `recon.api.scorecard` and mounted
+    # it; this file's own rule is that the line goes when the endpoint arrives, so
+    # that the list cannot become a graveyard excusing a missing mount.
 }
 
 #: Mounted, and not in DESIGN's list because DESIGN describes the client API:
@@ -67,6 +68,12 @@ NOT_BUILT_YET: dict[tuple[str, str], str] = {
 ALSO_EXPECTED: dict[tuple[str, str], str] = {
     ("POST", "/internal/ingest/records"): "R2 -- validated landing of a payload batch",
     ("GET", "/api/entities"): "R20 -- org-wide index, admin scope only",
+    # The dashboard's detail routes. DESIGN pins the collection endpoints and the
+    # per-id POST actions but no per-id GET; `dashboard/src/lib/contract.ts`
+    # records that as ASSUMED item A2 and builds the conflict- and
+    # proposal-detail pages on it, so T-11 serves them.
+    ("GET", "/api/conflicts/{conflict_id}"): "contract.ts A2 -- conflict detail",
+    ("GET", "/api/proposals/{proposal_id}"): "contract.ts A2 -- proposal detail",
 }
 
 

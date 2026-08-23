@@ -1,0 +1,95 @@
+{
+  "benchmarks": {
+    "bench:conflict-accuracy": {
+      "detail": "precision 1.000000 recall 1.000000 on 3050 golden entries (FN=0 FP=0 field-mismatches=0); clean sample 1000/1000 unflagged; threshold: EXACT",
+      "passed": true
+    },
+    "bench:cross-source-query-p95": {
+      "detail": "n=20 min=4.6ms p50=5.6ms p95=6.3ms max=6.3ms threshold<1s (warm-up discarded; 43375 entities, 360400 landed records; in-process ASGI)",
+      "passed": true
+    },
+    "bench:dashboard-load-p95": {
+      "detail": "n=20 min=59.7ms p50=68.9ms p95=75.2ms max=79.0ms threshold<1s; 15 server calls per load (GET /api/scorecard + 14 x GET /api/conflicts?type=..&page_size=1), 43375 entities / 3050 proposals; SERVICE SIDE ONLY -- in-process ASGI, no network, no TLS, no browser, no JS parse and no render; this is a floor on a page load, not a page load",
+      "passed": true
+    },
+    "bench:ingestion-rps": {
+      "detail": "13961 rec/s sustained over 240200 records in 17.20s (threshold >=500); gen1:120200rec/7.37s(warm-up) gen2:120200rec/8.32s=14447rps gen3:120000rec/8.89s=13506rps; measured inside a rolled-back transaction, mirror restored=True",
+      "passed": true
+    },
+    "bench:invariant-pass": {
+      "detail": "22.94s total = invariants 12.94s + persist 2.72s + reconcile 7.29s (threshold <30s); 3050 conflicts over 360400 landed records",
+      "passed": true
+    },
+    "bench:spend-cap-exact": {
+      "detail": "cap=81600uUSD granted=6/6 of 120 contenders; refused=114; reserved-while-open=81600 (== cap); settled spend=10782 (== 1797 x 6); ledger violations=0; over-admitted=False; threshold: EXACT",
+      "passed": true
+    }
+  },
+  "checks": {
+    "bench:conflict-accuracy": true,
+    "bench:cross-source-query-p95": true,
+    "bench:dashboard-load-p95": true,
+    "bench:ingestion-rps": true,
+    "bench:invariant-pass": true,
+    "bench:spend-cap-exact": true,
+    "clean-sample": true,
+    "coverage": true,
+    "determinism": true,
+    "golden-diff": true,
+    "join-check": true,
+    "manifest": true,
+    "mirror-unchanged": true,
+    "oscillation-dedup": true,
+    "proposal-safety": true,
+    "spend-cap-burst": true
+  },
+  "conflicts": {
+    "by_type": {
+      "C1": 500,
+      "C10": 50,
+      "C11": 50,
+      "C12": 100,
+      "C13": 100,
+      "C14": 50,
+      "C2": 200,
+      "C3": 300,
+      "C4": 250,
+      "C5": 400,
+      "C6": 500,
+      "C7": 300,
+      "C8": 150,
+      "C9": 100
+    },
+    "total": 3050
+  },
+  "database": "ks_verify_hh",
+  "details": {
+    "bench:conflict-accuracy": "precision 1.000000 recall 1.000000 on 3050 golden entries (FN=0 FP=0 field-mismatches=0); clean sample 1000/1000 unflagged; threshold: EXACT",
+    "bench:cross-source-query-p95": "n=20 min=4.6ms p50=5.6ms p95=6.3ms max=6.3ms threshold<1s (warm-up discarded; 43375 entities, 360400 landed records; in-process ASGI)",
+    "bench:dashboard-load-p95": "n=20 min=59.7ms p50=68.9ms p95=75.2ms max=79.0ms threshold<1s; 15 server calls per load (GET /api/scorecard + 14 x GET /api/conflicts?type=..&page_size=1), 43375 entities / 3050 proposals; SERVICE SIDE ONLY -- in-process ASGI, no network, no TLS, no browser, no JS parse and no render; this is a floor on a page load, not a page load",
+    "bench:ingestion-rps": "13961 rec/s sustained over 240200 records in 17.20s (threshold >=500); gen1:120200rec/7.37s(warm-up) gen2:120200rec/8.32s=14447rps gen3:120000rec/8.89s=13506rps; measured inside a rolled-back transaction, mirror restored=True",
+    "bench:invariant-pass": "22.94s total = invariants 12.94s + persist 2.72s + reconcile 7.29s (threshold <30s); 3050 conflicts over 360400 landed records",
+    "bench:spend-cap-exact": "cap=81600uUSD granted=6/6 of 120 contenders; refused=114; reserved-while-open=81600 (== cap); settled spend=10782 (== 1797 x 6); ledger violations=0; over-admitted=False; threshold: EXACT",
+    "clean-sample": "1000 asserted-clean entities, 0 flagged (SS8 intersection predicate over 3050 detected conflicts)",
+    "coverage": "combined 92.5% (floor 80%) over 7 core modules [adapters:92.0% budget:87.6% confidence:89.2% er:93.2% invariants:94.2% normalize:100.0% reconciler:96.1%]; 3966 passed, 1 skipped, 56 warnings in 1413.58s (0:23:33); measured by a real pytest run in 1416s",
+    "determinism": "dataset 642d160a46bfdf75 == 642d160a46bfdf75 over 21 files (profile=full, seed=20260822, 27.3s + 27.0s, PYTHONHASHSEED=0 subprocesses; committed golden/ reproduced byte-for-byte); conflict set 3050 fingerprints, payload 77cf192e9e79b5cb == 77cf192e9e79b5cb; confidence vector 3050 entries, 7ccd8926684645cc across dry-a/dry-b/committed",
+    "golden-diff": "FN=0 FP=0 field-mismatches=0 matched=3050/3050 golden/detected per type [C1:500/500 C10:50/50 C11:50/50 C12:100/100 C13:100/100 C14:50/50 C2:200/200 C3:300/300 C4:250/250 C5:400/400 C6:500/500 C7:300/300 C8:150/150 C9:100/100] dir=/Users/hankholcomb/Documents/code_parent_folders/gauntlet_repos/keystone/golden",
+    "join-check": "25/25 unified views fetched from GET /api/entities/{key} match golden/expected-views.json across 14 view fields",
+    "manifest": "47/47 generator self-checks green (expected 47); profile=full seed=20260822; A.4 conflict minimums 14/14 asserted; multi_child_households=3000 deal_less_leads=18175 oscillating_fields=25 malformed=24; A.5 compound ratio 0.2295; cross-checked against committed golden/ (3050 entries, 1000 clean, 25 views)",
+    "mirror-unchanged": "7 landing/staging tables, 720809 rows, byte-unchanged",
+    "oscillation-dedup": "second pass proposed 0 (skipped_fingerprint=3050/3050); oscillating 25/25 golden, all escalated=25; lineage 1279575 rows over 3 generations; NOTE conflicts.escalation_reason is not writable by recon_writer, so the reason lives in the conflict.escalated audit row only",
+    "proposal-safety": "3050 conflicts -> 3050 proposals (pending=2670 sensitive_hold=380 evidence_only=1950); C14 held 50/50; sensitive-target held 380/380 (recomputed by recon.sensitive.classify); mirror 7 tables 720809 rows byte-unchanged; run=recon-299d6d2c4fe3d1d6",
+    "spend-cap-burst": "contenders=120 granted=6 refused=114 other=0 refusal_sqlstates=['KS006'] cap=81600 reserve_each=13600 spend_while_open=81600 actual_each=1797 final_spend=10782 cap_hit_audit_rows=124 alerts_fired=124 retry_wave=10 retries_granted=0 backstop=True ledger_violations=0 release_sites=1['budget.py:1775'] post_send=provider_error/13600 pre_send=provider_error/0 silent_usage=ok/13600 overspend=overspend->scope_halted/13600 sweeper=charged:13600/released:0/spend:13600 raw_update=['schema-qualified:KS007', 'quoted:KS007', 'only:KS007', 'priced-at-a-number-of-its-own:KS007', 'unknown-outcome-refunded:KS007', 'self-attested-outage:KS007']/13600->1797 replay=receipt:True/refused:True/13600 sweep_as_capped=refused:True/open:1/13600 failed_call_priced=refused:True/13600 elapsed=2.8s"
+  },
+  "generated_at": "2026-08-23T21:04:57+00:00",
+  "passed": true,
+  "proposals": {
+    "by_status": {
+      "pending": 2670,
+      "sensitive_hold": 380
+    },
+    "total": 3050
+  },
+  "run_id": "recon-299d6d2c4fe3d1d6",
+  "suite_version": "0.1.0"
+}

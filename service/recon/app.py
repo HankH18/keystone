@@ -4,9 +4,12 @@ Routers are mounted here and defined next to the code they expose, so a module
 owns both its behaviour and its HTTP surface: `/health` lives in `recon.health`
 (real DB + per-source probes, all bounded), `/internal/ingest/*` lives in
 `recon.ingest` (validated landing, RFC7807 rejections), `/internal/sync` +
-`/internal/reconcile` live in `recon.api.internal` (the R19 cron triggers) and
+`/internal/reconcile` live in `recon.api.internal` (the R19 cron triggers),
 `/api/entities*` lives in `recon.api.entities` (R10's unified cross-source view
-and R20's per-row scope filter).
+and R20's per-row scope filter) and `/api/conflicts*` + `/api/proposals*` live
+in `recon.api.review` (R11's reviewer surface and R24's apply path) and
+`/api/scorecard` lives in `recon.api.scorecard` (the latest `python -m
+recon.suite` results, which the dashboard's overview reconciles against).
 
 **A router that is not mounted here does not exist.** Two of them were built,
 tested and left unreachable, because the tests that covered them imported the
@@ -37,6 +40,8 @@ from recon.api.auth import install_problem_handler
 from recon.api.entities import router as entities_router
 from recon.api.internal import JOB_SYNC, register_job_handler, sync_job
 from recon.api.internal import router as internal_router
+from recon.api.review import router as review_router
+from recon.api.scorecard import router as scorecard_router
 from recon.health import SERVICE_NAME
 from recon.health import router as health_router
 from recon.ingest import router as ingest_router
@@ -150,6 +155,16 @@ def create_app() -> FastAPI:
     # fixture, so the unified query endpoint -- Core deliverable #3 -- 404'd
     # everywhere except the test suite.
     app.include_router(entities_router)
+    # The reviewer surface (R11) and the apply path (R24): `/api/conflicts*`,
+    # `/api/proposals*` and the three decision endpoints. The dashboard is built
+    # against exactly these and has been talking to a 404 until now.
+    app.include_router(review_router)
+    # `GET /api/scorecard` (T-14). DESIGN pins it and the dashboard's overview
+    # route is built against it: `dashboard/src/lib/contract.ts` A4 is the body
+    # shape, and the route reconciles every conflict-type figure against it. It
+    # served 404 until this line existed, which `docs/proposal-policy.md` had
+    # already recorded as a known gap rather than a hypothetical one.
+    app.include_router(scorecard_router)
     # The sync trigger's body: ingest every generation, then materialize the
     # canonical layer (`recon.api.internal.sync_job`). Bound to *this app*, not
     # to the module-global registry, so building an application never reaches

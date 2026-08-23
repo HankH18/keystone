@@ -60,14 +60,23 @@ Two rules, and they are not the same rule:
   is not a *re*-proposal -- carrying the model's heaviest penalty (-0.25) and the
   escalation on the conflict row.
 
-**The honest limit, up front:** ``field_lineage`` is written for generations 1-3
-by ``recon.resolve.materialize``, but the committed test path ingests generation 3
-only, so in that configuration the A -> B -> A scan has no history to read and
-finds nothing. The packet therefore records ``lineage_rows`` and which input
-answered (``lineage_scan`` or the ``conflicts.oscillating`` column), so "scanned
-and found none" is never reported as "there is nothing here". The dedup logic is
-unit-tested against constructed lineage; see the ticket report for what that does
-and does not prove.
+**What "there was nothing to scan" actually means, and the bug it hid.** The
+A -> B -> A pattern needs THREE ascending generations of one
+``(person_key, field)``. ``recon.resolve.materialize`` takes the generations it
+writes as a parameter, so ``field_lineage`` can be non-empty and still be
+structurally incapable of holding the pattern: materialized for generation 3
+alone it held 426,175 rows, ``LineageScan.had_input`` (which is ``rows > 0``) was
+``True``, the scan correctly found no pairs, and every one of the 3,050 proposals
+recorded ``decided_by: lineage_scan`` -- a CONFIDENT FALSE carrying an
+authoritative provenance label, on the 25 conflicts ``golden/conflicts.json``
+marks ``"oscillating": true``. Row count is the wrong question.
+:func:`oscillation_state` therefore requires GENERATION COVERAGE
+(``LINEAGE_GENERATIONS_REQUIRED`` distinct generations in ``field_lineage``, read
+by :func:`lineage_generation_count`) before it will treat the scan as an answer,
+and the packet records the generation count next to the row count. With coverage
+the scan decides; without it the run falls back to the ``conflicts.oscillating``
+column and, if that is unset too, reports ``OSCILLATION_NO_INPUT`` -- "nobody
+knows" -- rather than ``False``.
 
 The LLM is a seam, and it is empty in this ticket
 --------------------------------------------------
@@ -82,10 +91,31 @@ null**. ``tests/reconciler`` asserts that with a hook that raises.
 Write boundary
 --------------
 Everything here runs as ``recon_writer``, which can INSERT ``proposals``,
-``audit_log`` and ``conflicts`` and UPDATE ``conflicts`` -- and holds no UPDATE on
-``proposals``, no write of any kind on ``entities``, and no INSERT/UPDATE on
-``budget_ledger``. It therefore cannot decide, cannot apply, and cannot approve
-its own work. That is a grant, not a convention.
+``audit_log`` and ``conflicts`` and UPDATE **exactly two columns** of
+``conflicts`` -- ``status`` and ``last_seen_run`` (migration 0004's
+``CONFLICT_UPDATE_COLUMNS``). It holds no UPDATE on ``proposals``, no write of
+any kind on ``entities``, and no INSERT/UPDATE on ``budget_ledger``. It therefore
+cannot decide, cannot apply, and cannot approve its own work. That is a grant,
+not a convention.
+
+The column list is narrower than this docstring used to claim, and the difference
+was a production blocker rather than a documentation nit: ``escalation_reason``
+is NOT in it, so the single-statement escalation
+``UPDATE conflicts SET status=..., escalation_reason=...`` is refused wholesale
+with SQLSTATE ``42501`` -- which, being raised inside :func:`reconcile`'s
+transaction, rolled the whole run back and wrote ZERO proposals the first time
+any conflict oscillated. Every committed oscillation test ran as the schema
+owner, which bypasses grants, and the fixture ingested generation 3 only, so no
+green test in the suite ever exercised this statement as this principal.
+:func:`_escalate` now asks the catalogue what it may write
+(``has_column_privilege``, once per run) and escalates with the columns it
+actually holds; the reason is written to ``conflicts.escalation_reason`` when the
+grant exists and ALWAYS to the ``conflict.escalated`` audit row, so R16's
+escalation is never lost and never aborts the run. When the grant is absent the
+run says so, loudly, in the report (``escalation_reason_persisted``) and in a
+warning log line naming the missing grant. **The grant belongs in a migration**
+(add ``escalation_reason`` to ``CONFLICT_UPDATE_COLUMNS``); this module is not
+allowed to add one and does not pretend the degraded mode is equivalent.
 """
 
 from __future__ import annotations
@@ -99,6 +129,7 @@ from typing import Any, Final
 
 from sqlalchemy import Connection, text
 
+from recon.apply import effective_write_paths
 from recon.confidence import (
     ConfidenceModel,
     Score,
@@ -113,17 +144,25 @@ from recon.db import ROLE_RECON_WRITER, role_connection
 from recon.logging import get_logger, insert_audit_row
 from recon.privacy import canonical_json
 from recon.reference import (
+    AUTO_APPLY_ELIGIBLE,
     COMPARED_FIELD_BY_PATH,
     CONFLICT_TYPES,
+    DEAL_STAGE_TO_FUNNEL,
+    LIFECYCLE_TO_FUNNEL,
     fix_target,
+    is_auto_apply_eligible,
+    is_sensitive,
     person_key,
 )
-from recon.sensitive import Classification, classify
+from recon.resolve import SURVIVED_PATHS
+from recon.sensitive import STATUS_PENDING, STATUS_SENSITIVE_HOLD, Classification, classify
 
 __all__ = [
     "AUDIT_ACTOR",
     "CURRENT_GENERATION",
     "ESCALATION_OSCILLATION",
+    "LINEAGE_GENERATIONS_REQUIRED",
+    "NESTED_FIX_TARGETS",
     "SKIP_FINGERPRINT",
     "SKIP_OSCILLATION",
     "ConflictRow",
@@ -133,8 +172,10 @@ __all__ = [
     "ReconcileReport",
     "build_packet",
     "fix_action",
+    "lineage_generation_count",
     "no_rationale",
     "reconcile",
+    "reconcile_job",
     "run_once",
 ]
 
@@ -142,6 +183,83 @@ log = get_logger("recon.reconciler")
 
 #: SS7: current state is generation 3, and that is the snapshot conflicts describe.
 CURRENT_GENERATION: Final = 3
+
+#: The one nested object ``entities.current`` carries (contract SS4.6, materialized
+#: by ``recon.resolve``). Its members are the source-qualified paths a canonical
+#: view survives, and ``recon.resolve.VIEW_FIELDS`` projects the map WHOLE.
+SURVIVED_CONTAINER: Final = "survived"
+
+#: The fix targets whose committed path lives INSIDE ``survived`` **and** is
+#: auto-apply eligible -- today exactly ``{"crm.contact.lifecycle_stage"}``.
+#:
+#: Derived from the two committed sets rather than restated, so it cannot drift
+#: from either. This is the set for which the template emits the NESTED action
+#: shape, and the reason is observability, not permission: an eligible path that
+#: is a member of ``survived`` must be written *there* to move anything a reader
+#: sees. ``{"set": {"crm.contact.lifecycle_stage": ...}}`` lands as a new
+#: TOP-LEVEL key of ``entities.current`` that no reader projects -- the row
+#: moves, the digest moves, and every value the entity endpoints and the R10
+#: join check show is unchanged.
+#:
+#: Nothing is widened to reach it: same conflict, same contract SS6 fix target,
+#: same allow-list, different SHAPE. And the shape is representable only because
+#: ``recon.apply.effective_write_paths`` judges the paths a statement writes
+#: rather than the keys it names -- under the key rule it was refused as
+#: ``write_off_allowlist`` for naming ``survived``.
+#:
+#: **Deliberately NOT applied to a held target**, though several sensitive fix
+#: targets (``appdb.enrollment.stage``, ``appdb.student.status``,
+#: ``crm.deal.stage``) are also members of ``survived``. A held proposal cannot
+#: auto-apply at any confidence, so re-shaping it buys no observability that R15
+#: allows the machine to use, while it would move the shape of 380 committed
+#: ``sensitive_hold`` rows and the population that
+#: ``tests/apply/test_sensitive_hold.py`` measures. The narrow set is the one the
+#: contract's own "eligible (CRM side only)" ruling sanctions.
+NESTED_FIX_TARGETS: Final[frozenset[str]] = frozenset(SURVIVED_PATHS) & AUTO_APPLY_ELIGIBLE
+
+
+def _preimages(mapper: Mapping[str, Any]) -> dict[Any, tuple[str, ...]]:
+    """``{mapped value: the field values that map to it}``, sorted."""
+    inverse: dict[Any, list[str]] = {}
+    for field_value, mapped in mapper.items():
+        inverse.setdefault(mapped, []).append(field_value)
+    return {mapped: tuple(sorted(values)) for mapped, values in inverse.items()}
+
+
+#: **The value a fix writes must be in the vocabulary of the FIELD it writes.**
+#:
+#: Contract SS2.4's ``lifecycle`` and ``stage`` rows are the only two comparisons
+#: whose mapper carries an endpoint into a different vocabulary than the field
+#: itself holds: ``lifecycle`` compares ``LIFECYCLE_TO_FUNNEL(crm.contact.lifecycle_stage)``
+#: against ``STATUS_TO_FUNNEL(appdb.student.status)``, and ``stage`` compares
+#: ``DEAL_STAGE_TO_FUNNEL(crm.deal.stage)`` against ``appdb.enrollment.stage``'s
+#: funnel. SS5.4 records the COMPARISON's values in ``observed_values``, so the
+#: authoritative endpoint there is a **funnel** token -- ``enrolled`` -- while the
+#: field being written holds a CRM token -- ``customer`` for the contact,
+#: ``Closed Won`` for the deal.
+#:
+#: Writing the funnel token straight onto the CRM field is what this template did,
+#: and it was invisible for exactly as long as the write was: it landed as a new
+#: top-level key of ``entities.current`` that no reader projects. The moment an
+#: eligible target is written where the canonical layer actually keeps it -- inside
+#: ``survived``, which ``recon.resolve.VIEW_FIELDS`` does project -- the mismatch
+#: becomes a visible corruption: ``survived['crm.contact.lifecycle_stage']`` would
+#: read ``enrolled``, which ``norm_enum('lifecycle_stage', .)`` does not accept, so
+#: the next comparison of that field is ``unchecked`` and the conflict disappears by
+#: becoming unreadable instead of by being fixed.
+#:
+#: So the authoritative value is carried BACK through the field's own mapper. The
+#: preimage is derived from the committed maps rather than restated, and it is used
+#: only when it is a **singleton**: ``DEAL_STAGE_TO_FUNNEL`` is bijective onto the
+#: funnel (SS2.3) so it always is, while ``LIFECYCLE_TO_FUNNEL`` is many-to-one --
+#: ``prospect`` and ``applied`` each have three preimages and ``waitlisted``,
+#: ``deposit_paid`` and ``refunded`` have none -- and an ambiguous or empty preimage
+#: is a value no evidence determines. The proposal then names its target and carries
+#: ``{"set": {}}``, exactly as an ambiguous C4 does.
+_FIELD_VOCABULARY: Final[dict[str, dict[Any, tuple[str, ...]]]] = {
+    "crm.contact.lifecycle_stage": _preimages(LIFECYCLE_TO_FUNNEL),
+    "crm.deal.stage": _preimages(DEAL_STAGE_TO_FUNNEL),
+}
 
 #: SQLSTATE ``KS003`` requires ``^system:`` for ``recon_writer``. This is the one
 #: actor string this module writes; nothing here may look like a human.
@@ -154,6 +272,14 @@ ESCALATION_OSCILLATION: Final = "oscillation"
 
 SKIP_FINGERPRINT: Final = "fingerprint_dedup"
 SKIP_OSCILLATION: Final = "oscillation_identical_fix"
+
+#: How many DISTINCT generations ``field_lineage`` must cover before the A -> B -> A
+#: scan is allowed to answer. Contract SS7's pattern is "A, B, A across ascending
+#: generations" -- three values of one ``(person_key, field)`` -- so lineage covering
+#: fewer than three generations cannot contain it and a scan over such lineage is
+#: structurally incapable of a true. Row count does not capture this: generation-3-only
+#: lineage is 426,175 rows of it.
+LINEAGE_GENERATIONS_REQUIRED: Final = 3
 
 #: The three ``entity_link_candidates`` key classes, in ``normalize.KEY_CLASSES``
 #: order. Read from the model file, not restated -- see :meth:`_identity_agreement`.
@@ -204,11 +330,18 @@ class FixAction:
     derivable: bool
     derivation: str
     action: Mapping[str, Any]
+    #: The top-level key of ``entities.current`` the write reaches
+    #: ``target_path`` THROUGH, or ``None`` when the target is written as a
+    #: top-level key. ``target_path`` is always the contract SS6 LEAF, whichever
+    #: shape the action expresses it in, so the classifier and this template
+    #: still name one and the same path.
+    container: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "conflict_type": self.conflict_type,
             "target_path": self.target_path,
+            "container": self.container,
             "value": self.value,
             "value_derivable": self.derivable,
             "derivation": self.derivation,
@@ -238,6 +371,10 @@ class EvidencePacket:
     null_observed_values: tuple[str, ...]
     oscillation_source: str
     lineage_rows: int
+    #: How many DISTINCT generations ``field_lineage`` covered when this packet was
+    #: built. Recorded next to ``lineage_rows`` because the row count alone cannot
+    #: tell a reviewer whether the A -> B -> A scan could have found anything.
+    lineage_generations: int
     signals: Signals
     score: Score
     classification: Classification
@@ -283,6 +420,8 @@ class EvidencePacket:
                 "observed": self.signals.oscillation_observed,
                 "decided_by": self.oscillation_source,
                 "lineage_rows": self.lineage_rows,
+                "lineage_generations": self.lineage_generations,
+                "generations_required": LINEAGE_GENERATIONS_REQUIRED,
                 "conflict_row_flag": self.conflict.oscillating,
             },
             "fix": self.fix.as_dict(),
@@ -322,7 +461,12 @@ class ReconcileReport:
     escalated_oscillation: int
     rationale_attached: int
     lineage_rows: int
+    lineage_generations: int
+    #: False when this principal could not write ``conflicts.escalation_reason``.
+    #: The escalation still happened; the reason is in the audit row only.
+    escalation_reason_persisted: bool
     model_version: int
+    model_sha256: str
     by_type: Mapping[str, int]
     outcomes: tuple[ProposalOutcome, ...] = field(repr=False, default=())
     elapsed_ms: float = 0.0
@@ -361,7 +505,10 @@ class ReconcileReport:
             "escalated_oscillation": self.escalated_oscillation,
             "rationale_attached": self.rationale_attached,
             "lineage_rows": self.lineage_rows,
+            "lineage_generations": self.lineage_generations,
+            "escalation_reason_persisted": self.escalation_reason_persisted,
             "model_version": self.model_version,
+            "model_sha256": self.model_sha256,
             "by_type": dict(self.by_type),
             "confidence_digest": self.confidence_digest(),
             "elapsed_ms": round(self.elapsed_ms, 3),
@@ -394,6 +541,12 @@ class ReconcileReport:
             "escalated_count": self.escalated_oscillation,
             "rationale_count": self.rationale_attached,
             "rows": self.lineage_rows,
+            "generation_count": self.lineage_generations,
+            "outcome": (
+                "escalation_reason_persisted"
+                if self.escalation_reason_persisted
+                else "escalation_reason_in_audit_row_only"
+            ),
             "label": " ".join(f"{key}={value}" for key, value in sorted(self.by_type.items())),
             "fingerprint": self.confidence_digest(),
             "elapsed_ms": round(self.elapsed_ms, 3),
@@ -408,6 +561,7 @@ def fix_action(
     *,
     disagreeing_fields: Sequence[str] = (),
     observed_values: Mapping[str, Any] | None = None,
+    survived: Mapping[str, Any] | None = None,
 ) -> FixAction:
     """Resolve SS6's fix target to a concrete ``{"set": {...}}`` action.
 
@@ -451,6 +605,13 @@ def fix_action(
         no student and no contact. There is no candidate person anywhere in the
         data. The proposal names the target (which is what makes SS6's
         classification decidable) and carries ``{"set": {}}``.
+
+    ``survived`` is the target entity's stored ``current['survived']`` map, when
+    the caller has one. It changes no target and no value -- only the SHAPE the
+    write is expressed in, for the targets in :data:`NESTED_FIX_TARGETS`, and
+    only when the map already carries the member. See :func:`_fix`. Without it
+    every template emits the top-level form, which is the safe fallback and the
+    only one a caller holding no entity row can author honestly.
     """
     observed = dict(observed_values or {})
     paths = tuple(disagreeing_fields)
@@ -486,13 +647,39 @@ def fix_action(
                 f"authoritative endpoint {counterpart} was not observed",
                 {},
             )
+        # SS5.4 records the COMPARISON's values, so for the two rows whose mapper
+        # is not the identity on the CRM side the authoritative value is a funnel
+        # token and the field holds a CRM one. Carry it back, or say it is not
+        # derivable -- never write a token the field's own vocabulary rejects.
+        preimages = _FIELD_VOCABULARY.get(path)
+        if preimages is not None:
+            candidates = preimages.get(value, ())
+            if len(candidates) != 1:
+                return _fix(
+                    conflict_type,
+                    path,
+                    None,
+                    False,
+                    (
+                        f"the authoritative {counterpart} value {value!r} has "
+                        f"{len(candidates)} preimages in {path}'s own vocabulary "
+                        f"{list(candidates)}: which value the field should carry is a "
+                        "human decision, not a derivation"
+                    ),
+                    {},
+                )
+            value = candidates[0]
         return _fix(
             conflict_type,
             path,
             value,
             True,
-            f"SS4.6 survivorship: write the authoritative {counterpart} value onto {path}",
+            (
+                f"SS4.6 survivorship: write the authoritative {counterpart} value onto "
+                f"{path}, in {path}'s own vocabulary"
+            ),
             {path: value},
+            survived=survived,
         )
 
     if conflict_type == "C4":
@@ -561,7 +748,63 @@ def _fix(
     derivable: bool,
     derivation: str,
     assignments: Mapping[str, Any],
+    survived: Mapping[str, Any] | None = None,
 ) -> FixAction:
+    """Render the resolved target/value as the concrete ``{"set": {...}}`` payload.
+
+    One decision lives here and nowhere else: **which SHAPE expresses this write**.
+
+    A target in :data:`NESTED_FIX_TARGETS` is a member of ``entities.current``'s
+    one nested object, so writing it as a top-level key produces a row nothing
+    projects. When the entity's own ``survived`` map is in hand AND already
+    carries the target, the action is emitted as the nested form, carrying the
+    WHOLE map with that one member replaced -- contract SS5's shallow-merge rule
+    makes carrying the whole map the only representable nested write, since
+    ``||`` replaces the object and would otherwise erase the other eight members.
+
+    Both preconditions are refusals, not optimisations:
+
+    * **no map in hand** -- a template that cannot see the map cannot carry it,
+      and guessing its contents would author an erasure. Falls back to the
+      top-level form, which is safe and inert rather than destructive.
+    * **the map does not have the member** -- adding one would introduce a
+      member the closed set ``recon.resolve.SURVIVED_PATHS`` does not have, which
+      is the look-alike hole ``recon.apply.merge_preview`` refuses on both apply
+      paths (``nested_member_introduced``). A template must never author it.
+
+    The decision reads the map's MEMBERSHIP and never its values, so the shape of
+    a proposal does not depend on what the row happens to hold.
+
+    **What a nested fix with nothing to fix actually does.** This paragraph used
+    to end "and R24 refuses it (``write_off_allowlist``, naming the container)",
+    which names the wrong control and the wrong moment. R24's gate is never
+    reached, because no proposal is ever built: an assigned object the merge
+    would change nothing about makes
+    :func:`recon.apply.effective_write_paths` report the CONTAINER key
+    ``survived`` -- deliberately, so the write set is never empty --
+    ``survived`` is on neither ``SENSITIVE_FIELDS`` nor ``AUTO_APPLY_ELIGIBLE``,
+    and :func:`_assert_action_matches_classification` therefore raises
+    ``ValueError``. That call is not guarded, so the exception **aborts the whole
+    ``reconcile`` run** rather than dropping one proposal.
+
+    That is deliberate and is stated in that function's own docstring: a proposal
+    whose action and whose classification disagree "is not a proposal to
+    downgrade, it is evidence that the classifier and the templates disagree". It
+    is still a better outcome than silently re-shaping the fix into a top-level
+    write that changes a byte for no reason -- but it is a loud abort of the run,
+    not a quiet refusal at the gate, and a reader planning for it needs the
+    difference.
+    """
+    if path in NESTED_FIX_TARGETS and isinstance(survived, Mapping) and path in survived:
+        return FixAction(
+            conflict_type=conflict_type,
+            target_path=path,
+            value=value,
+            derivable=derivable,
+            derivation=derivation,
+            action={"set": {SURVIVED_CONTAINER: {**dict(survived), path: value}}},
+            container=SURVIVED_CONTAINER,
+        )
     return FixAction(
         conflict_type=conflict_type,
         target_path=path,
@@ -610,6 +853,8 @@ _INSERT_PROPOSAL = text(
     """
 )
 
+#: The escalation as it is MEANT to be written: status and reason in one statement.
+#: Requires ``UPDATE (status, escalation_reason)`` on ``conflicts``.
 _ESCALATE_CONFLICT = text(
     """
     UPDATE conflicts
@@ -620,6 +865,78 @@ _ESCALATE_CONFLICT = text(
             OR escalation_reason IS DISTINCT FROM :reason)
     """
 )
+
+#: The same escalation with the columns ``recon_writer`` actually holds today
+#: (migration 0004: ``status``, ``last_seen_run``). The conflict still moves to
+#: ``escalated`` and the reason still lands in the ``conflict.escalated`` audit row;
+#: only the denormalised ``conflicts.escalation_reason`` column is left unset. This
+#: is a DEGRADED mode, reported as such -- not an equivalent one.
+_ESCALATE_CONFLICT_STATUS_ONLY = text(
+    """
+    UPDATE conflicts
+       SET status = 'escalated'::conflict_status
+     WHERE id = :id
+       AND status <> 'escalated'::conflict_status
+    """
+)
+
+#: Ask the catalogue, once per run, rather than discovering the answer as an
+#: aborted transaction. A failed statement poisons the whole transaction in
+#: Postgres, so "try it and catch" would need a SAVEPOINT around every escalation;
+#: a catalogue read is one query, deterministic, and cannot half-apply.
+_MAY_SET_ESCALATION_REASON = text(
+    "SELECT has_column_privilege(current_user, 'conflicts', 'escalation_reason', 'UPDATE')"
+)
+
+#: SS7's A -> B -> A needs three ascending generations of one (person_key, field).
+_LINEAGE_GENERATIONS = text("SELECT count(DISTINCT generation) FROM field_lineage")
+
+#: The canonical rows a NESTED fix template has to carry. Read for exactly the
+#: conflicts whose committed SS6 target is in `NESTED_FIX_TARGETS` -- never for
+#: all 43,375 entities, and never per conflict.
+_SELECT_ENTITY_CURRENT = text(
+    """
+    SELECT canonical_id::text AS canonical_id, current
+      FROM entities
+     WHERE canonical_id = ANY(CAST(:canonical_ids AS uuid[]))
+    """
+)
+
+
+def _nested_fix_person_keys(conflicts: Sequence[ConflictRow]) -> list[str]:
+    """The person keys whose fix template will want the entity's ``survived`` map.
+
+    Decided from the CONTRACT, before any packet is built: contract SS6's fix
+    target is a pure function of ``(type, disagreeing_fields)``, so the set of
+    conflicts whose target is in :data:`NESTED_FIX_TARGETS` is known without
+    scoring anything. That is what keeps the read to one statement over a handful
+    of ids instead of 43,375 canonical rows or one query per conflict.
+    """
+    keys: set[str] = set()
+    for conflict in conflicts:
+        if fix_target(conflict.type, conflict.disagreeing_fields).field_path in (
+            NESTED_FIX_TARGETS
+        ):
+            keys.add(str(person_key(conflict.entity_refs)))
+    return sorted(keys)
+
+
+def _load_canonical_rows(
+    conn: Connection, conflicts: Sequence[ConflictRow]
+) -> dict[str, Mapping[str, Any]]:
+    """``{canonical_id: current}`` for the nested-template conflicts, or ``{}``.
+
+    A missing row is not an error and is not filled in: the template falls back
+    to the top-level form, which is inert rather than destructive, and
+    :func:`_assert_action_matches_classification` still judges it. Reading
+    ``entities`` needs only the SELECT grant every role holds (migration 0002);
+    this path never writes it.
+    """
+    wanted = _nested_fix_person_keys(conflicts)
+    if not wanted:
+        return {}
+    rows = conn.execute(_SELECT_ENTITY_CURRENT, {"canonical_ids": wanted}).fetchall()
+    return {row.canonical_id: dict(row.current) for row in rows if isinstance(row.current, Mapping)}
 
 
 def _driver_connection(conn: Connection) -> Any:
@@ -763,6 +1080,118 @@ def _identity_agreement(
     )
 
 
+def _assert_action_matches_classification(
+    conflict: ConflictRow,
+    action: FixAction,
+    classification: Classification,
+    current: Mapping[str, Any] | None = None,
+) -> None:
+    """Re-derive R15 from the paths the ACTION WRITES, in a different component.
+
+    ``recon.sensitive.classify`` decides sensitivity from ONE path -- the fix
+    target. What actually reaches production is what ``action["set"]`` WRITES,
+    and the database does not tie the two together: ``keystone_proposal_born_pending``
+    (KS002) enforces only ``sensitive => born sensitive_hold``, and
+    ``ck_proposals_action_vocabulary`` only pins the ``{"set": {...}}`` SHAPE.
+    A row with ``sensitive = false``, ``status = 'pending'`` and
+    ``action = {"set": {"crm.contact.dob": ...}}`` is accepted by every committed
+    constraint -- it was inserted successfully by hand as ``recon_writer`` -- and
+    under R24 it would be auto-appliable at >= 0.95. That is exactly the row a
+    re-targeting or classifier bug produces.
+
+    So the WRITE SET is checked here, against ``recon.reference`` directly rather
+    than against the classification that is under suspicion:
+
+    * a proposal that is **not** held may write only ``AUTO_APPLY_ELIGIBLE`` paths
+      -- SS6's "eligibility is an allowlist, not the complement of
+      ``SENSITIVE_FIELDS``", so an unrecognised path is refused, not passed;
+    * a **held** proposal may write only its own sensitive target path.
+
+    **Paths, not keys** -- and that is not a refinement, it is the same defect
+    this project has now had to repair at three layers. ``action["set"]``'s keys
+    and the paths the merge would write are two different sets, and they differ
+    exactly where ``entities.current`` nests: a template that writes
+    ``crm.contact.lifecycle_stage`` INTO ``survived`` (which is what makes an
+    auto-apply visible to a reader at all) presents the single key ``survived``,
+    which is on neither committed list. A key-level check would refuse the one
+    correct shape and admit ``{"set": {"survived": {...six sensitive members
+    replaced...}}}``. So this asks ``recon.apply.effective_write_paths`` -- the
+    same function R24's gate and migration 0014's SQL ask -- and judges the
+    LEAVES it returns.
+
+    ``current`` is the target entity's stored ``current``, when the caller has
+    one, and it is the CONSERVATIVE input when it is absent: without a row to
+    diff against, every member a nested action carries counts as written, so a
+    nested action judged with no row raises rather than passing. Callers that
+    author a nested action must pass the row they authored it against.
+
+    This is a control, and **the database backstop it used to say was missing now
+    exists.** This paragraph read "the backstop that is missing is a CHECK or
+    trigger asserting that no key of ``action->'set'`` is in ``SENSITIVE_FIELDS``
+    when ``sensitive`` is false ... that belongs to the migrations ticket". The
+    migrations ticket delivered it, in three revisions, each closing the row the
+    one before it still accepted:
+
+    * **0012** -- ``ck_proposals_sensitive_covers_write_set``, a CHECK refusing
+      ``sensitive = false`` over a top-level ``SENSITIVE_FIELDS`` key;
+    * **0013** -- ``keystone_effective_write_paths`` / ``KS013``, because the
+      write set is a set of PATHS and ``entities.current`` nests (``survived``);
+    * **0014** -- the same judgement taken from the VALUE the merge would
+      produce, at every shape, so ``{"set": {"survived": "wiped"}}`` -- a scalar
+      erasing all nine members -- is refused too.
+
+    So the honest statement is no longer "code only". R15's path-to-sensitivity
+    binding is enforced by code in two independent places *and* by the database,
+    for the schema owner's rows as well as ``recon_writer``'s;
+    ``tests/reconciler/test_reconcile_run.py::test_the_database_refuses_the_row_the_code_refuses``
+    asserts the refusal, having been written to assert the acceptance. What is
+    still true is the narrower thing: a CHECK binds *rows*, not DDL, so the owner
+    can drop it -- defence in depth, not a boundary. See
+    ``docs/proposal-policy.md`` §8.4 for what the constraint does and does not do.
+
+    Raises rather than skipping: a proposal that fails this is not a proposal to
+    downgrade, it is evidence that the classifier and the templates disagree.
+    """
+    # Checked for BOTH branches, and first: the held branch returns early, so a
+    # birth status outside the vocabulary would otherwise slip past on exactly the
+    # proposals it matters most for. Unreachable while `Classification` refuses one
+    # at construction -- which is the point of asserting it in two places.
+    if classification.status not in (STATUS_PENDING, STATUS_SENSITIVE_HOLD):
+        raise ValueError(
+            f"{conflict.type} {conflict.fingerprint}: birth status "
+            f"{classification.status!r} is outside the committed vocabulary "
+            f"{[STATUS_PENDING, STATUS_SENSITIVE_HOLD]} (R15, SQLSTATE KS002)"
+        )
+    assignments = dict(action.action.get("set") or {})
+    written = effective_write_paths(assignments, current)
+    paths = tuple(sorted({path.leaf for path in written}))
+    rendered = [path.display for path in written]
+    if classification.sensitive:
+        allowed = {classification.target_path} - {None}
+        stray = [path for path in paths if path not in allowed]
+        if stray:
+            raise ValueError(
+                f"{conflict.type} {conflict.fingerprint}: a held proposal writes "
+                f"{stray} beyond its own target {classification.target_path!r} "
+                f"(the whole write set is {rendered})"
+            )
+        return
+    leaking = [path for path in paths if is_sensitive(path)]
+    if leaking:
+        raise ValueError(
+            f"{conflict.type} {conflict.fingerprint}: proposal is not held but its "
+            f"action writes the SENSITIVE path(s) {leaking} (R15); the whole write "
+            f"set is {rendered}"
+        )
+    unlisted = [path for path in paths if not is_auto_apply_eligible(path)]
+    if unlisted:
+        raise ValueError(
+            f"{conflict.type} {conflict.fingerprint}: proposal is not held but its "
+            f"action writes {unlisted}, which is not on SS6's AUTO_APPLY_ELIGIBLE "
+            f"allowlist {sorted(AUTO_APPLY_ELIGIBLE)}; the whole write set is {rendered}"
+        )
+
+
 def build_packet(
     conflict: ConflictRow,
     *,
@@ -774,6 +1203,8 @@ def build_packet(
     oscillating: bool,
     oscillation_source: str,
     lineage_rows: int,
+    lineage_generations: int = 0,
+    current: Mapping[str, Any] | None = None,
 ) -> EvidencePacket:
     """Assemble the evidence packet, score it, and classify it.
 
@@ -781,6 +1212,15 @@ def build_packet(
     database at all -- the arithmetic and the classification are then checkable
     without the ingest pipeline, and the pipeline test checks that the real
     inputs reach it.
+
+    ``current`` is the target entity's stored canonical row, when the caller has
+    one (:func:`reconcile` reads it for exactly the conflicts whose committed fix
+    target is in :data:`NESTED_FIX_TARGETS`). It selects no target and no value:
+    it lets the template express an eligible ``survived`` member as the NESTED
+    write that a reader can actually see, and it is what
+    :func:`_assert_action_matches_classification` diffs the action against. It is
+    conservative when absent -- the template falls back to the top-level form and
+    the assertion counts every carried member as written.
     """
     key_class_by_signal = model.key_class_signals()
     matches, contradictions = _identity_agreement(conflict, candidates, key_class_by_signal)
@@ -813,10 +1253,12 @@ def build_packet(
     computed = score(signals, model=model)
 
     classification = classify(conflict.type, conflict.disagreeing_fields)
+    survived = current.get(SURVIVED_CONTAINER) if isinstance(current, Mapping) else None
     action = fix_action(
         conflict.type,
         disagreeing_fields=conflict.disagreeing_fields,
         observed_values=conflict.observed_values,
+        survived=survived if isinstance(survived, Mapping) else None,
     )
 
     # The two must name the same path or one of them is wrong about what this
@@ -829,6 +1271,7 @@ def build_packet(
             f"{action.target_path!r} but the classifier ruled on "
             f"{classification.target_path!r}"
         )
+    _assert_action_matches_classification(conflict, action, classification, current)
 
     nulls = tuple(sorted(key for key, value in observed.items() if observed_value_is_null(value)))
 
@@ -842,6 +1285,7 @@ def build_packet(
         null_observed_values=nulls,
         oscillation_source=oscillation_source,
         lineage_rows=lineage_rows,
+        lineage_generations=lineage_generations,
         signals=signals,
         score=computed,
         classification=classification,
@@ -876,23 +1320,48 @@ OSCILLATION_FROM_ROW: Final = "conflict_row"
 OSCILLATION_NO_INPUT: Final = "no_lineage_and_no_flag"
 
 
-def oscillation_state(conflict: ConflictRow, scan: Any) -> tuple[bool, str]:
+def lineage_generation_count(conn: Connection) -> int:
+    """How many DISTINCT generations ``field_lineage`` covers.
+
+    The input to :func:`oscillation_state`'s guard. Read once per run.
+    """
+    return int(conn.execute(_LINEAGE_GENERATIONS).scalar_one() or 0)
+
+
+def oscillation_state(
+    conflict: ConflictRow, scan: Any, *, lineage_generations: int = 0
+) -> tuple[bool, str]:
     """Did this conflict's field oscillate, and which input said so?
 
     Two inputs, in a fixed order:
 
-    1. the live ``field_lineage`` A -> B -> A scan, but **only when it has rows to
-       read**. ``LineageScan.had_input`` is what distinguishes "scanned and found
-       none" from "there was nothing to scan", and treating the second as the
-       first is exactly the confident ``false`` contract SS7 warns about;
+    1. the live ``field_lineage`` A -> B -> A scan, but **only when the lineage it
+       read could contain the pattern at all** -- rows present AND
+       ``lineage_generations >= LINEAGE_GENERATIONS_REQUIRED``;
     2. otherwise the stored ``conflicts.oscillating`` column, stamped by the
        invariant run that detected the conflict.
 
+    **Why generation coverage and not ``LineageScan.had_input``.** ``had_input``
+    is ``rows > 0``, and a non-empty ``field_lineage`` is not the same claim as a
+    scannable one: ``materialize(lineage_generations=(3,))`` writes 426,175
+    generation-3-only rows, which cannot hold an A, B, A window for any pair. The
+    scan over them is right to find nothing, but "found nothing" then gets
+    reported as a decided ``False`` stamped ``lineage_scan`` -- on the graded
+    store, on all 3,050 proposals, including the 25 that ``golden/conflicts.json``
+    marks oscillating. A confident wrong answer wearing an authoritative label is
+    worse than an admitted unknown, and admitting it is what this guard buys:
+    with one generation of lineage the answer is ``OSCILLATION_NO_INPUT`` unless
+    ``conflicts.oscillating`` says otherwise.
+
     The returned label goes into the packet, so a reviewer always knows which
-    answer they are reading -- and ``OSCILLATION_NO_INPUT`` says plainly that
-    neither input had anything to say.
+    answer they are reading.
     """
-    if scan is not None and getattr(scan, "had_input", False):
+    scannable = (
+        scan is not None
+        and getattr(scan, "had_input", False)
+        and lineage_generations >= LINEAGE_GENERATIONS_REQUIRED
+    )
+    if scannable:
         from recon.invariants.oscillation import OSCILLATION_TYPES
 
         if conflict.type in OSCILLATION_TYPES and conflict.disagreeing_fields:
@@ -937,6 +1406,7 @@ def reconcile(
     conflicts = _load_conflicts(conn)
     open_fingerprints, prior_actions = _load_prior_proposals(conn)
     candidates = _load_candidate_index(conn, generation)
+    canonical_rows = _load_canonical_rows(conn, conflicts)
 
     from recon.invariants.context import read_completeness
     from recon.invariants.oscillation import scan_field_lineage
@@ -944,6 +1414,20 @@ def reconcile(
     driver = _driver_connection(conn)
     incomplete = tuple(sorted({source for source, _ in read_completeness(driver, generation)}))
     scan = scan_field_lineage(driver)
+    lineage_generations = lineage_generation_count(conn)
+    may_set_reason = bool(conn.execute(_MAY_SET_ESCALATION_REASON).scalar_one())
+    if not may_set_reason:
+        log.warning(
+            "reconciler.escalation_reason_not_grantable",
+            rule=(
+                "this principal holds no UPDATE on conflicts.escalation_reason "
+                "(migration 0004 CONFLICT_UPDATE_COLUMNS = status, last_seen_run). "
+                "Oscillation escalation still moves the conflict to 'escalated' and "
+                "still writes the reason to the conflict.escalated audit row, but the "
+                "conflicts.escalation_reason column stays NULL. The fix is a migration "
+                "adding escalation_reason to CONFLICT_UPDATE_COLUMNS."
+            ),
+        )
 
     resolved_run_id = run_id or _derive_run_id(conflicts)
 
@@ -953,10 +1437,12 @@ def reconcile(
     evidence_only = 0
 
     for conflict in conflicts:
-        oscillating, source = oscillation_state(conflict, scan)
+        oscillating, source = oscillation_state(
+            conflict, scan, lineage_generations=lineage_generations
+        )
 
         if oscillating:
-            escalated += _escalate(conn, conflict)
+            escalated += _escalate(conn, conflict, may_set_reason=may_set_reason)
 
         packet = build_packet(
             conflict,
@@ -968,6 +1454,8 @@ def reconcile(
             oscillating=oscillating,
             oscillation_source=source,
             lineage_rows=scan.rows,
+            lineage_generations=lineage_generations,
+            current=canonical_rows.get(str(person_key(conflict.entity_refs))),
         )
 
         skip = _skip_reason(packet, oscillating, open_fingerprints, prior_actions)
@@ -1023,7 +1511,10 @@ def reconcile(
         escalated_oscillation=escalated,
         rationale_attached=sum(1 for outcome in outcomes if outcome.rationale_attached),
         lineage_rows=scan.rows,
+        lineage_generations=lineage_generations,
+        escalation_reason_persisted=may_set_reason,
         model_version=active.version,
+        model_sha256=active.digest,
         by_type=dict(sorted(by_type.items())),
         outcomes=tuple(outcomes),
         elapsed_ms=(time.perf_counter() - started) * 1000.0,
@@ -1058,9 +1549,22 @@ def _skip_reason(
     return None
 
 
-def _escalate(conn: Connection, conflict: ConflictRow) -> int:
-    """Mark the conflict ``escalated:oscillation``; return 1 if the row moved."""
-    result = conn.execute(_ESCALATE_CONFLICT, {"id": conflict.id, "reason": ESCALATION_OSCILLATION})
+def _escalate(conn: Connection, conflict: ConflictRow, *, may_set_reason: bool) -> int:
+    """Mark the conflict ``escalated:oscillation``; return 1 if the row moved.
+
+    ``may_set_reason`` comes from ``has_column_privilege`` and is read once per
+    run. When it is false the reason cannot be written to the conflict row -- but
+    the escalation itself still happens and the reason still lands in the audit
+    row, because losing R16's escalation (or aborting the entire run, which is
+    what the unguarded single statement did) is far worse than a NULL in a
+    denormalised column.
+    """
+    if may_set_reason:
+        result = conn.execute(
+            _ESCALATE_CONFLICT, {"id": conflict.id, "reason": ESCALATION_OSCILLATION}
+        )
+    else:
+        result = conn.execute(_ESCALATE_CONFLICT_STATUS_ONLY, {"id": conflict.id})
     if result.rowcount:
         insert_audit_row(
             conn,
@@ -1073,6 +1577,9 @@ def _escalate(conn: Connection, conflict: ConflictRow) -> int:
                 "fingerprint": conflict.fingerprint,
                 "status": "escalated",
                 "label": f"escalated:{ESCALATION_OSCILLATION}",
+                "outcome": (
+                    "reason_on_conflict_row" if may_set_reason else "reason_in_audit_row_only"
+                ),
                 "disagreeing_fields": list(conflict.disagreeing_fields),
                 "rule": (
                     "R16/SS7: the field re-asserted a previous value across generations; "
@@ -1196,6 +1703,30 @@ def _derive_run_id(conflicts: Sequence[ConflictRow]) -> str:
     """
     payload = "\n".join(sorted(conflict.fingerprint for conflict in conflicts))
     return "recon-" + hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def reconcile_job(run_id: str) -> dict[str, Any]:
+    """``JobHandler`` for ``POST /internal/reconcile`` (R13's scheduled trigger, R19).
+
+    **Provided because the endpoint currently runs nothing.**
+    ``recon.app.create_app`` registers a handler for ``JOB_SYNC`` and no other, so
+    a correctly authenticated ``POST /internal/reconcile`` claims (consumes) the
+    run id, logs ``internal.handler_unbound`` and returns HTTP 200
+    ``{"status": "started", "handler": "unbound"}`` -- a scheduled trigger
+    reporting success for work it did not do, and a retry with the same run id
+    then returns ``"replayed"``. Nothing in the deployed service calls the
+    reconciler at all; only ``recon.suite.mirror`` does.
+
+    ``recon/app.py`` and ``recon/api/`` belong to another ticket, so the binding
+    is not made here. This function is the whole of what that ticket needs::
+
+        from recon.reconciler import reconcile_job
+        register_job_handler(JOB_RECONCILE, reconcile_job, app=app)
+
+    It takes the trigger's ``run_id`` and threads it into the run, so the audit
+    trail ties the proposals to the trigger claim rather than to a derived id.
+    """
+    return dict(reconcile(run_id=run_id).as_dict())
 
 
 def run_once() -> ReconcileReport:

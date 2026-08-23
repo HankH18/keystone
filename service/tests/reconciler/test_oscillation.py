@@ -1,39 +1,57 @@
 """R16/SS7: A -> B -> A escalation, and never re-proposing the identical fix.
 
-READ THIS BEFORE TRUSTING THE GREEN
-------------------------------------
-The session fixture ingests **generation 3 only**, so ``field_lineage`` is empty
-in this database and contract SS7's A -> B -> A scan has nothing to read. These
-tests therefore **write the lineage themselves** -- and everything downstream of
-that write is the real path:
+WHAT THE GREEN HERE IS EVIDENCE OF
+-----------------------------------
+The session fixture ingests **generations 1, 2 and 3** and materializes lineage
+over all three, so ``field_lineage`` holds ~1,279,575 real rows and the committed
+A -> B -> A scan finds its 25 oscillating pairs **unaided**. Those 25 are exactly
+the entries ``golden/conflicts.json`` marks ``"oscillating": true``, matched on
+``(type, sorted(entity_refs))``. So the detection half is real: no test plants the
+pattern for the pipeline to find.
 
-* the rows go into the real ``field_lineage`` table, through the real schema,
-  keyed on the real ``person_key`` of a **real conflict** the committed invariant
-  engine detected on the committed fixtures;
-* they are read back by ``recon.invariants.oscillation.scan_field_lineage`` --
-  the committed scan, not a re-implementation;
-* the conflict is escalated, scored and suppressed by the real reconciler.
+The escalation half runs through a **``recon_writer``** connection -- the
+principal the scheduled job actually authenticates as -- in
+:func:`test_the_real_run_escalates_the_golden_25_as_recon_writer`.
 
-**What that does NOT prove:** that the ingest/ER path *populates* ``field_lineage``
-for generations 1-2, and therefore that the oscillating conflicts are found
-without a test writing the rows.
+WHAT THIS SUITE PREVIOUSLY PROVED, AND WHY THAT MATTERED
+---------------------------------------------------------
+This module used to hand-write its own lineage and run every escalation test
+through a **schema owner** connection, which bypasses grants. It also asserted, in
+this docstring, that the path "does work end to end", and justified not
+reproducing it here with the claim that ingesting generations 1-2 "changes the
+detected conflict set away from the graded one (4,759 conflicts instead of
+golden's 3,050)".
 
-That half was measured separately rather than assumed. In a scratch database with
-generations **1-3** ingested and ``recon.resolve.materialize`` run over all three,
-``field_lineage`` held 1,279,575 real rows, the committed A -> B -> A scan found
-**25** oscillating conflicts unaided, the reconciler escalated all 25 to
-``escalated:oscillation`` with the -0.25 penalty and 25 ``conflict.escalated``
-audit rows, and after a reviewer rejected all 25 the next run refused exactly
-those 25 identical fixes (``skipped_oscillation=25``) while the remaining 4,734
-were blocked by ordinary fingerprint dedup. So the path does work end to end.
+Both halves were false, and together they concealed a production blocker:
 
-It is not reproduced *here* for one specific reason, and it is a real constraint
-rather than a cost: ingesting generations 1-2 changes the detected conflict set
-away from the graded one (4,759 conflicts instead of golden's 3,050 -- the
-invariant engine's generation filtering is incomplete, an upstream matter). This
-suite asserts proposal COUNTS against the graded set, so it cannot also be the
-suite that ingests generations 1-2. The two configurations are exercised
-separately and the ticket report says so.
+* ingesting generations 1-2 does **not** change the graded set. Measured:
+  generations 1, 2 and 3 ingested, ``run_invariants`` returns 3,050 conflicts in
+  exactly the golden per-type distribution, because SS7 has invariants read
+  generation 3 only. The fixture now does exactly that and asserts it;
+* the end-to-end run under the real principal **crashed**. ``_ESCALATE_CONFLICT``
+  sets ``conflicts.escalation_reason``, and migration 0004 grants ``recon_writer``
+  ``UPDATE (status, last_seen_run)`` on ``conflicts`` and nothing else, so
+  Postgres refused the whole statement with SQLSTATE 42501 -- inside the run's
+  transaction, rolling back every proposal. ``run_once()`` wrote **zero**
+  proposals the first time any conflict oscillated. Reproduced directly:
+  ``UPDATE conflicts SET status=...`` succeeds as ``recon_writer`` and
+  ``UPDATE conflicts SET status=..., escalation_reason=...`` is denied.
+
+:func:`recon.reconciler._escalate` now asks ``has_column_privilege`` once per run
+and escalates with the columns it holds; the reason always reaches the
+``conflict.escalated`` audit row, and ``report.escalation_reason_persisted`` says
+whether it also reached the column.
+
+WHAT IS STILL NOT PROVEN
+-------------------------
+``conflicts.escalation_reason`` is **not** populated under ``recon_writer`` today,
+because the grant does not exist. The dashboard's ``escalated:oscillation`` label
+is reconstructible from ``conflicts.status`` plus the audit row, not from the
+conflict row alone. **The fix is a one-line migration** adding
+``escalation_reason`` to ``CONFLICT_UPDATE_COLUMNS`` (migration 0004); this ticket
+may not add a migration, and :func:`test_the_escalation_reason_column_is_ungranted`
+pins the current state so the day the grant lands, that test turns red and is
+updated deliberately rather than silently.
 """
 
 from __future__ import annotations
@@ -46,6 +64,7 @@ from sqlalchemy import Connection, text
 
 from recon.invariants.oscillation import scan_field_lineage
 from recon.reconciler import (
+    LINEAGE_GENERATIONS_REQUIRED,
     OSCILLATION_FROM_ROW,
     OSCILLATION_FROM_SCAN,
     OSCILLATION_NO_INPUT,
@@ -81,7 +100,13 @@ def _row(**kwargs: object) -> ConflictRow:
 
 
 class _Scan:
-    """A stand-in for `LineageScan` with the two attributes the decision reads."""
+    """A stand-in for `LineageScan` with the two attributes the decision reads.
+
+    ``rows`` is deliberately kept separate from the generation count the decision
+    now also takes: the whole point of the fix is that the two are different
+    questions and only one of them says whether an A -> B -> A could have been
+    found.
+    """
 
     def __init__(self, pairs: set[tuple[str, str]], rows: int) -> None:
         self.pairs = pairs
@@ -95,6 +120,12 @@ class _Scan:
         return (canonical_id, field_path) in self.pairs
 
 
+#: The shipped configuration before the fix: lineage materialized for generation 3
+#: alone. Non-empty, unscannable.
+_ONE_GENERATION = 1
+_THREE_GENERATIONS = LINEAGE_GENERATIONS_REQUIRED
+
+
 def test_an_empty_lineage_scan_is_reported_as_no_input_not_as_a_false() -> None:
     """The distinction the whole module exists to preserve.
 
@@ -102,28 +133,73 @@ def test_an_empty_lineage_scan_is_reported_as_no_input_not_as_a_false() -> None:
     scan". Reporting that as a confident "does not oscillate" is the failure this
     label prevents, and it is why the packet records which input answered.
     """
-    oscillating, source = oscillation_state(_row(), _Scan(set(), rows=0))
+    oscillating, source = oscillation_state(_row(), _Scan(set(), rows=0), lineage_generations=0)
     assert oscillating is False
     assert source == OSCILLATION_NO_INPUT
 
 
-def test_a_scan_with_rows_that_finds_nothing_is_a_real_negative() -> None:
-    oscillating, source = oscillation_state(_row(), _Scan(set(), rows=5000))
+def test_lineage_with_rows_but_ONE_generation_is_also_no_input() -> None:
+    """The confident false the row-count guard let through, pinned as no-input.
+
+    CONTRACT CHANGED (deliberate). The old assertion here was
+    ``oscillation_state(_row(), _Scan(set(), rows=5000)) == (False,
+    OSCILLATION_FROM_SCAN)`` under the name "a scan with rows that finds nothing
+    is a real negative". Row count is not the question SS7 asks: the pattern is
+    "A, B, A across ascending generations", so lineage covering ONE generation is
+    structurally incapable of containing it however many rows it has. The shipped
+    configuration was exactly that -- ``materialize(lineage_generations=(3,))``,
+    426,175 rows, ``had_input`` True -- and every one of the 3,050 graded
+    proposals therefore recorded ``decided_by: lineage_scan`` with
+    ``observed: false``, including the 25 that ``golden/conflicts.json`` marks
+    oscillating. A wrong answer wearing an authoritative provenance label is worse
+    than an admitted unknown.
+    """
+    oscillating, source = oscillation_state(
+        _row(), _Scan(set(), rows=426_175), lineage_generations=_ONE_GENERATION
+    )
+    assert oscillating is False
+    assert source == OSCILLATION_NO_INPUT, (
+        "one generation of lineage cannot contain A -> B -> A, so the scan is not "
+        "an answer and must not be reported as one"
+    )
+
+
+def test_a_scan_over_three_generations_that_finds_nothing_is_a_real_negative() -> None:
+    """With the coverage to find it, "found none" IS a decided negative."""
+    oscillating, source = oscillation_state(
+        _row(), _Scan(set(), rows=5000), lineage_generations=_THREE_GENERATIONS
+    )
     assert oscillating is False
     assert source == OSCILLATION_FROM_SCAN
+
+
+def test_one_generation_of_lineage_still_defers_to_the_stored_flag() -> None:
+    """The fallback the row-count guard made unreachable.
+
+    With ``had_input`` alone, a non-empty single-generation lineage suppressed the
+    ``conflicts.oscillating`` column entirely -- ``OSCILLATION_FROM_ROW`` could
+    never be reached in the shipped configuration.
+    """
+    oscillating, source = oscillation_state(
+        _row(oscillating=True), _Scan(set(), rows=426_175), lineage_generations=_ONE_GENERATION
+    )
+    assert oscillating is True
+    assert source == OSCILLATION_FROM_ROW
 
 
 def test_the_live_scan_finds_an_oscillation_the_stored_flag_missed() -> None:
     conflict = _row(oscillating=False)
     key = str(person_key(conflict.entity_refs))
     scan = _Scan({(key, "crm.contact.grade")}, rows=10)
-    oscillating, source = oscillation_state(conflict, scan)
+    oscillating, source = oscillation_state(conflict, scan, lineage_generations=_THREE_GENERATIONS)
     assert oscillating is True
     assert source == OSCILLATION_FROM_SCAN
 
 
 def test_the_stored_flag_is_used_when_there_is_no_lineage_to_scan() -> None:
-    oscillating, source = oscillation_state(_row(oscillating=True), _Scan(set(), rows=0))
+    oscillating, source = oscillation_state(
+        _row(oscillating=True), _Scan(set(), rows=0), lineage_generations=0
+    )
     assert oscillating is True
     assert source == OSCILLATION_FROM_ROW
 
@@ -133,22 +209,28 @@ def test_only_the_two_types_that_carry_disagreeing_fields_can_oscillate() -> Non
     conflict = _row(type="C12", disagreeing_fields=())
     key = str(person_key(conflict.entity_refs))
     scan = _Scan({(key, "crm.contact.grade")}, rows=10)
-    assert oscillation_state(conflict, scan) == (False, OSCILLATION_FROM_SCAN)
+    assert oscillation_state(conflict, scan, lineage_generations=_THREE_GENERATIONS) == (
+        False,
+        OSCILLATION_FROM_SCAN,
+    )
 
 
 # =====================================================================================
-# the real path, with lineage this test writes
+# the real path: real lineage, real oscillations, the real principal
 # =====================================================================================
 @pytest.fixture
 def owner(conflict_store: str) -> Iterator[Connection]:
     """A schema-owner connection, rolled back.
 
-    Deliberately the owner rather than ``recon_writer``: this test has to play a
-    reviewer *rejecting* a proposal inside the same transaction as the run that
-    created it, and only the review role (or the owner, which migration 0006
-    binds to the same transition graph) may move a proposal to ``rejected``.
-    The write BOUNDARY is tested as ``recon_writer`` in ``test_reconcile_run.py``;
-    what is under test here is the POLICY.
+    Used ONLY by the tests that must play a reviewer *rejecting* a proposal inside
+    the same transaction as the run that created it: migration 0006 lets only the
+    review role (or the owner, bound to the same transition graph) move a proposal
+    to ``rejected``.
+
+    It is deliberately NOT the fixture for the escalation tests any more. The
+    owner bypasses grants, and owner-only escalation coverage is exactly what hid
+    a run-aborting ``InsufficientPrivilege`` in the shipped path -- see
+    :func:`test_the_real_run_escalates_the_golden_25_as_recon_writer`.
     """
     del conflict_store
     from recon.db import get_engine
@@ -161,143 +243,239 @@ def owner(conflict_store: str) -> Iterator[Connection]:
             transaction.rollback()
 
 
-def _a_real_c6_conflict(conn: Connection) -> tuple[int, str, tuple[str, ...], tuple[str, ...]]:
-    row = conn.execute(
+def _golden_oscillating_keys() -> set[tuple[str, tuple[str, ...]]]:
+    """``(type, sorted(entity_refs))`` for every golden entry marked oscillating."""
+    import json
+    from pathlib import Path
+
+    golden = json.loads(
+        (Path(__file__).resolve().parents[3] / "golden" / "conflicts.json").read_text()
+    )
+    return {
+        (entry["type"], tuple(sorted(entry["entity_refs"])))
+        for entry in golden
+        if entry.get("oscillating")
+    }
+
+
+def _an_oscillating_conflict(conn: Connection) -> tuple[int, str, tuple[str, ...], tuple[str, ...]]:
+    """A conflict the COMMITTED scan says oscillates, found without planting anything."""
+    scan = scan_field_lineage(conn.connection.driver_connection)
+    assert scan.pairs, "no oscillating pairs in real lineage; the fixture is not built"
+    rows = conn.execute(
+        text(
+            "SELECT id, fingerprint, entity_refs, disagreeing_fields FROM conflicts "
+            " WHERE type IN ('C6', 'C14') AND jsonb_array_length(disagreeing_fields) > 0 "
+            " ORDER BY fingerprint"
+        )
+    ).all()
+    for row in rows:
+        key = str(person_key(tuple(row.entity_refs)))
+        hits = [path for path in row.disagreeing_fields if scan.oscillates(key, path)]
+        if hits:
+            return row.id, row.fingerprint, tuple(row.entity_refs), tuple(hits)
+    raise AssertionError("the scan found pairs but none of them matched a conflict")
+
+
+def _a_non_oscillating_c6(conn: Connection) -> tuple[int, str]:
+    scan = scan_field_lineage(conn.connection.driver_connection)
+    rows = conn.execute(
         text(
             "SELECT id, fingerprint, entity_refs, disagreeing_fields FROM conflicts "
             " WHERE type = 'C6' AND jsonb_array_length(disagreeing_fields) > 0 "
-            " ORDER BY fingerprint LIMIT 1"
+            " ORDER BY fingerprint"
         )
-    ).one()
-    return row.id, row.fingerprint, tuple(row.entity_refs), tuple(row.disagreeing_fields)
+    ).all()
+    for row in rows:
+        key = str(person_key(tuple(row.entity_refs)))
+        if not any(scan.oscillates(key, path) for path in row.disagreeing_fields):
+            return row.id, row.fingerprint
+    raise AssertionError("every C6 oscillates; the control test would prove nothing")
 
 
-def _write_aba_lineage(conn: Connection, canonical_id: str, field_path: str) -> None:
-    """Give ONE ``(canonical_id, field)`` an A -> B -> A history: A, then B, then A.
+def _clear_lineage(conn: Connection, entity_refs: tuple[str, ...], paths: tuple[str, ...]) -> None:
+    """Remove one pair's history so it stops oscillating. The sabotage lever."""
+    canonical = str(person_key(entity_refs))
+    removed = 0
+    for path in paths:
+        result = conn.execute(
+            text(
+                "DELETE FROM field_lineage WHERE canonical_id = CAST(:cid AS uuid) "
+                "  AND field = :field"
+            ),
+            {"cid": canonical, "field": path},
+        )
+        removed += result.rowcount
+    assert removed > 0, (
+        f"no field_lineage rows removed for {canonical} {paths}; the sabotage lever "
+        "did nothing, so the comparison below would be between two identical runs"
+    )
 
-    The existing generation-3 rows for that pair are removed first. The session
-    fixture materializes generation 3, so ``field_lineage`` already holds ~426,000
-    real rows and this pair already has a generation-3 entry; leaving it in place
-    would leave the pair's newest value coming from the real row (the scan takes
-    the lexicographically smallest ``source_ref`` per generation, SS4.6's
-    tiebreak) and no A -> B -> A would exist. Replacing that pair's history is
-    what "this field oscillated" means, and it leaves every other pair's real
-    lineage untouched -- so the scan has to find one planted pattern inside
-    426,000 genuine rows rather than in an empty table.
+
+def test_the_committed_scan_finds_the_golden_25_without_a_test_planting_them(
+    owner: Connection,
+) -> None:
+    """The detection half, unaided.
+
+    No row in this test writes lineage. The fixture ingests generations 1-3 and
+    materializes them; the committed scan is handed the result and must find
+    exactly the pairs ``golden/conflicts.json`` marks oscillating.
     """
-    conn.execute(
-        text(
-            "DELETE FROM field_lineage WHERE canonical_id = CAST(:cid AS uuid) AND field = :field"
-        ),
-        {"cid": canonical_id, "field": field_path},
-    )
-    conn.execute(
-        text(
-            "INSERT INTO field_lineage (canonical_id, field, value_text, source_id, "
-            "source_ref, generation) VALUES "
-            "(CAST(:cid AS uuid), :field, 'A', 'crm', 'crm:contact:probe', 1), "
-            "(CAST(:cid AS uuid), :field, 'B', 'crm', 'crm:contact:probe', 2), "
-            "(CAST(:cid AS uuid), :field, 'A', 'crm', 'crm:contact:probe', 3)"
-        ),
-        {"cid": canonical_id, "field": field_path},
-    )
-
-
-def test_the_committed_scan_finds_the_pattern_this_test_wrote(owner: Connection) -> None:
-    """First, prove the scan sees it -- otherwise everything below is vacuous.
-
-    Both halves are asserted: the pair does NOT oscillate over the real,
-    materialized generation-3 lineage, and it DOES once a history is written for
-    it. Without the first half a scan that returned every pair would pass.
-    """
-    _, _, entity_refs, paths = _a_real_c6_conflict(owner)
-    canonical_id = str(person_key(entity_refs))
-
-    before = scan_field_lineage(owner.connection.driver_connection)
-    assert before.had_input is True, "the fixture materializes generation 3; lineage is not empty"
-    assert before.rows > 100_000, f"only {before.rows} lineage rows -- did materialize run?"
-    assert not before.oscillates(canonical_id, paths[0])
-    assert before.pairs == frozenset(), (
-        "generation-3-only lineage cannot contain an A -> B -> A pattern, so the "
-        f"scan must find none; it found {sorted(before.pairs)[:3]}"
-    )
-
-    _write_aba_lineage(owner, canonical_id, paths[0])
-
     scan = scan_field_lineage(owner.connection.driver_connection)
     assert scan.had_input is True
-    assert scan.oscillates(canonical_id, paths[0])
-    assert scan.pairs == frozenset({(canonical_id, paths[0])}), (
-        "exactly one pair was given a history; the scan must not invent others"
+    assert scan.rows > 1_000_000, f"only {scan.rows} lineage rows -- did materialize run?"
+    assert len(scan.pairs) == 25, (
+        f"the scan found {len(scan.pairs)} A -> B -> A pairs over real generation-1-3 "
+        "lineage; golden marks 25 conflicts oscillating"
     )
 
-
-def test_an_oscillating_conflict_is_marked_escalated_oscillation(owner: Connection) -> None:
-    conflict_id, fingerprint, entity_refs, paths = _a_real_c6_conflict(owner)
-    _write_aba_lineage(owner, str(person_key(entity_refs)), paths[0])
-
-    report = reconcile(conn=owner, run_id="t7-osc-escalate")
-
-    assert report.lineage_rows > 0
-    assert report.escalated_oscillation == 1
-    status, reason = owner.execute(
-        text("SELECT status::text, escalation_reason FROM conflicts WHERE id = :id"),
-        {"id": conflict_id},
-    ).one()
-    assert (status, reason) == ("escalated", "oscillation")
-
-    # SS7's label, as the dashboard renders it.
-    assert f"{status}:{reason}" == "escalated:oscillation"
-
-    audited = owner.execute(
-        text(
-            "SELECT count(*) FROM audit_log WHERE action = 'conflict.escalated' AND subject = :fp"
-        ),
-        {"fp": fingerprint},
+    generations = owner.execute(
+        text("SELECT count(DISTINCT generation) FROM field_lineage")
     ).scalar_one()
-    assert audited == 1
+    assert generations == 3, "SS7's A -> B -> A window needs three ascending generations"
 
 
-def test_only_the_oscillating_conflict_is_escalated(owner: Connection) -> None:
-    """A blast-radius check: escalation must not spill onto the other 4,000."""
-    _, _, entity_refs, paths = _a_real_c6_conflict(owner)
-    _write_aba_lineage(owner, str(person_key(entity_refs)), paths[0])
+def test_the_real_run_escalates_the_golden_25_as_recon_writer(writer: Connection) -> None:
+    """THE test the suite did not have: real oscillations, real principal.
 
-    reconcile(conn=owner, run_id="t7-osc-scope")
+    Every escalation test previously ran as the schema owner, which bypasses
+    grants. Under ``recon_writer`` -- the principal ``run_once()`` authenticates
+    as -- the single-statement escalation
+    ``UPDATE conflicts SET status=..., escalation_reason=...`` was refused with
+    SQLSTATE 42501, and because the exception propagated out of ``reconcile``'s
+    transaction the ENTIRE run rolled back: zero proposals, the first time any
+    conflict oscillated.
 
-    escalated = owner.execute(
+    This asserts the run completes, writes one proposal per conflict, and
+    escalates exactly the golden 25 -- as ``recon_writer``.
+    """
+    report = reconcile(conn=writer, run_id="t7-osc-writer")
+
+    assert writer.execute(text("SELECT current_user")).scalar_one() == "recon_writer"
+    assert report.lineage_generations == 3
+    assert report.conflicts_seen == report.proposed, (
+        "R13: one proposal per conflict. A crash mid-run would show up here as a "
+        "short count rather than as an exception, so it is asserted as a number."
+    )
+    assert report.escalated_oscillation == 25
+
+    escalated = writer.execute(
         text("SELECT count(*) FROM conflicts WHERE status = 'escalated'")
     ).scalar_one()
-    assert escalated == 1
+    assert escalated == 25
+
+    # The reason reaches a durable row whether or not the column grant exists.
+    audited = writer.execute(
+        text("SELECT count(*) FROM audit_log WHERE action = 'conflict.escalated'")
+    ).scalar_one()
+    assert audited == 25
+
+
+def test_the_escalated_set_is_exactly_goldens_oscillating_set(writer: Connection) -> None:
+    """Not just the right COUNT -- the right conflicts."""
+    reconcile(conn=writer, run_id="t7-osc-identity")
+    rows = writer.execute(
+        text("SELECT type, entity_refs FROM conflicts WHERE status = 'escalated'")
+    ).all()
+    escalated = {(row.type, tuple(sorted(row.entity_refs))) for row in rows}
+    assert escalated == _golden_oscillating_keys()
+
+
+def test_the_escalation_reason_column_is_ungranted_to_recon_writer(writer: Connection) -> None:
+    """Pins the DEGRADED state so the fix is a deliberate, visible change.
+
+    Migration 0004 narrowed ``recon_writer``'s UPDATE on ``conflicts`` to
+    ``(status, last_seen_run)``. ``escalation_reason`` is not in that list, so the
+    reconciler writes the reason to the audit row only and reports
+    ``escalation_reason_persisted=False``. The proper fix is a migration adding
+    the column to ``CONFLICT_UPDATE_COLUMNS``; this ticket may not add one.
+
+    **When that migration lands this test turns red**, which is the point: the
+    remediation is then applied deliberately (flip both assertions and assert the
+    column is populated) rather than leaving a stale caveat in the docs.
+    """
+    granted = writer.execute(
+        text(
+            "SELECT has_column_privilege(current_user, 'conflicts', 'escalation_reason', 'UPDATE')"
+        )
+    ).scalar_one()
+    report = reconcile(conn=writer, run_id="t7-osc-grant")
+    assert report.escalation_reason_persisted is granted
+    assert granted is False, (
+        "recon_writer can now write conflicts.escalation_reason. Good -- update "
+        "this test and assert the column is populated on all 25 escalations."
+    )
+    # The escalation still happened, and the reason is still recorded.
+    assert report.escalated_oscillation == 25
+    body_has_reason = writer.execute(
+        text(
+            "SELECT count(*) FROM audit_log WHERE action = 'conflict.escalated' "
+            "  AND detail::text LIKE '%reason_in_audit_row_only%'"
+        )
+    ).scalar_one()
+    assert body_has_reason == 25
+
+
+def test_the_penalty_is_recorded_on_a_real_oscillating_proposal(writer: Connection) -> None:
+    """As ``recon_writer``: the packet says the scan decided, and why it could.
+
+    ``lineage_generations == 3`` is the assertion that makes ``decided_by:
+    lineage_scan`` mean something. Under the shipped gen-3-only fixture it was 1,
+    the scan could not have found an A -> B -> A, and every packet claimed
+    ``lineage_scan`` anyway.
+    """
+    _, fingerprint, _, _ = _an_oscillating_conflict(writer)
+
+    reconcile(conn=writer, run_id="t7-osc-scored")
+    confidence, evidence = writer.execute(
+        text("SELECT confidence, evidence FROM proposals WHERE fingerprint = :fp"),
+        {"fp": fingerprint},
+    ).one()
+    assert evidence["oscillation"]["observed"] is True
+    assert evidence["oscillation"]["decided_by"] == OSCILLATION_FROM_SCAN
+    assert evidence["oscillation"]["lineage_generations"] == 3
+    assert evidence["confidence"]["signals"]["oscillation_observed"] is True
+
+    # The persisted packet must re-derive the stored number, penalty included.
+    term = next(t for t in evidence["confidence"]["terms"] if t["signal"] == "oscillation_observed")
+    assert Decimal(term["contribution"]) == Decimal("-0.25")
+    assert Decimal(evidence["confidence"]["confidence"]) == Decimal(confidence)
 
 
 def test_oscillation_lowers_the_confidence_by_exactly_the_committed_weight(
     owner: Connection,
 ) -> None:
-    """-0.25, the heaviest penalty in the model, applied to a real conflict."""
-    conflict_id, fingerprint, entity_refs, paths = _a_real_c6_conflict(owner)
+    """-0.25, the heaviest penalty in the model, on a REAL oscillating conflict.
 
-    baseline = reconcile(conn=owner, run_id="t7-osc-baseline")
-    before = owner.execute(
-        text("SELECT confidence FROM proposals WHERE fingerprint = :fp"), {"fp": fingerprint}
+    The sabotage lever is deleting that pair's lineage: with it the conflict
+    oscillates and is penalised, without it the same conflict is not. If the
+    penalty came from anywhere else, both runs would score the same.
+
+    Runs as the OWNER only because it has to clear ``proposals``/``audit_log``
+    between the two runs, and ``recon_writer`` is append-only on both by design
+    (migration 0004) -- which is itself a property worth having. The recon_writer
+    half of this path is asserted directly above.
+    """
+    _, fingerprint, entity_refs, paths = _an_oscillating_conflict(owner)
+
+    reconcile(conn=owner, run_id="t7-osc-scored")
+    penalised = owner.execute(
+        text("SELECT confidence FROM proposals WHERE fingerprint = :fp"),
+        {"fp": fingerprint},
     ).scalar_one()
-    assert baseline.proposed > 0
+
     owner.execute(text("DELETE FROM audit_log"))
     owner.execute(text("DELETE FROM proposals"))
+    owner.execute(text("UPDATE conflicts SET status = 'open' WHERE status = 'escalated'"))
+    _clear_lineage(owner, entity_refs, paths)
 
-    _write_aba_lineage(owner, str(person_key(entity_refs)), paths[0])
-    reconcile(conn=owner, run_id="t7-osc-scored")
-    after, evidence = owner.execute(
+    reconcile(conn=owner, run_id="t7-osc-baseline")
+    plain, plain_evidence = owner.execute(
         text("SELECT confidence, evidence FROM proposals WHERE fingerprint = :fp"),
         {"fp": fingerprint},
     ).one()
-
-    assert Decimal(before) - Decimal(after) == Decimal("0.2500")
-    assert evidence["oscillation"]["observed"] is True
-    assert evidence["oscillation"]["decided_by"] == OSCILLATION_FROM_SCAN
-    assert evidence["oscillation"]["lineage_rows"] > 0
-    assert evidence["confidence"]["signals"]["oscillation_observed"] is True
-    del conflict_id
+    assert plain_evidence["oscillation"]["observed"] is False
+    assert Decimal(plain) - Decimal(penalised) == Decimal("0.2500")
 
 
 def _reject(conn: Connection, fingerprint: str) -> None:
@@ -319,12 +497,15 @@ def test_a_rejected_fix_is_never_re_proposed_while_the_field_oscillates(
     ``status <> 'rejected'``). Without the oscillation rule the next run would
     re-propose the identical fix a human just refused, on a field the source keeps
     re-asserting -- which is exactly what R16 forbids.
+
+    Runs as the owner because only the review role may set ``rejected``; the
+    escalation this depends on is proven under ``recon_writer`` above.
     """
-    _, fingerprint, entity_refs, paths = _a_real_c6_conflict(owner)
-    _write_aba_lineage(owner, str(person_key(entity_refs)), paths[0])
+    _, fingerprint, _, _ = _an_oscillating_conflict(owner)
 
     first = reconcile(conn=owner, run_id="t7-osc-r1")
     assert any(o.fingerprint == fingerprint and o.proposed for o in first.outcomes)
+    assert first.escalated_oscillation == 25
 
     _reject(owner, fingerprint)
 
@@ -333,6 +514,7 @@ def test_a_rejected_fix_is_never_re_proposed_while_the_field_oscillates(
     assert outcome.proposed is False
     assert outcome.skip_reason == SKIP_OSCILLATION
     assert second.skipped_oscillation == 1
+    assert second.skipped_fingerprint == 3049
 
     live = owner.execute(
         text("SELECT count(*) FROM proposals WHERE fingerprint = :fp AND status <> 'rejected'"),
@@ -346,10 +528,11 @@ def test_the_control_a_rejected_fix_that_does_not_oscillate_IS_re_proposed(
 ) -> None:
     """The sabotage check: prove the suppression came from OSCILLATION.
 
-    Same setup, same rejection, no lineage. If this conflict were also suppressed,
-    the test above would be evidence of nothing but fingerprint bookkeeping.
+    Same setup, same rejection, on a conflict the scan does NOT flag. If this one
+    were also suppressed, the test above would be evidence of nothing but
+    fingerprint bookkeeping.
     """
-    _, fingerprint, _, _ = _a_real_c6_conflict(owner)
+    _, fingerprint = _a_non_oscillating_c6(owner)
 
     first = reconcile(conn=owner, run_id="t7-ctl-r1")
     assert any(o.fingerprint == fingerprint and o.proposed for o in first.outcomes)
@@ -366,17 +549,16 @@ def test_the_control_a_rejected_fix_that_does_not_oscillate_IS_re_proposed(
     assert second.proposed == 1
 
 
-def test_an_oscillating_conflict_still_gets_its_FIRST_proposal(owner: Connection) -> None:
+def test_an_oscillating_conflict_still_gets_its_FIRST_proposal(writer: Connection) -> None:
     """R16 forbids re-proposing the identical fix; the first one is not a re-propose.
 
     The conflict is escalated and the score carries the penalty, but it does reach
     a human -- a silently dropped conflict would be the worse failure.
     """
-    _, fingerprint, entity_refs, paths = _a_real_c6_conflict(owner)
-    _write_aba_lineage(owner, str(person_key(entity_refs)), paths[0])
+    _, fingerprint, _, _ = _an_oscillating_conflict(writer)
 
-    report = reconcile(conn=owner, run_id="t7-osc-first")
+    report = reconcile(conn=writer, run_id="t7-osc-first")
     outcome = next(o for o in report.outcomes if o.fingerprint == fingerprint)
     assert outcome.proposed is True
     assert outcome.escalated is True
-    assert report.escalated_oscillation == 1
+    assert report.escalated_oscillation == 25

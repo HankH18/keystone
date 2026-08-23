@@ -418,14 +418,20 @@ SAFE_KEYS: Final[frozenset[str]] = frozenset(
         "accepted",
         "action",
         "actor",
+        "after_digest",
         "alert",
         "attempt",
         "attempts",
+        "auto",
+        "before_digest",
         "complete",
         "confidence",
+        "conflict_type",
         "count",
         "created_run",
+        "current_status",
         "deal_present_gen3",
+        "decision",
         "disposition",
         "dropped_source",
         "decided_by",
@@ -437,8 +443,11 @@ SAFE_KEYS: Final[frozenset[str]] = frozenset(
         "entry",  # a manifest's `<source>.<entity>` key, not a datum
         "env_var",
         "env_vars",
+        "event_id",
         "expected",
+        "failed",
         "field",
+        "form",
         "found",
         "field_path",
         "fingerprint",
@@ -452,6 +461,7 @@ SAFE_KEYS: Final[frozenset[str]] = frozenset(
         "last_seen_run",
         "level",
         "line",
+        "lineage",
         "link_method",
         "load_id",
         "loaded",
@@ -462,6 +472,7 @@ SAFE_KEYS: Final[frozenset[str]] = frozenset(
         "model",
         "oscillating",
         "outcome",
+        "param",
         "path",
         "persist",
         "presented",
@@ -474,6 +485,8 @@ SAFE_KEYS: Final[frozenset[str]] = frozenset(
         "records_rejected",
         "rejected",
         "rejections",
+        "restored_digest",
+        "returned",
         "rows",
         "rule",
         "rule_id",
@@ -497,11 +510,13 @@ SAFE_KEYS: Final[frozenset[str]] = frozenset(
         "title",
         "tokens_in",
         "tokens_out",
+        "total",
         "unchecked_fields",
         "upstream_status",
         "usage",
         "verdict",
         "version",
+        "wanted_status",
         "window_days",
     }
 )
@@ -615,6 +630,7 @@ SEQUENCE_SAFE_KEYS: Final[frozenset[str]] = frozenset(
         "disagreeing_fields",
         "entity_refs",
         "env_vars",
+        "failed",  # `recon.apply`: the names of R24's failed gate checks
         "paid_payment_refs",
         "rejections",
         "scopes",
@@ -1455,6 +1471,20 @@ RETENTION: Final[tuple[RetentionRule, ...]] = (
             "`source_key` is the source's natural key (it is joined to "
             "raw_records.natural_key by trigger KS009), i.e. a surrogate identifier, "
             "not personal data. Kept as long as the canonical rows it justifies."
+        ),
+    ),
+    RetentionRule(
+        table="budget_model_prices",
+        disposition="retain",
+        reason=(
+            "Reference data, not a record of anything that happened: the committed "
+            "per-token rates from prices.yaml (migration 0010), keyed by model name. "
+            "It carries no personal data and it is owner-only for a reason -- "
+            "migration 0010's reserve and settle triggers derive the worst case and "
+            "the settled amount by reading this table, so a row that aged out would "
+            "turn every reservation for that model into KS0xx 'model is not in "
+            "budget_model_prices' rather than free anything. Rows change by "
+            "migration, never by clock."
         ),
     ),
     *(

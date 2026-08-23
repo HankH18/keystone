@@ -12,24 +12,38 @@ rows -- which matters more here than anywhere, because the graded claim is a
 skips on a laptop with no docker and **fails** in CI, because a green that proves
 nothing is worse than a red.
 
-What the session fixture builds, and what it deliberately does not
-------------------------------------------------------------------
-Generation 3 is ingested and the committed invariant engine is run over it, so
-``conflicts`` holds the real, graded conflict set -- these tests count real
-proposals against real detections, not fixtures.
+What the session fixture builds, and why all three generations
+--------------------------------------------------------------
+**All three generations** are ingested and the committed invariant engine is run
+over them, so ``conflicts`` holds the real, graded conflict set -- these tests
+count real proposals against real detections, not fixtures.
 
-``recon.resolve.materialize`` is then run for generation 3, because the three
-heaviest-weighted confidence signals are read from ``entity_link_candidates`` and
-without it that table is empty -- every identity signal would score 0, every
-score would still be produced, and every assertion here would still pass. That is
-the definition of an untested green, so the ~2 minutes it costs is paid.
+``recon.resolve.materialize`` is then run with ``lineage_generations=(1, 2, 3)``,
+for two separate reasons:
 
-What is deliberately NOT built is generations 1-2. ``field_lineage`` therefore
-holds generation 3 only, which cannot contain an A -> B -> A pattern, so the
-oscillation tests write their own lineage; ``test_oscillation.py``'s module
-docstring says exactly what that does and does not prove. (Ingesting generations
-1-2 is also not neutral: it changes the detected conflict set away from the
-graded one -- see :func:`_assert_store_matches_golden`.)
+* the three heaviest-weighted confidence signals are read from
+  ``entity_link_candidates``, and without materialization that table is empty --
+  every identity signal would score 0, every score would still be produced, and
+  every assertion here would still pass. That is the definition of an untested
+  green;
+* contract SS7's A -> B -> A pattern needs **three ascending generations** of one
+  ``(person_key, field)``. Lineage covering one generation cannot contain it, so
+  a suite built that way can only test R16 against hand-planted rows.
+
+**This fixture previously ingested generation 3 alone**, and this docstring
+previously said that ingesting generations 1-2 "changes the detected conflict set
+away from the graded one (4,759 conflicts instead of golden's 3,050)". That is
+false, and it was load-bearing: it is the stated reason R16's oscillation half was
+never exercised end to end. Measured in a scratch database with generations 1, 2
+and 3 ingested, ``run_invariants`` returns **3,050** conflicts in exactly the
+golden per-type distribution -- byte-for-byte the graded set -- because
+invariants read generation 3 only (SS7). :func:`_assert_store_matches_golden`
+asserts that on every run, so the claim is enforced rather than believed.
+
+With all three generations, ``field_lineage`` holds ~1,279,575 rows across
+generations 1-3, the committed A -> B -> A scan finds **25** oscillating pairs
+unaided, and those 25 are exactly the entries ``golden/conflicts.json`` marks
+``"oscillating": true``. The whole build costs about a minute.
 """
 
 from __future__ import annotations
@@ -72,9 +86,18 @@ def scratch_dsn() -> Iterator[str]:
         yield dsn
 
 
+#: SS7: gen 1 baseline, gen 2 changes, gen 3 = current state with >= 25 fields
+#: re-asserting their gen-1 value. All three are needed for an A -> B -> A window.
+INGESTED_GENERATIONS = (1, 2, 3)
+
+#: SS8/SS7: `golden/conflicts.json` carries `"oscillating": true` on exactly this
+#: many entries. The A -> B -> A scan over generations 1-3 must find the same set.
+GOLDEN_OSCILLATING = 25
+
+
 @pytest.fixture(scope="session")
 def conflict_store(scratch_dsn: str) -> str:
-    """The scratch database with generation 3 ingested and the invariants run.
+    """The scratch database with generations 1-3 ingested and the invariants run.
 
     Committed once, because everything downstream reads it and nothing downstream
     is allowed to change it: every test that writes does so inside a transaction
@@ -86,14 +109,15 @@ def conflict_store(scratch_dsn: str) -> str:
     from recon.ingest import expected_counts_from_manifest, ingest_generation
     from recon.invariants.runner import persist_run, run_invariants
 
-    report = ingest_generation(
-        build_adapters(None),
-        3,
-        run_id="t7-gen3",
-        expected=expected_counts_from_manifest(None),
-    )
-    failed = [result for result in report.sources if result.status != "ok"]
-    assert not failed, f"generation-3 ingest did not complete: {failed}"
+    for generation in INGESTED_GENERATIONS:
+        report = ingest_generation(
+            build_adapters(None),
+            generation,
+            run_id=f"t7-gen{generation}",
+            expected=expected_counts_from_manifest(None),
+        )
+        failed = [result for result in report.sources if result.status != "ok"]
+        assert not failed, f"generation-{generation} ingest did not complete: {failed}"
 
     with psycopg.connect(scratch_dsn) as conn:
         run = run_invariants(conn, run_id="t7-invariants")
@@ -102,13 +126,11 @@ def conflict_store(scratch_dsn: str) -> str:
 
     _assert_store_matches_golden(run)
 
-    # The identity layer, so the three identity signals have something to read.
-    # Generation 3 only: `lineage_generations=(3,)` keeps the deferred-trigger
-    # commit to ~2 minutes and leaves `field_lineage` unable to hold an A -> B -> A
-    # pattern, which is the honest state for the oscillation tests to start from.
+    # The identity layer (so the three identity signals have something to read) AND
+    # the lineage history (so SS7's A -> B -> A scan has three generations to scan).
     from recon.resolve import materialize
 
-    materialized = materialize(generation=3, lineage_generations=(3,))
+    materialized = materialize(generation=3, lineage_generations=INGESTED_GENERATIONS)
     assert materialized.candidates > 0, (
         "entity_link_candidates is empty, so every identity signal would score 0 "
         "and the three heaviest weights in the model would be untested"
@@ -116,9 +138,28 @@ def conflict_store(scratch_dsn: str) -> str:
 
     with psycopg.connect(scratch_dsn) as conn:
         after = conn.execute("SELECT count(*) FROM conflicts").fetchone()[0]
+        generations = conn.execute(
+            "SELECT count(DISTINCT generation) FROM field_lineage"
+        ).fetchone()[0]
     assert after == len(run.conflicts), (
         "materialization changed the conflict store; the counts these tests assert "
         f"would no longer be the graded ones ({len(run.conflicts)} -> {after})"
+    )
+    # Without this the oscillation suite silently degrades to "scanned nothing".
+    assert generations == len(INGESTED_GENERATIONS), (
+        f"field_lineage covers {generations} generation(s), not "
+        f"{len(INGESTED_GENERATIONS)}. SS7's A -> B -> A window needs three, so "
+        "every oscillation assertion below would be vacuous"
+    )
+
+    from recon.invariants.oscillation import scan_field_lineage
+
+    with psycopg.connect(scratch_dsn) as conn:
+        scan = scan_field_lineage(conn)
+    assert len(scan.pairs) == GOLDEN_OSCILLATING, (
+        "the committed A -> B -> A scan found "
+        f"{len(scan.pairs)} oscillating pairs over real lineage, not golden's "
+        f"{GOLDEN_OSCILLATING}. R16's oscillation half would be testing nothing."
     )
     return scratch_dsn
 

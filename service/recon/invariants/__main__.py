@@ -19,9 +19,15 @@ import psycopg
 from recon.invariants.context import CURRENT_GENERATION
 from recon.invariants.grading import grade_clean_sample, grade_run
 from recon.invariants.runner import persist_run, run_invariants
+from recon.logging import configure_logging_once, console
 
 
 def main(argv: list[str] | None = None) -> int:
+    # This is one of the ways a Keystone process starts (`recon.logging.ENTRY_POINTS`),
+    # so it installs the redaction chain before it can emit anything -- and `console`
+    # below is the same chokepoint `python -m recon.suite` writes its scorecard
+    # through, rather than a `print` sitting outside every control in the package.
+    configure_logging_once()
     parser = argparse.ArgumentParser(prog="recon.invariants")
     parser.add_argument("--run-id", default="invariants-cli")
     parser.add_argument("--generation", type=int, default=CURRENT_GENERATION)
@@ -42,25 +48,25 @@ def main(argv: list[str] | None = None) -> int:
             conn.commit()
     wall = time.perf_counter() - started
 
-    print(f"run {run.run_id}  generation {run.generation}  status {run.status}")
+    console(f"run {run.run_id}  generation {run.generation}  status {run.status}")
     if run.incomplete:
-        print(f"  incomplete loads: {list(run.incomplete)}")
+        console(f"  incomplete loads: {list(run.incomplete)}")
     for outcome in run.outcomes:
         flag = " SKIPPED" if outcome.skipped else ""
-        print(
+        console(
             f"  {outcome.rule_id} {outcome.scope_table:16s} rows={outcome.rows:6d} "
             f"raw={outcome.raw_conflicts:5d} {outcome.elapsed_ms:8.1f}ms"
             f" {outcome.verdicts}{flag}"
         )
-    print(f"  stamped {len(run.results)} invariant_results rows")
-    print(f"  raw conflicts {len(run.raw_conflicts)} -> surviving {len(run.conflicts)}")
-    print(f"  by type: {run.by_type()}")
+    console(f"  stamped {len(run.results)} invariant_results rows")
+    console(f"  raw conflicts {len(run.raw_conflicts)} -> surviving {len(run.conflicts)}")
+    console(f"  by type: {run.by_type()}")
 
     diff = grade_run(run.conflicts)
     clean = grade_clean_sample(run.conflicts)
-    print(diff.report())
-    print(clean.report())
-    print(f"wall clock: {wall:.2f}s (engine {run.elapsed_ms / 1000.0:.2f}s)")
+    console(diff.report())
+    console(clean.report())
+    console(f"wall clock: {wall:.2f}s (engine {run.elapsed_ms / 1000.0:.2f}s)")
 
     return 0 if (diff.passed and clean.passed) else 1
 

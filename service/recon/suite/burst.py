@@ -130,8 +130,10 @@ __all__ = [
     "CONTENDERS",
     "RETRY_WAVE",
     "BurstOutcome",
+    "burst_outcome",
     "check_spend_cap_burst",
     "release_sites",
+    "reset_burst_cache",
     "run_burst",
 ]
 
@@ -1091,10 +1093,32 @@ def _assess_boundary(outcome: BurstOutcome) -> None:
         )
 
 
+#: The one burst this process ran. Two scorecard rows are two questions about
+#: the same 120-thread contention run -- ``spend-cap-burst`` asks whether the
+#: whole evidence vector held, ``bench:spend-cap-exact`` asks whether the cap
+#: halted at exactly the cap. Provoking a second burst for the second question
+#: would double the slowest part of the suite AND let the two rows describe
+#: different runs, so a flake could show as one green and one red with nothing to
+#: say which burst either was talking about.
+_OUTCOME_CACHE: dict[str, BurstOutcome] = {}
+
+
+def burst_outcome() -> BurstOutcome:
+    """The process-wide burst outcome, run on first use."""
+    if "outcome" not in _OUTCOME_CACHE:
+        _OUTCOME_CACHE["outcome"] = run_burst()
+    return _OUTCOME_CACHE["outcome"]
+
+
+def reset_burst_cache() -> None:
+    """Drop the cached burst. For a test that must provoke a second one."""
+    _OUTCOME_CACHE.clear()
+
+
 def check_spend_cap_burst() -> CheckResult:
     """Scorecard row: run the burst, PASS only on the whole vector."""
     started = datetime.now(tz=UTC)
-    outcome = run_burst()
+    outcome = burst_outcome()
     elapsed = (datetime.now(tz=UTC) - started).total_seconds()
     detail = f"{outcome.vector()} elapsed={elapsed:.1f}s"
     if outcome.ok:

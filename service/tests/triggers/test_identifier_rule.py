@@ -42,9 +42,13 @@ import json
 import re
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Annotated, Any, get_args, get_origin, get_type_hints
+from urllib.parse import quote
 
 import pytest
+from fastapi import params as fastapi_params
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 from sqlalchemy import Engine, text
 
 from recon.adapters import identifiers as identifiers_module
@@ -54,6 +58,7 @@ from recon.api.internal import TriggerRequest
 from recon.ingest import RecordsRequest
 from tests.budget.support import env_settings
 from tests.triggers.test_single_trigger_guard import (
+    API_KEY_ENDPOINTS,
     TRIGGER_ENDPOINTS,
     _app_with_every_trigger_route,
     mutating_routes,
@@ -242,14 +247,131 @@ def test_a_wrong_typed_identifier_is_a_4xx_everywhere(matrix: TestClient) -> Non
 
 
 # ======================================================================================
+# behavioural -- the matrix, second half: the identifier in the PATH
+# ======================================================================================
+
+#: `migrations/versions/0003_seed_api_clients.py`, and `.env.example`. Spelled out
+#: rather than derived, exactly as `tests/api/conftest.py` spells it out: a value
+#: computed by the same helper the service uses would agree with itself even if
+#: both changed.
+ADMIN_API_KEY = "keystone-demo-admin-8c25e0b71a94f36d"
+ADMIN_HEADERS = {"X-Api-Key": ADMIN_API_KEY}
+
+#: Ids that are well-formed and cannot name a row. The decision endpoints answer
+#: 404 for these, which is what makes the control below a control: it proves the
+#: matrix is judging the identifier and not just meeting a closed door -- and it
+#: cannot decide a real proposal in the shared development database on its way
+#: through, because there is no such proposal to decide.
+UNUSED_PROPOSAL_IDS: tuple[str, ...] = (
+    "9223372036854775807",  # max bigint
+    "9" * 40,  # wider than bigint: still an integer, still nobody's id
+)
+
+
+def _path_segment(value: str) -> str:
+    """`value` as a URL path segment, the way a real client would send it.
+
+    `surrogatepass` so an unpaired surrogate is percent-encoded onto the wire
+    rather than raising in the test -- the server side is what is under test.
+    """
+    return quote(value.encode("utf-8", "surrogatepass"), safe="")
+
+
+def _fire_api_key(client: TestClient, path: str, value: str) -> tuple[int, dict]:
+    url = path.replace("{proposal_id}", _path_segment(value))
+    response = client.post(url, headers=ADMIN_HEADERS)
+    try:
+        return response.status_code, response.json()
+    except ValueError:
+        return response.status_code, {}
+
+
+@pytest.mark.parametrize(
+    ("case", "value", "why"), HOSTILE_IDENTIFIERS, ids=[c for c, _, _ in HOSTILE_IDENTIFIERS]
+)
+def test_every_api_key_route_refuses_the_same_hostile_path_identically(
+    matrix: TestClient, case: str, value: str, why: str
+) -> None:
+    """The other three mutating routes, run through the same hostile list.
+
+    T-11 added a second class of mutating route, and its identifier arrives in
+    the **path** rather than the body. Listing those routes in the coverage
+    assertion without ever posting a hostile value at them would have made the
+    coverage a lie, so they are fired at here: same list of values, same "never a
+    5xx", same "one rule, one verdict, whichever URL a caller used".
+
+    An identifier that cannot even *form* a path segment (the empty string) is
+    refused by the router before routing resolves; everything else reaches the
+    parser, which refuses it as an unprocessable request. Both are 4xx, and both
+    are the same 4xx on all three routes -- the divergence is the defect.
+    """
+    segment = _path_segment(value)
+    seen: dict[str, int] = {}
+    for path, _scope in API_KEY_ENDPOINTS:
+        status, body = _fire_api_key(matrix, path, value)
+        seen[path] = status
+        assert status < 500, (
+            f"{path} answered {status} for the {case} identifier ({why}); a value "
+            "the store cannot hold is a 4xx about the request, never a server fault"
+        )
+        assert 400 <= status < 500, f"{path} accepted the {case} identifier with {status}"
+        if segment == "":
+            assert status == 404, (
+                f"{path} answered {status} for an identifier that cannot form a path "
+                "segment at all; the route must simply not resolve"
+            )
+        else:
+            assert status == 422, (
+                f"{path} answered {status} for the {case} identifier ({why}), not 422: {body}"
+            )
+            assert body.get("rule") == IDENTIFIER_RULE or body.get("type", "").endswith(
+                "invalid_request"
+            ), f"{path} refused the {case} identifier without stating the shared rule: {body}"
+    assert len(set(seen.values())) == 1, (
+        f"the {case} identifier ({why}) was judged differently by each endpoint: "
+        f"{seen}. One rule means one verdict, whichever URL a caller used."
+    )
+
+
+@pytest.mark.parametrize("value", UNUSED_PROPOSAL_IDS)
+def test_every_api_key_route_accepts_a_usable_path_identifier(
+    matrix: TestClient, value: str
+) -> None:
+    """The control, for the path half. A door that is always shut proves nothing.
+
+    A well-formed id must get past the identifier verdict and be *looked up* --
+    404, because no proposal carries it. A 422 here would mean the route refuses
+    every identifier, which would satisfy the hostile matrix above while
+    validating nothing; a 401/403 would mean the matrix has been measuring the
+    credential rather than the identifier.
+    """
+    for path, _scope in API_KEY_ENDPOINTS:
+        status, body = _fire_api_key(matrix, path, value)
+        assert status == 404, (
+            f"{path} answered {status} for the usable identifier {value!r}, not 404: "
+            f"{body}. The matrix above would then be measuring a closed door."
+        )
+        assert body.get("type", "").endswith("proposal-not-found"), body
+
+
+# ======================================================================================
 # routing -- enumerated from the app, never from memory
 # ======================================================================================
 
 
 def test_every_mutating_route_the_app_mounts_is_in_the_identifier_matrix() -> None:
-    """A new mutating route must join the matrix rather than escape it."""
+    """A new mutating route must join the matrix rather than escape it.
+
+    The matrix has two halves because the application has two classes of mutating
+    route (T-11), and each half is *fired*, not merely listed:
+    :data:`TRIGGER_ENDPOINTS` carry their identifier in the request body and are
+    driven by `test_every_endpoint_refuses_the_same_identifier_identically`;
+    :data:`API_KEY_ENDPOINTS` carry it in the path segment and are driven by
+    `test_every_api_key_route_refuses_the_same_hostile_path_identically`. A route
+    on neither list is a route no hostile identifier is ever posted at.
+    """
     app = _app_with_every_trigger_route()
-    covered = {path for path, _ in TRIGGER_ENDPOINTS}
+    covered = {path for path, _ in TRIGGER_ENDPOINTS} | {path for path, _ in API_KEY_ENDPOINTS}
     mounted = {route.path for route in mutating_routes(app)}
     assert mounted, "no mutating route was enumerated at all"
     assert mounted <= covered, (
@@ -258,22 +380,89 @@ def test_every_mutating_route_the_app_mounts_is_in_the_identifier_matrix() -> No
     )
 
 
+def _mentions_str(annotation: object) -> bool:
+    """True when ``annotation`` can bind a `str` -- ``str``, ``str | None``, ``list[str]``."""
+    if annotation is str:
+        return True
+    return any(_mentions_str(arg) for arg in get_args(annotation))
+
+
+def _caller_supplied_text(endpoint: Any) -> dict[str, str]:
+    """``name -> where`` for every **text** value ``endpoint`` binds from the caller.
+
+    Read off the endpoint's own annotations (and, for a body model, that model's
+    fields), so it describes the route the app is serving right now rather than a
+    list somebody maintained. Dependency-injected parameters are excluded: a
+    ``Principal`` comes from the auth dependency, not from the request body.
+    """
+    hints = get_type_hints(endpoint, include_extras=True)
+    found: dict[str, str] = {}
+    for name, annotation in hints.items():
+        if name == "return":
+            continue
+        base = annotation
+        if get_origin(annotation) is Annotated:
+            args = get_args(annotation)
+            base = args[0]
+            if any(isinstance(meta, fastapi_params.Depends) for meta in args[1:]):
+                continue
+        if _mentions_str(base):
+            found[name] = "parameter"
+            continue
+        if isinstance(base, type) and issubclass(base, BaseModel):
+            for field_name, field in base.model_fields.items():
+                if _mentions_str(field.annotation):
+                    found[f"{name}.{field_name}"] = f"field of {base.__name__}"
+    return found
+
+
 def test_every_mutating_route_resolves_to_the_shared_identifier_validator() -> None:
-    """Its module must call `validate_identifier`; it may not roll its own."""
+    """Its module must call `validate_identifier`; it may not roll its own.
+
+    Two branches, and **which branch a route takes is derived from the route**,
+    not from an exemption list a reader has to trust:
+
+    * a route that binds any **text** from the caller can be handed a control
+      character, an unpaired surrogate or a NUL, so its module has to reach the
+      one rule in `recon.adapters.identifiers`;
+    * a route whose caller-supplied values are all *parsed* types -- the reviewer
+      decisions take ``proposal_id: int`` -- cannot be handed one at all: the
+      framework's parser refuses ``a\x00b`` before any handler code runs, which
+      `test_every_api_key_route_refuses_the_same_hostile_path_identically` proves
+      against the real app rather than assuming. Asserting the *absence* of a
+      text parameter is what keeps that branch honest: retyping ``proposal_id``
+      as ``str`` moves the route into the first branch and turns this red on the
+      commit that does it.
+    """
     import inspect
 
     app = _app_with_every_trigger_route()
+    routes = mutating_routes(app)
     checked = 0
-    for route in mutating_routes(app):
+    exempt: list[str] = []
+    for route in routes:
         module = inspect.getmodule(route.endpoint)
         assert module is not None
         source = inspect.getsource(module)
         checked += 1
+        text_inputs = _caller_supplied_text(route.endpoint)
+        if not text_inputs:
+            exempt.append(route.path)
+            continue
         assert "validate_identifier" in source, (
-            f"{route.path} accepts a client-supplied identifier but its module "
-            "never calls recon.adapters.identifiers.validate_identifier"
+            f"{route.path} accepts a client-supplied identifier "
+            f"({sorted(text_inputs)}) but its module never calls "
+            "recon.adapters.identifiers.validate_identifier"
         )
-    assert checked >= 3, f"expected the three mutating endpoints, enumerated {checked}"
+    assert checked == len(routes)
+    assert checked >= 6, (
+        "expected the three trigger endpoints and the three reviewer decisions, "
+        f"enumerated {checked}"
+    )
+    assert sorted(exempt) == sorted(path for path, _ in API_KEY_ENDPOINTS), (
+        "the set of routes that take NO text from the caller has changed: "
+        f"{sorted(exempt)}. Every other mutating route must reach the shared rule."
+    )
 
 
 def test_the_payload_validator_reaches_the_same_rule() -> None:

@@ -17,15 +17,17 @@ cleanly along what is and is not implemented:
 * the digest **is** implemented and is exercised here against the real
   database, including the exact scenario the floor cites -- ``recon_writer``
   appends a landing row, and the mirror digest moves;
-* the "across a reconciler run" half **cannot** be built until ``recon
-  .reconciler`` exists (T-9), and ``test_the_check_fails_loudly_...`` asserts
-  that it FAILS with that reason. It must never report PASS by hashing an
-  untouched database twice, which is the vacuous green the whole exercise is
-  about.
+* the "across a reconciler run" half needed ``recon.reconciler``, which T-9
+  landed and T-14 wired into the scorecard as the digests taken either side of
+  the graded pass. The anti-vacuous-green property is unchanged and still
+  asserted: with the module hidden the seam RAISES rather than returning a
+  do-nothing callable, and the runner turns that into FAIL. It must never report
+  PASS by hashing an untouched database twice.
 """
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import sys
@@ -237,18 +239,48 @@ def test_mirror_digest_refuses_a_table_outside_the_mirror(owner_engine: Engine) 
 # ===========================================================================
 # The half that is NOT implemented fails loudly
 # ===========================================================================
-def test_the_check_fails_loudly_because_the_reconciler_does_not_exist_yet() -> None:
-    """The anti-vacuous-green assertion, and the most important one here.
+def test_the_reconciler_entrypoint_now_resolves_because_t9_landed() -> None:
+    """The seam resolves to the real run, now that ``recon.reconciler`` exists.
 
-    "Across a reconciler run" needs a reconciler; ``recon.reconciler`` is T-9
-    and is not written. The tempting implementation -- hash, do nothing, hash
-    again, PASS -- would produce a permanently green row whose greenness is
-    caused by the absence of the thing under test.
+    **This replaces two assertions that ``recon.reconciler`` DOES NOT EXIST.**
+    They were correct when written -- the module docstring above says so in as
+    many words -- and T-9 landed a 1,400-line ``recon/reconciler.py`` with its
+    own test package, so both were already failing before T-14 touched anything
+    and neither could be made green again except by deleting the reconciler.
 
-    So the check FAILS, and says why. This test pins that: never PASS, and the
-    detail names the missing module rather than reading like an infrastructure
-    problem.
+    The property they existed to protect is NOT dropped: it is asserted by
+    :func:`test_the_entrypoint_still_refuses_to_return_a_no_op` below, which
+    hides the module and requires the seam to raise rather than hand back a
+    do-nothing callable.
     """
+    from recon.reconciler import run_once
+
+    assert reconciler_entrypoint() is run_once
+
+
+def test_the_entrypoint_still_refuses_to_return_a_no_op(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The anti-vacuous-green property, asserted without needing T-9 to be absent.
+
+    Hide ``recon.reconciler`` and the seam must RAISE. Returning a do-nothing
+    callable would make ``check_mirror_unchanged`` hash an untouched database
+    twice and report PASS -- a green caused by the absence of the thing under
+    test, which is the whole point of this module.
+    """
+    monkeypatch.setitem(sys.modules, "recon.reconciler", None)
+
+    with pytest.raises(NotYetImplemented) as excinfo:
+        reconciler_entrypoint()
+    assert "recon.reconciler" in str(excinfo.value)
+
+
+def test_a_missing_reconciler_is_a_failing_row_not_a_passing_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """And the runner turns that raise into FAIL, never into a skip."""
+    monkeypatch.setitem(sys.modules, "recon.reconciler", None)
+
     result = run_check(CHECK_NAME, check_mirror_unchanged)
 
     assert result.status == FAIL, "an unimplemented check must never report PASS"
@@ -256,21 +288,25 @@ def test_the_check_fails_loudly_because_the_reconciler_does_not_exist_yet() -> N
     assert "recon.reconciler" in result.detail
 
 
-def test_the_reconciler_entrypoint_raises_rather_than_returning_a_no_op() -> None:
-    """The failure is raised at the seam, not swallowed into a stub callable.
-
-    Returning a do-nothing callable would make ``check_mirror_unchanged``
-    report PASS -- the exact shape this whole ticket is about.
-    """
-    with pytest.raises(NotYetImplemented) as excinfo:
-        reconciler_entrypoint()
-    assert "recon.reconciler" in str(excinfo.value)
-
-
 def test_the_check_is_registered_under_the_name_t14_keeps() -> None:
-    """The registry is no longer empty, and the name is the one that stays."""
+    """The registry keeps the name; T-14 changed which callable answers to it.
+
+    **This replaces ``CHECKS[CHECK_NAME] is check_mirror_unchanged``.** T-14
+    registers ``recon.suite.__main__.check_mirror_unchanged``, which compares the
+    digests ``recon.suite.pipeline`` took either side of the graded
+    ``run_once()`` -- the pass that wrote all 3,050 proposals. The function in
+    this module runs its OWN reconciler pass, and by the time the scorecard
+    reaches this row every fingerprint is already open, so that pass proposes
+    nothing: it would bracket an idle database. The identity assertion is
+    replaced by the two properties that actually matter -- the name is
+    registered, and the callable is not this module's.
+    """
+    from recon.suite.__main__ import check_mirror_unchanged as registered
+
     assert CHECK_NAME == "mirror-unchanged"
-    assert CHECKS[CHECK_NAME] is check_mirror_unchanged
+    assert CHECK_NAME in CHECKS
+    assert CHECKS[CHECK_NAME] is registered
+    assert registered is not check_mirror_unchanged
 
 
 def test_a_crashing_check_becomes_a_failing_row_not_a_missing_one() -> None:
@@ -298,13 +334,19 @@ def test_there_is_no_skip_status() -> None:
 # The CLI, as the graded command actually runs it
 # ===========================================================================
 def _run_suite(service_root: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run the harness with NO database and NO writable scorecard directory."""
+    env = dict(os.environ)
+    env.pop("DATABASE_URL", None)
+    env.pop("KEYSTONE_REQUIRE_DB", None)
+    env["KEYSTONE_SCORECARD_DIR"] = str(service_root / ".pytest_cache" / "mirror-scorecard")
     return subprocess.run(
         [sys.executable, "-m", "recon.suite", *args],
         cwd=service_root,
         capture_output=True,
         text=True,
-        timeout=120,
+        timeout=180,
         check=False,
+        env=env,
     )
 
 
@@ -315,23 +357,23 @@ def test_the_suite_lists_the_registered_check(service_root: Path) -> None:
     assert "no checks yet" not in result.stdout
 
 
-def test_the_suite_exits_non_zero_while_a_registered_check_is_unimplemented(
-    service_root: Path,
-) -> None:
-    """DESIGN pins "exits non-zero on any failure", and this is the first failure.
+def test_the_suite_exits_non_zero_when_this_row_cannot_run(service_root: Path) -> None:
+    """DESIGN pins "exits non-zero on any failure", asserted on THIS row.
 
-    The scorecard is meant to be read by a human and by CI. Both must see that
-    ``mirror-unchanged`` is not satisfied yet, rather than a harness that
-    reports success because it ran nothing.
+    **This replaces an assertion that the suite is red because
+    ``mirror-unchanged`` is unimplemented.** It is implemented; T-9 landed the
+    reconciler and T-14 registered the bracketed comparison. What survives is the
+    contract that does not depend on any ticket's state: with no database the row
+    cannot run, so it is FAIL -- never a skip, never absent -- and the process
+    exits non-zero.
+
+    ``DATABASE_URL`` is removed rather than left set, because with a database
+    configured this argv builds the real 100k pipeline and would take minutes
+    inside a schema test.
     """
-    result = _run_suite(service_root)
+    result = _run_suite(service_root, "--only", CHECK_NAME, "--no-write")
 
     assert result.returncode != 0, result.stdout
-    assert CHECK_NAME in result.stdout
-    assert FAIL in result.stdout
-    # Assert THIS check's row is failing, not the suite-wide tally. The tally
-    # encoded "the registry holds exactly one check", which every ticket that
-    # registers a graded check breaks by construction -- and SPEC gate 1
-    # requires several more. `_check_row` reads the row for CHECK_NAME.
+    assert "SKIP" not in result.stdout
     assert _check_row(result.stdout, CHECK_NAME).startswith(FAIL), result.stdout
     assert _passed_count(result.stdout)[0] < _passed_count(result.stdout)[1]

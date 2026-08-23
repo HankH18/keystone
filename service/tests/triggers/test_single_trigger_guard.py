@@ -62,11 +62,30 @@ RECONCILE_SECRET = "reconcile-secret-for-the-guard-matrix"
 
 MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
-#: `(path, job)` for every mutating endpoint this repository ships.
+#: `(path, job)` for every SCHEDULED mutating endpoint (R19's trigger secret).
 TRIGGER_ENDPOINTS: tuple[tuple[str, str], ...] = (
     ("/internal/ingest/records", auth_module.JOB_SYNC),
     ("/internal/sync", auth_module.JOB_SYNC),
     ("/internal/reconcile", auth_module.JOB_RECONCILE),
+)
+
+#: `(path, required scope)` for every mutating endpoint of the CLIENT API.
+#:
+#: A second class of mutating route exists as of T-11, and pretending otherwise
+#: is what would make this file's coverage assertion a lie: DESIGN SSHTTP API
+#: pins the reviewer decisions under `X-Api-Key`, not under a trigger secret --
+#: they are pressed by a human in the dashboard, not by cron, and R19's secrets
+#: are per *scheduled job*. Feeding them into the trigger matrix would assert the
+#: wrong thing (that a reviewer needs the scheduler's credential); leaving them
+#: out of both lists would let a mutating route ship unguarded, which is the
+#: exact hole `test_every_mutating_route_the_app_mounts_is_covered_by_the_matrix`
+#: exists to close. So they are covered here, by the guard they actually use, and
+#: the coverage assertion below requires every mutating route to be in ONE of the
+#: two lists and to carry the matching header.
+API_KEY_ENDPOINTS: tuple[tuple[str, str], ...] = (
+    ("/api/proposals/{proposal_id}/approve", auth_module.SCOPE_ADMIN),
+    ("/api/proposals/{proposal_id}/reject", auth_module.SCOPE_ADMIN),
+    ("/api/proposals/{proposal_id}/apply", auth_module.SCOPE_ADMIN),
 )
 
 
@@ -132,6 +151,32 @@ def takes_the_trigger_header(route: APIRoute) -> bool:
     return False
 
 
+def api_key_scope(route: APIRoute) -> str | None:
+    """The scope `require_api_key` enforces on this route, or `None` if it has none.
+
+    Read off the resolved dependency tree rather than off the source, so a route
+    that *looks* guarded because the decorator mentions a dependency, but whose
+    dependency does not actually ask for the header, is not counted as guarded.
+    `required_scope` is the closure variable `recon.api.auth.require_api_key`
+    captures, and `None` there means "authenticated, any scope".
+    """
+
+    def walk_dependant(dependant: object) -> Iterator[object]:
+        yield dependant
+        for sub in getattr(dependant, "dependencies", ()):
+            yield from walk_dependant(sub)
+
+    for dependant in walk_dependant(route.dependant):
+        aliases = {param.alias for param in getattr(dependant, "header_params", ())}
+        if auth_module.API_KEY_HEADER not in aliases:
+            continue
+        call = getattr(dependant, "call", None)
+        if call is None:  # pragma: no cover - a header param always has a call
+            continue
+        return inspect.getclosurevars(call).nonlocals.get("required_scope")
+    return None
+
+
 def _app_with_every_trigger_route() -> FastAPI:
     """The real application, plus any trigger router it does not (yet) mount.
 
@@ -161,19 +206,43 @@ def test_every_mutating_route_the_app_mounts_is_covered_by_the_matrix() -> None:
     table = sorted((route.path, tuple(sorted(route.methods))) for route in routes)
     assert ("/health", ("GET",)) in table, table
 
-    covered = {path for path, _job in TRIGGER_ENDPOINTS}
+    by_trigger = {path for path, _job in TRIGGER_ENDPOINTS}
+    by_api_key = {path for path, _scope in API_KEY_ENDPOINTS}
+    assert not (by_trigger & by_api_key), (
+        f"{sorted(by_trigger & by_api_key)} is listed under two guards; a route with two "
+        "credentials is a route whose weaker credential is the real one"
+    )
+    covered = by_trigger | by_api_key
     mutating = {route.path for route in mutating_routes(create_app())}
     assert mutating, f"no mutating route was enumerated at all: {table}"
     assert mutating <= covered, (
-        "the application mounts a mutating route the guard matrix does not cover: "
+        "the application mounts a mutating route no guard list covers: "
         f"{sorted(mutating - covered)}. Every endpoint that writes must be run "
-        f"through every secret configuration. Full route table: {table}"
+        f"through every configuration of the credential it requires. Full route "
+        f"table: {table}"
     )
 
-    # ...and every mutating route actually asks for the trigger header.
+    # ...and every mutating route actually asks for the credential it is listed under.
     for route in mutating_routes(create_app()):
-        assert takes_the_trigger_header(route), (
-            f"{route.path} mutates state but does not accept {auth_module.TRIGGER_SECRET_HEADER}"
+        if route.path in by_trigger:
+            assert takes_the_trigger_header(route), (
+                f"{route.path} is listed as trigger-guarded but does not accept "
+                f"{auth_module.TRIGGER_SECRET_HEADER}"
+            )
+            assert api_key_scope(route) is None, (
+                f"{route.path} accepts both credentials; the weaker one is then the "
+                "real requirement"
+            )
+            continue
+        expected_scope = dict(API_KEY_ENDPOINTS)[route.path]
+        assert not takes_the_trigger_header(route), (
+            f"{route.path} is a client-API route and also accepts "
+            f"{auth_module.TRIGGER_SECRET_HEADER}"
+        )
+        assert api_key_scope(route) == expected_scope, (
+            f"{route.path} mutates state and does not require {auth_module.API_KEY_HEADER} "
+            f"with scope {expected_scope!r} (got {api_key_scope(route)!r}). DESIGN pins "
+            "reviewer actions as org-wide, so a client key must be refused with 403."
         )
 
 

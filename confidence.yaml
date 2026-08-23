@@ -1,0 +1,325 @@
+# Keystone -- the committed confidence model (R14).
+#
+# THIS FILE IS THE MODEL. `service/recon/confidence.py` evaluates it and holds no
+# number of its own; there is no fallback table in code, so deleting a weight here
+# is a loud failure rather than a silent default. A weight change is therefore a
+# reviewable diff in this file, and `service/tests/reconciler/test_confidence_yaml.py`
+# asserts every value below verbatim -- changing one without changing that test is a
+# red build, which is what makes the model *committed* rather than merely *stored*.
+#
+# R14, normatively: "Confidence SHALL be a [0,1] score computed by a committed
+# deterministic formula over inspectable signals ...; same conflict + same evidence
+# => same score; partial/conflicting evidence lowers it. A hardcoded constant or raw
+# LLM-emitted number is a failure."
+#
+# Three properties, and how each is actually obtained:
+#
+#   inspectable   Every signal below states the table and predicate it is read from.
+#                 The evaluated packet -- each signal's raw value, its weight and its
+#                 contribution -- is persisted on the proposal in `proposals.evidence`
+#                 under `confidence`, so a reviewer reads the arithmetic that produced
+#                 the number rather than being asked to trust it.
+#
+#   reproducible  All arithmetic is `decimal.Decimal`, never float. Every value below
+#                 is a QUOTED STRING and is parsed with `Decimal(str)`, so no binary
+#                 floating-point value is ever constructed and the result cannot vary
+#                 with libm, platform or Python build. Terms are summed in the fixed
+#                 order given by `signal_order` and the result is quantized to
+#                 `precision.decimal_places` under `precision.rounding`. Same conflict
+#                 + same evidence => the same decimal digits, in any process.
+#
+#   never the LLM `recon/confidence.py` imports nothing from `recon.llm`, and the
+#                 scoring function takes an evidence packet, not text. The rationale
+#                 is attached to the proposal AFTER the score exists and is never an
+#                 input to it.
+#
+# Sensitivity is NOT in this file on purpose. R15's classification is a pure function
+# of the target field path (contract SS6) and is evaluated BEFORE confidence; a
+# sensitive proposal is held at every score including 1.0. Putting a sensitivity term
+# in the formula would make the hold a matter of arithmetic, which is exactly the
+# thing R15 forbids. See `service/recon/sensitive.py`.
+---
+# Bumped on ANY change to a base, a weight or a derivation. Stamped into every
+# evidence packet, so a proposal always says which model version scored it -- and
+# the packet ALSO carries `model_sha256`, the sha256 of this file's raw bytes, so
+# an edit that forgets to bump this integer is still visible on every row written
+# afterwards instead of silently re-pointing history at different arithmetic.
+#
+# v2 (this version): the clamp is applied to the POSITIVE half first and the
+#     penalties are subtracted after it, so partial and conflicting evidence
+#     lower the score even when the positive evidence has already saturated. No
+#     base and no weight changed; in the region `base + sum(positive) <= 1.0` v2
+#     is arithmetically identical to v1, so only the scores v1 was flattening
+#     moved. v1 stored 1.0000 for 1,057 of the graded 3,050 proposals and left a
+#     penalty arithmetically invisible on 191 of them -- which does not discharge
+#     R14's "partial/conflicting evidence lowers it".
+# v1: clamp01(base + sum(all weights)).
+version: 2
+
+formula: "clamp01(clamp01(base[conflict_type] + sum(positive)) + sum(negative))"
+
+precision:
+  # `proposals.confidence` is NUMERIC(5,4); the model quantizes to the same scale so
+  # the stored value is the computed value and not a database-side rounding of it.
+  decimal_places: 4
+  rounding: ROUND_HALF_EVEN
+  # Applied TWICE per score: once to `base + sum(positive)` and once to the
+  # result after `sum(negative)` is added. See `formula` above.
+  clamp_min: "0.0000"
+  clamp_max: "1.0000"
+
+# The fixed summation order. Decimal addition of these values is exact, so the order
+# does not change the result -- it is pinned anyway so that "the arithmetic" names one
+# sequence of operations and a reader can follow the persisted packet top to bottom.
+# A signal joins the positive or the negative half by the SIGN OF ITS COMMITTED
+# WEIGHT (`sign:` below, which `_parse` checks against the weight), never by the
+# sign of its evaluated contribution -- a count signal scoring 0 is still a
+# penalty term.
+signal_order:
+  - hard_external_id_agreement
+  - normalized_email_agreement
+  - name_dob_exact
+  - amount_date_corroboration
+  - disagreeing_field
+  - partial_evidence
+  - oscillation_observed
+
+# ---------------------------------------------------------------------------------
+# base[conflict_type] -- the prior, before any evidence signal.
+#
+# The base answers ONE question: given only that this rule fired, how much of the
+# PROPOSAL is already determined? Not "is the conflict real" -- the invariant engine
+# is graded at 0 FP / 0 FN against the golden set, so every conflict here is real.
+# The base is about the FIX: a type whose repair value is read straight off the
+# authoritative record starts high; a type whose repair requires a human to choose
+# between two records, or to supply a fact that exists in no source, starts low.
+# ---------------------------------------------------------------------------------
+bases:
+  C1:
+    value: "0.50"
+    note: >-
+      paid-but-no-deal. Evidence-only (SS6: no field write). The premise is strongly
+      observed -- a paid payment and an enrollment both exist -- but the missing CRM
+      deal cannot be reconstructed from any source, so the disposition is a human's.
+  C2:
+    value: "0.35"
+    note: >-
+      payment-with-no-person. The lowest base of any non-merge type, and deliberately:
+      DETECTION is certain (the payment satisfies none of P1..P3) while the FIX is
+      not. SS5.6 makes the plants the only payments omitting both `external_ref` and
+      the metadata name pair, and `payer_email` is drawn from an address used by no
+      student and no contact -- so no candidate person exists anywhere in the data and
+      no value for `payments.payment.external_ref` is derivable. The proposal names
+      the target field (which is what makes SS6's classification decidable) and
+      carries an empty `set`.
+  C3:
+    value: "0.45"
+    note: >-
+      duplicate-by-email, in-source. Two CRM contacts; which record survives a merge
+      is a human call, and no field write can express it.
+  C4:
+    value: "0.50"
+    note: >-
+      same-person-different-emails. Rests on an `L3` (name+dob) link -- the weakest
+      of the three match-key classes -- and the fix rewrites `crm.contact.email`, a
+      billing-identity field. Always `sensitive_hold` regardless of this number.
+  C5:
+    value: "0.50"
+    note: >-
+      record-in-one-source-only. Evidence-only: absence in a source is not repairable
+      by writing a field.
+  C6:
+    value: "0.40"
+    note: >-
+      field disagreement. The repair value is read off the app-DB endpoint, which
+      SS4.6 survivorship makes authoritative for identity fields, so the value is
+      always derivable -- but WHICH person the two records describe is exactly what
+      the identity signals below measure, and they, not this base, are what carries a
+      C6 into the auto-apply band.
+  C7:
+    value: "0.50"
+    note: >-
+      enrolled-but-unpaid. Evidence-only; a missing payment is not a field write.
+  C8:
+    value: "0.45"
+    note: >-
+      dropped sibling. The child is absent from one downstream source; the repair is
+      an ingestion/ER question, not a value to set on a record that is not there.
+  C9:
+    value: "0.55"
+    note: >-
+      stale pointer. The highest base among the types that write a field: the deal is
+      provably absent from the generation-3 CRM snapshot, or provably resolves to a
+      different person, and the proposed repair -- clear the pointer -- is both
+      conservative and always derivable (SS5.5: a null `crm_deal_id` is not a
+      conflict, so the cleared state is a state the rule set already calls clean).
+  C10:
+    value: "0.30"
+    note: >-
+      merge-collapsed record. The lowest base in the catalogue, because the defining
+      fact of C10 is that two match-key classes reach two DIFFERENT students -- the
+      automation demonstrably cannot choose, and the proposal exists to put that in
+      front of a human.
+  C11:
+    value: "0.55"
+    note: >-
+      duplicate payment. Closed-form arithmetic over one source: equal
+      (payer_email_norm, amount_cents, type) under 600s apart, both attributed to the
+      same person. Evidence-only -- which of the two to void is a money decision.
+  C12:
+    value: "0.55"
+    note: >-
+      wrong-amount payment. The amount is compared against the committed fee schedule,
+      so the predicate is arithmetic against committed data rather than an inference.
+      Evidence-only: correcting a settled payment is not a canonical field write.
+  C13:
+    value: "0.55"
+    note: >-
+      refund not reflected. Timestamp ordering plus E1/E2 attribution, all inside
+      committed data. Evidence-only.
+  C14:
+    value: "0.40"
+    note: >-
+      sensitive-field-only disagreement. The same predicate as C6 and therefore the
+      same base. This number never decides anything: SS6 classification holds every
+      C14 at every score, including 1.0.
+
+# ---------------------------------------------------------------------------------
+# signals -- each states WHERE it is read from, so it is checkable against the
+# database rather than against this comment.
+# ---------------------------------------------------------------------------------
+signals:
+
+  hard_external_id_agreement:
+    weight: "0.35"
+    kind: boolean
+    sign: positive
+    derivation: >-
+      1 when `entity_link_candidates` (generation 3) holds a row whose `source_ref` is
+      one of this conflict's `crm:contact:` refs, whose `key_class` is `ext`
+      (normalize.KEY_CLASSES[0] -- match_keys' hard-external-id class) and whose
+      `resolved_ref` is one of this conflict's `appdb:student:` refs. That is the two
+      sources agreeing on the strongest identifier there is. 0 otherwise, including
+      when the conflict carries no contact ref or no student ref.
+    key_class: ext
+
+  normalized_email_agreement:
+    weight: "0.25"
+    kind: boolean
+    sign: positive
+    derivation: >-
+      The same test on `key_class = 'email'`: the contact's `norm_email` resolves to a
+      student the conflict also names. Independent of the `ext` class -- a contact can
+      agree on email and not carry an external id, or the reverse -- which is why the
+      two signals add rather than override.
+    key_class: email
+
+  name_dob_exact:
+    weight: "0.20"
+    kind: boolean
+    sign: positive
+    derivation: >-
+      The same test on `key_class = 'namedob'`: `(first_norm, last_norm, dob_norm)`
+      resolves to a student the conflict also names. Weighted lowest of the three
+      because it is the class SS4 treats as weakest, and because normalize.match_keys
+      emits no `namedob` key at all unless all three components are present.
+    key_class: namedob
+
+  amount_date_corroboration:
+    weight: "0.10"
+    kind: boolean
+    sign: positive
+    derivation: >-
+      1 when EVERY key listed for the conflict's type in `corroborating_keys` is
+      present and non-null in the conflict's `observed_values`. These are the pinned
+      keys (contract SS5.4) that carry an independent money or time observation
+      supporting the predicate. A type with an empty list scores 0 by construction --
+      an absence predicate (C5, C7, C8) has no positive money/date fact to corroborate
+      it, and saying so is more useful than inventing one.
+
+      MEASURED, and stated because a reader of the proposals table will notice it: on
+      the graded 3,050-conflict store this signal is CONSTANT WITHIN EVERY TYPE -- 1
+      for C1/C11/C12/C13 and 0 for the other ten. That is a property of the DATA, not
+      of the derivation: SS5.4 pins these keys as required for their type and the
+      committed fixtures observe all of them, so the "present and non-null" test is
+      satisfied on every instance. The signal is still per-instance (a null pinned
+      observation turns it off, exactly as it turns `partial_evidence` on), but on
+      THIS dataset it discriminates nothing within a type and contributes what adding
+      0.10 to four bases would. `tests/reconciler/test_reconcile_run.py` commits the
+      list of types whose score is constant, with the clause of each type's own
+      predicate that forces it.
+    corroborating_keys:
+      C1: ["paid_payment_refs", "enrollment_ref"]
+      C2: []
+      C3: []
+      C4: []
+      C5: []
+      C6: []
+      C7: []
+      C8: []
+      C9: []
+      C10: []
+      C11: ["amount_cents", "occurred_at_delta_seconds"]
+      C12: ["amount_cents", "expected_amount_cents"]
+      C13: ["refunded_at", "enrollment.updated_at"]
+      C14: []
+
+  disagreeing_field:
+    weight: "-0.10"
+    kind: count
+    sign: negative
+    derivation: >-
+      The number of distinct COMPARED_FIELDS comparison ROWS covered by the conflict's
+      `disagreeing_fields`. The ROW, not the path, is the unit: contract SS2.4 puts
+      BOTH source-qualified endpoints of a disagreeing comparison into
+      `disagreeing_fields`, so a grade-only C6 carries two paths and is ONE
+      disagreement. Counting paths would double every penalty. Only R-006 and R-014
+      populate `disagreeing_fields`, so this term is 0 for every other type.
+      This is the "sources conflict lowers it" half of R14.
+
+  partial_evidence:
+    weight: "-0.15"
+    kind: boolean
+    sign: negative
+    derivation: >-
+      1 when ANY of four conditions holds, each recorded by name in the packet:
+      (a) `incomplete_sources` -- `source_generations` reports a source of generation
+      3 as not complete, so the run is degraded (contract SS5.3) and a rule may be
+      reading a partial snapshot; (b) `null_observed_values` -- at least one of the
+      type's pinned `observed_values` entries is null, an empty string or an empty
+      list, so a fact the predicate names was not actually observed; (c)
+      `single_source` -- `sources_involved` names fewer than two systems, so no second
+      system corroborates anything in the packet; (d) `contradictory_match_keys` --
+      two match-key classes resolve ONE source record to two DIFFERENT entities, which
+      is what a C10 merge-collapsed record is made of and is the strongest evidence
+      there is AGAINST an identity. (a)-(c) are R14's "partial evidence lowers it";
+      (d) is its "conflicting evidence lowers it", at the identity level rather than
+      the field level.
+
+      MEASURED: clause (c) `single_source` is fixed by the conflict TYPE for
+      C2/C3/C5/C11 -- `sources_involved` is part of those types' predicates -- so for
+      them this term is a base adjustment rather than evidence. It varies per-instance
+      only within C8 and C9, via clause (b). Clause (d) fires on exactly the 50 C10s,
+      which is what a C10 is. Recorded here so the model's discriminating power is not
+      overstated: the three identity signals are what actually vary within a type.
+
+  oscillation_observed:
+    weight: "-0.25"
+    kind: boolean
+    sign: negative
+    derivation: >-
+      1 when the conflict's underlying field oscillated A -> B -> A across generations
+      (contract SS7), as reported by `recon.invariants.oscillation.scan_field_lineage`
+      over `field_lineage` and, when that scan has no rows to read, by the
+      `conflicts.oscillating` column the invariant run stamped. The heaviest penalty
+      in the model: a source that re-asserts a value a human already moved away from
+      is evidence AGAINST the fix, not for it. The packet records which of the two
+      inputs answered, how many `field_lineage` rows the scan saw AND how many
+      distinct GENERATIONS those rows cover, so "scanned and found none" is never
+      confused with "there was nothing to scan". The generation count is the
+      load-bearing one: SS7's pattern needs three ascending generations, so lineage
+      materialized for generation 3 alone is 426,175 rows that cannot contain it, and
+      a guard keyed on row count alone reported a confident `false` on all 3,050
+      proposals -- golden's 25 oscillating ones included -- while stamping them
+      `decided_by: lineage_scan`. With generations 1-3 materialized the committed scan
+      finds exactly those 25 unaided.

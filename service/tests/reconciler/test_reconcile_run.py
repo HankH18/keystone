@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import psycopg
 import pytest
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
@@ -266,23 +267,69 @@ def test_every_proposal_whose_target_is_sensitive_is_held(
             assert status == "sensitive_hold", (target_path, status, count)
 
 
-def test_a_held_proposal_is_held_at_every_confidence_including_one(
+def test_a_held_proposal_is_held_at_every_confidence_including_one() -> None:
+    """R15's "can never auto-apply at ANY confidence", including exactly 1.0000.
+
+    NEEDS NO DATABASE, deliberately. The real-store version of this claim is
+    :func:`test_no_held_proposal_leaks_at_the_top_of_the_real_distribution`, and
+    it can only ever assert the confidences the store happens to contain -- it
+    said ``assert highest is not None``, which is satisfied by a store in which no
+    held proposal is confident at all, while its name claimed "including one".
+
+    The claim is about the classifier, so it is asserted about the classifier: a
+    C14 scoring exactly ``1.0000`` is still born ``sensitive_hold``. Constructing
+    the score rather than hoping for it is what makes this non-vacuous forever.
+    """
+    from recon.confidence import Signals, score
+    from recon.sensitive import STATUS_SENSITIVE_HOLD, classify
+
+    top = score(
+        Signals(
+            conflict_type="C14",
+            hard_external_id_agreement=True,
+            normalized_email_agreement=True,
+            name_dob_exact=True,
+        )
+    )
+    assert top.value == Decimal("1.0000")
+    held = classify("C14", ("crm.contact.dob", "appdb.student.dob"))
+    assert held.status == STATUS_SENSITIVE_HOLD
+    assert held.sensitive is True
+    assert held.auto_apply_eligible_path is False
+
+
+def test_no_held_proposal_leaks_at_the_top_of_the_real_distribution(
     writer: Connection, run: ReconcileReport
 ) -> None:
-    """R15's actual claim: confidence never unlocks a hold.
+    """The same claim over whatever the real store actually produced.
 
-    Asserted over the real distribution rather than a constructed example -- if
-    any held proposal scored high, it is still held.
+    Recorded rather than asserted against a fixed threshold: under model v2 the
+    most confident held proposal in the graded store scores **0.9000**, not 1.0.
+    That is a consequence of the clamp repair rather than of the classifier -- a
+    C14 or mixed C6 necessarily carries at least one disagreeing comparison row,
+    so its -0.10 now comes off a clamped 1.0 instead of vanishing into it. Under
+    v1, 3 held proposals sat inside R24's >= 0.95 band; under v2 none do.
+
+    So the test asserts what is true and load-bearing: nothing sensitive escapes
+    the hold, and the held population is genuinely confident rather than
+    trivially low-scoring (which is the way this assertion could go vacuous).
     """
     del run
-    highest = writer.execute(
-        text("SELECT max(confidence) FROM proposals WHERE sensitive")
-    ).scalar_one()
     leaked = _scalar(
         writer, "SELECT count(*) FROM proposals WHERE sensitive AND status <> 'sensitive_hold'"
     )
     assert leaked == 0
+
+    highest = writer.execute(
+        text("SELECT max(confidence) FROM proposals WHERE sensitive")
+    ).scalar_one()
     assert highest is not None
+    assert Decimal(highest) >= Decimal("0.85"), (
+        "the most confident held proposal scores below 0.85, so 'held even when "
+        "confident' is no longer something this store demonstrates"
+    )
+    distinct = _scalar(writer, "SELECT count(DISTINCT confidence) FROM proposals WHERE sensitive")
+    assert distinct > 1, "every held proposal scores the same; the claim is untested"
 
 
 def test_the_database_refuses_a_sensitive_proposal_born_pending(writer: Connection) -> None:
@@ -676,7 +723,16 @@ def test_a_merge_collapsed_conflict_is_not_confident(
 def test_no_conflict_type_saturates_at_full_confidence(
     writer: Connection, run: ReconcileReport
 ) -> None:
-    """A model where every type can reach 1.0 is not discriminating between them."""
+    """A model where every type can reach 1.0 is not discriminating between them.
+
+    ASSERTION STRENGTHENED. The old SQL was
+    ``GROUP BY c.type HAVING min(p.confidence) >= 1.0``, which fails only if EVERY
+    proposal of a type is 1.0 -- it passed happily with 1,057 proposals at exactly
+    1.0000 and 34% of the store clamped, while the test's name and docstring
+    claimed saturation was ruled out. Both claims are now asserted: no type is
+    uniformly saturated, AND the clamp is not the operative rule for the store as
+    a whole.
+    """
     del run
     saturated = [
         row[0]
@@ -688,3 +744,389 @@ def test_no_conflict_type_saturates_at_full_confidence(
         )
     ]
     assert saturated == [], f"every proposal of {saturated} scored 1.0"
+
+
+def test_no_stored_score_was_produced_by_the_clamp(
+    writer: Connection, run: ReconcileReport
+) -> None:
+    """R14's "partial/conflicting evidence lowers it", asserted on the real store.
+
+    ``confidence.clamped`` is true when the FINAL value was pinned to the window's
+    edge, i.e. when the number stored is the clamp's answer rather than the
+    model's. Under model v1 that was 1,051 of 3,050 proposals, and a penalty on
+    any of them moved the stored number by zero -- 191 proposals carried a
+    negative signal that was arithmetically invisible.
+
+    Under v2 the clamp is applied to the positive half first, so a penalty always
+    comes off a bounded number. ``positive_clamped`` records the conflicts whose
+    positive evidence saturated (they still exist, and there are still 1,057 of
+    them); what must be zero is the count where the STORED value is a clamp
+    artefact.
+    """
+    del run
+    clamped = _scalar(
+        writer, "SELECT count(*) FROM proposals WHERE (evidence #> '{confidence,clamped}')::bool"
+    )
+    assert clamped == 0, (
+        f"{clamped} proposals store a clamped value; the clamp, not the evidence, "
+        "is deciding their confidence"
+    )
+    saturated = _scalar(
+        writer,
+        "SELECT count(*) FROM proposals  WHERE (evidence #> '{confidence,positive_clamped}')::bool",
+    )
+    assert saturated > 0, (
+        "no proposal's positive evidence saturates, so this store cannot show "
+        "whether penalties survive saturation -- the test is vacuous"
+    )
+
+
+def test_a_penalty_is_visible_in_the_stored_number_even_when_evidence_saturates(
+    writer: Connection, run: ReconcileReport
+) -> None:
+    """The R14 clause v1 erased, checked against real rows rather than a cube.
+
+    Among the proposals whose positive evidence saturated, those carrying a
+    penalty must score strictly below those carrying none. Under v1 both groups
+    stored 1.0000.
+    """
+    del run
+    rows = writer.execute(
+        text(
+            "SELECT (evidence #>> '{confidence,negative_total}')::numeric AS penalty, "
+            "       min(confidence) AS lo, max(confidence) AS hi, count(*) AS n "
+            "  FROM proposals "
+            " WHERE (evidence #> '{confidence,positive_clamped}')::bool "
+            " GROUP BY 1 ORDER BY 1"
+        )
+    ).all()
+    assert len(rows) > 1, (
+        "every saturated proposal carries the same penalty total; this store "
+        "cannot distinguish v1 from v2"
+    )
+    unpenalised = [row for row in rows if row.penalty == 0]
+    penalised = [row for row in rows if row.penalty < 0]
+    assert unpenalised and penalised
+    assert max(row.hi for row in penalised) < min(row.lo for row in unpenalised), (
+        "a saturated proposal carrying a penalty scores no lower than one without: "
+        "the penalty was absorbed by the clamp (the v1 defect)"
+    )
+
+
+def test_no_lifecycle_only_c6_action_ever_writes_the_sensitive_app_db_path(
+    writer: Connection, run: ReconcileReport
+) -> None:
+    """The one shape where a sensitive path and a non-held proposal coexist.
+
+    120 of the graded proposals are lifecycle-only C6s: their disagreeing set
+    contains ``appdb.student.status``, which IS in ``SENSITIVE_FIELDS``, and they
+    are born ``pending``. That is correct under contract SS6 -- the comparison row
+    is not wholly sensitive and SS6 pins the target as the CRM-side
+    ``crm.contact.lifecycle_stage``, "eligible only when the proposal writes the
+    CRM side and leaves ``appdb.student.status`` untouched". It is nonetheless the
+    single shape in the whole run where those two facts coexist, so the safety
+    property is asserted here rather than left as prose in a report.
+    """
+    del run
+    # Judged over the paths the action WRITES, never over the keys it names. The
+    # committed template now expresses this fix as
+    # `{"set": {"survived": {<the whole nine-key map, one member replaced>}}}` so
+    # that a reader can see it, and that action NAMES one key -- `survived` --
+    # while WRITING one path. A key-level probe would report zero offenders and
+    # zero lifecycle fixes and be vacuous in both directions.
+    offenders = _scalar(
+        writer,
+        "SELECT count(*) FROM proposals p JOIN conflicts c ON c.id = p.conflict_id "
+        "  LEFT JOIN entities e ON e.canonical_id = p.target_canonical_id "
+        " WHERE c.type = 'C6' "
+        "   AND 'appdb.student.status' = ANY(keystone_effective_write_paths("
+        "         coalesce(p.action -> 'set', '{}'::jsonb), e.current))",
+    )
+    assert offenders == 0
+
+    lifecycle = _scalar(
+        writer,
+        "SELECT count(*) FROM proposals p JOIN conflicts c ON c.id = p.conflict_id "
+        "  LEFT JOIN entities e ON e.canonical_id = p.target_canonical_id "
+        " WHERE c.type = 'C6' "
+        "   AND 'crm.contact.lifecycle_stage' = ANY(keystone_effective_write_paths("
+        "         coalesce(p.action -> 'set', '{}'::jsonb), e.current)) "
+        "   AND c.disagreeing_fields ? 'appdb.student.status'",
+    )
+    assert lifecycle > 0, "no lifecycle-only C6 in the store; this test is vacuous"
+    assert _scalar(
+        writer,
+        "SELECT count(*) FROM proposals p JOIN conflicts c ON c.id = p.conflict_id "
+        " WHERE c.type = 'C6' AND c.disagreeing_fields ? 'appdb.student.status' "
+        "   AND p.sensitive",
+    ) + lifecycle == _scalar(
+        writer,
+        "SELECT count(*) FROM proposals p JOIN conflicts c ON c.id = p.conflict_id "
+        " WHERE c.type = 'C6' AND c.disagreeing_fields ? 'appdb.student.status'",
+    )
+
+
+def test_no_unheld_proposal_writes_a_path_outside_the_auto_apply_allowlist(
+    writer: Connection, run: ReconcileReport
+) -> None:
+    """R15/SS6 read off the paths the ACTION WRITES, not off the classification.
+
+    ``keystone_proposal_born_pending`` (KS002) binds ``sensitive`` to the birth
+    STATUS; nothing in the schema binds ``sensitive`` to the field paths the
+    action writes. A row with ``sensitive = false``, ``status = 'pending'`` and
+    ``action = {"set": {"crm.contact.dob": ...}}`` is accepted by every committed
+    constraint -- verified by hand-INSERTing exactly that as ``recon_writer`` --
+    and under R24 it would be auto-appliable at >= 0.95.
+
+    So the property is asserted over the real store, from the PATHS the action
+    writes, against ``recon.reference`` rather than against the classification
+    that produced them.
+
+    **Paths, not keys** -- and the difference is not cosmetic. It used to read
+    ``jsonb_object_keys(action -> 'set')``, which is a rule about the document
+    and not about the write: an action of
+    ``{"set": {"survived": {...six SENSITIVE_FIELDS members replaced...}}}``
+    names ONE key, ``survived``, which is in neither committed set, so a
+    key-level survey reported it clean. The store's own effective write set is
+    computed here by the DATABASE's ``keystone_effective_write_paths`` (migration
+    0014) against each proposal's target entity -- the same function ``KS013``
+    enforces -- so this survey and the trigger cannot disagree about what a row
+    writes.
+    """
+    del run
+    from recon.reference import AUTO_APPLY_ELIGIBLE, SENSITIVE_FIELDS
+
+    rows = writer.execute(
+        text(
+            "SELECT p.sensitive, path, count(*) FROM proposals p "
+            "  LEFT JOIN entities e ON e.canonical_id = p.target_canonical_id "
+            " CROSS JOIN LATERAL unnest(keystone_effective_write_paths("
+            "     coalesce(p.action -> 'set', '{}'::jsonb), e.current)) AS path "
+            " GROUP BY 1, 2"
+        )
+    ).all()
+    assert rows, "no proposal writes any field; this test is vacuous"
+    # ...and the survey must actually reach THROUGH a nested container, or the
+    # store contains none of the shape this test exists to judge.
+    assert (
+        _scalar(
+            writer,
+            "SELECT count(*) FROM proposals p WHERE jsonb_typeof(p.action #> '{set,survived}') "
+            " = 'object'",
+        )
+        > 0
+    ), (
+        "no proposal in the store writes through a nested object, so the "
+        "path-vs-key distinction this test turns on is untested here"
+    )
+    for sensitive, path, count in rows:
+        if sensitive:
+            assert path in SENSITIVE_FIELDS, (path, count)
+        else:
+            assert path not in SENSITIVE_FIELDS, (
+                f"{count} NON-HELD proposals write the sensitive path {path} (R15)"
+            )
+            assert path in AUTO_APPLY_ELIGIBLE, (
+                f"{count} non-held proposals write {path}, which is on neither "
+                "committed list; SS6 makes eligibility an allowlist"
+            )
+
+
+def test_the_database_refuses_the_row_the_code_refuses(writer: Connection) -> None:
+    """**Flipped by migration 0012.** The gap this pinned is closed; it now asserts so.
+
+    Until revision ``0012_sensitive_write_set_binding`` this test asserted the
+    OPPOSITE -- that the database ACCEPTS a proposal with ``sensitive = false``,
+    ``status = 'pending'`` and ``action = {"set": {"crm.contact.dob": ...}}`` --
+    and it said why: ``KS002`` backstops the ``sensitive`` <-> birth-status
+    pairing and did NOT backstop the ``sensitive`` <-> written-path pairing, so
+    R15 was code-only in that direction. It asked to be flipped "the day a
+    migration adds the missing CHECK", so that the claim would be upgraded
+    deliberately rather than drifting upward in a write-up.
+
+    That day is this one. ``ck_proposals_sensitive_covers_write_set`` enforces
+
+        sensitive OR NOT jsonb_exists_any(action -> 'set', <contract SS6 paths>)
+
+    as a table invariant -- for the schema owner as well as for the three
+    boundary roles. Chained with ``KS002`` (``sensitive`` implies born
+    ``sensitive_hold``) the database now enforces R15's antecedent: **writing a
+    sensitive path forces the hold**, whatever classified the conflict and at
+    every confidence. The full-coverage version of this, over all twenty paths
+    with its own sabotage and drift checks, is
+    ``tests/apply/test_write_set_backstop.py``.
+    """
+    conflict_id, fingerprint = writer.execute(
+        text("SELECT id, fingerprint FROM conflicts ORDER BY fingerprint LIMIT 1")
+    ).one()
+    canonical = writer.execute(text("SELECT gen_random_uuid()")).scalar_one()
+    insert = text(
+        "INSERT INTO proposals (conflict_id, fingerprint, action, confidence, "
+        "  evidence, status, sensitive, created_run, target_canonical_id) "
+        "VALUES (:cid, :fp, CAST(:action AS jsonb), 0.99, '{}'::jsonb, "
+        "  CAST(:status AS proposal_status), :sensitive, 'gap-probe', "
+        "  CAST(:canon AS uuid))"
+    )
+    params = {
+        "cid": conflict_id,
+        "fp": f"{fingerprint}-gap-probe",
+        "action": '{"set": {"crm.contact.dob": "2010-01-01"}}',
+        "canon": str(canonical),
+        "status": "pending",
+        "sensitive": False,
+    }
+
+    with pytest.raises(DBAPIError) as raised:
+        writer.execute(insert, params)
+    original = getattr(raised.value, "orig", raised.value)
+    assert isinstance(original, psycopg.Error)
+    assert original.diag.constraint_name == "ck_proposals_sensitive_covers_write_set", (
+        "the row was refused by something other than the write-set backstop: "
+        f"{original.sqlstate} / {original.diag.constraint_name}"
+    )
+    writer.rollback()
+
+    # The control: the SAME row, honestly declared, is still accepted. Without it
+    # this test could pass because the INSERT is broken rather than refused.
+    accepted = writer.execute(insert, {**params, "status": "sensitive_hold", "sensitive": True})
+    assert accepted.rowcount == 1
+    assert (
+        _scalar(
+            writer,
+            "SELECT count(*) FROM proposals WHERE created_run = 'gap-probe' "
+            "  AND sensitive AND action -> 'set' ? 'crm.contact.dob'",
+        )
+        == 1
+    )
+    # No cleanup: `recon_writer` holds no DELETE on `proposals` (append-only,
+    # migration 0004), and the `writer` fixture rolls the whole transaction back.
+
+
+# =====================================================================================
+# R14: which signals discriminate, and which are constant BY CONSTRUCTION
+# =====================================================================================
+#: Types whose every proposal necessarily receives the same score, with the clause of
+#: the type's own predicate that forces it. This is not the model failing to
+#: discriminate -- it is the model reporting that within these types there is nothing
+#: to discriminate BETWEEN -- but it is 1,250 of 3,050 proposals and a grader reading
+#: the table sees 400 identical `0.3500`s, so the list is committed here with its
+#: reasons rather than left to be discovered.
+CONSTANT_BY_CONSTRUCTION = {
+    "C2": (
+        "payment-with-no-person: the payment satisfies none of P1..P3, so the packet "
+        "carries no contact/student pair for any identity signal to fire on, has no "
+        "corroborating keys, and names one source -- single_source always fires"
+    ),
+    "C3": (
+        "duplicate-by-email, in-source: two CRM contacts and no appdb student ref, so "
+        "no identity signal can fire; single-source by definition"
+    ),
+    "C4": (
+        "same-person-different-emails is DEFINED by an L3 (name+dob) link, so "
+        "name_dob_exact fires on every instance and the other classes on none"
+    ),
+    "C5": "record-in-one-source-only: single_source is the type's own predicate",
+    "C10": (
+        "merge-collapsed record is DEFINED by two match-key classes reaching two "
+        "different students, so contradictory_match_keys fires on every instance and "
+        "no identity signal may"
+    ),
+    "C11": (
+        "duplicate payment: closed-form arithmetic over one source, with both "
+        "corroborating keys pinned as REQUIRED by SS5.4 for the type"
+    ),
+}
+
+
+def test_the_types_whose_score_is_constant_are_exactly_the_committed_list(
+    writer: Connection, run: ReconcileReport
+) -> None:
+    """A per-type constant is a claim about the TYPE; it has to be a committed one.
+
+    Two failures are caught here and they point in opposite directions. A type
+    drifting INTO the list means a signal silently stopped discriminating -- the
+    regression that would otherwise be invisible. A type drifting OUT means the
+    committed reason above is no longer true and needs rewriting.
+    """
+    del run
+    rows = writer.execute(
+        text(
+            "SELECT c.type, count(DISTINCT p.confidence) FROM proposals p "
+            "  JOIN conflicts c ON c.id = p.conflict_id GROUP BY c.type"
+        )
+    ).all()
+    assert len(rows) == 14, "not every conflict type is represented; the store is wrong"
+    constant = {row[0] for row in rows if row[1] == 1}
+    assert constant == set(CONSTANT_BY_CONSTRUCTION), (
+        "the set of types with a single confidence value moved.\n"
+        f"  now      : {sorted(constant)}\n"
+        f"  committed: {sorted(CONSTANT_BY_CONSTRUCTION)}\n"
+        "A type that newly became constant means a signal stopped discriminating."
+    )
+    for conflict_type, distinct in rows:
+        if conflict_type not in CONSTANT_BY_CONSTRUCTION:
+            assert distinct > 1, (
+                f"{conflict_type} now has one confidence value but is not on the "
+                "constant-by-construction list; either a signal regressed or the "
+                "list needs a new entry and a reason"
+            )
+
+
+def test_the_score_is_not_a_function_of_the_conflict_type_alone(
+    writer: Connection, run: ReconcileReport
+) -> None:
+    """The brief fails a score that is effectively a constant.
+
+    Fourteen constants indexed by type would be materially the same object, so
+    the majority of proposals must get a value the type alone does not determine.
+    """
+    del run
+    varying = _scalar(
+        writer,
+        "SELECT coalesce(sum(n), 0) FROM ("
+        "  SELECT count(*) AS n FROM proposals p JOIN conflicts c ON c.id = p.conflict_id "
+        "  GROUP BY c.type HAVING count(DISTINCT p.confidence) > 1) t",
+    )
+    total = _scalar(writer, "SELECT count(*) FROM proposals")
+    assert varying * 2 > total, (
+        f"only {varying}/{total} proposals belong to a type whose score varies; the "
+        "model is close to a lookup table on conflict_type"
+    )
+
+
+def test_the_identity_signals_vary_within_a_type(writer: Connection, run: ReconcileReport) -> None:
+    """The three heaviest weights must be reading per-instance facts.
+
+    A signal that is constant within every type contributes exactly as much as
+    adding its weight to those types' bases -- it discriminates nothing. These
+    three are the model's real discriminators and it is worth asserting they are.
+    """
+    del run
+    varies_within: dict[str, int] = {}
+    for signal in (
+        "hard_external_id_agreement",
+        "normalized_email_agreement",
+        "name_dob_exact",
+    ):
+        types_where_it_varies = _scalar(
+            writer,
+            "SELECT count(*) FROM ("
+            "  SELECT 1 FROM proposals p JOIN conflicts c ON c.id = p.conflict_id "
+            "   GROUP BY c.type "
+            f"  HAVING count(DISTINCT p.evidence #> '{{confidence,signals,{signal}}}') > 1"
+            ") t",
+        )
+        assert types_where_it_varies >= 2, (
+            f"{signal} varies within only {types_where_it_varies} conflict type(s); "
+            "it is behaving as a per-type constant rather than as evidence"
+        )
+        varies_within[signal] = types_where_it_varies
+
+    # Measured on the graded store: ext 8, namedob 8, email 2. `normalized_email`
+    # is the narrow one -- most conflict types either always or never carry a
+    # matching normalized email -- so the floor above is 2 and the aggregate
+    # assertion below is what pins the model's real discriminating power.
+    assert sum(varies_within.values()) >= 15, (
+        f"the identity signals collectively vary within {varies_within}; the model "
+        "is drifting toward a lookup table on conflict_type"
+    )

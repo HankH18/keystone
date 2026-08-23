@@ -44,6 +44,27 @@ Each clause is discharged by a mechanism, not by intent:
     COMPARISON ROW -- contract SS2.4 puts both endpoints of a row into
     ``disagreeing_fields``, so counting paths would double every penalty).
 
+    **And they lower it even when the positive evidence saturates**, which is why
+    the clamp is applied TWICE and not once. Model version 1 evaluated
+    ``clamp01(base + sum(all weights))``; on the graded store that erased the
+    penalty on 191 of 3,050 proposals (162 ``disagreeing_field``, 29
+    ``partial_evidence``) because their positive evidence had already carried the
+    raw total past 1.0, so subtracting 0.10 or 0.15 from 1.10 still stored
+    1.0000. A worked case: a C6 linked on all three key classes scored
+    ``0.40 + 0.35 + 0.25 + 0.20 = 1.20``, and its disagreement penalty was
+    arithmetically invisible. R14 says partial and conflicting evidence LOWERS
+    the score; a penalty that a strong-enough prior can buy immunity from does
+    not discharge that clause. Version 2 therefore clamps the positive half
+    first and then subtracts:
+
+    ``clamp01(clamp01(base + sum(positive)) + sum(negative))``
+
+    In the region where ``base + sum(positive) <= 1`` this is arithmetically
+    identical to version 1, so the change moves only the scores the clamp was
+    silently flattening. The remaining insensitivity is at the floor: once a
+    score is already at ``clamp_min`` a further penalty cannot lower it, and
+    :func:`score` records ``clamped`` so a reviewer can see when that happened.
+
 ``never an LLM number``
     this module imports nothing from :mod:`recon.llm` and
     :func:`score` takes a :class:`Signals`, not text. ``tests/reconciler`` asserts
@@ -60,6 +81,7 @@ takes a field path, and :func:`score` cannot hold or release a proposal.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, localcontext
@@ -170,6 +192,13 @@ class ConfidenceModel:
     clamp_min: Decimal
     clamp_max: Decimal
     source: Path
+    #: ``sha256`` of the model file's raw bytes. Stamped into every evidence
+    #: packet so a proposal names the exact bytes that scored it, rather than an
+    #: integer a human has to remember to bump. ``version`` still exists and is
+    #: still asserted, but a weight edit that forgets it is now visible on every
+    #: row written afterwards -- and ``tests/reconciler/test_confidence_yaml.py``
+    #: pins this digest, so the edit is also a red build.
+    digest: str = ""
 
     @property
     def quantum(self) -> Decimal:
@@ -191,7 +220,14 @@ class ConfidenceModel:
             raise ConfidenceModelError(f"{self.source.name} has no signal named {name!r}") from None
 
     def key_class_signals(self) -> Mapping[str, str]:
-        """``key_class -> signal name`` for the three identity signals."""
+        """``key_class -> signal name`` for the three identity signals.
+
+        Safe to build as a dict because :func:`_parse` refuses a model in which
+        two signals share a ``key_class``. Without that check this comprehension
+        is last-write-wins over ``self.signals``' iteration order, so a duplicate
+        would silently drop one identity signal and WHICH one it dropped would
+        depend on the order of two keys in a YAML file.
+        """
         return {
             definition.key_class: name
             for name, definition in self.signals.items()
@@ -199,7 +235,14 @@ class ConfidenceModel:
         }
 
     def corroborating_keys(self, conflict_type: str) -> tuple[str, ...]:
-        """The pinned ``observed_values`` keys that corroborate ``conflict_type``."""
+        """The pinned ``observed_values`` keys that corroborate ``conflict_type``.
+
+        :func:`_parse` refuses a model in which more than one signal defines a
+        ``corroborating_keys`` table, so "the signal that owns the table" is
+        unambiguous. The earlier implementation returned the FIRST such signal in
+        YAML mapping order, which is a graded number depending on the order two
+        keys happen to appear in a file.
+        """
         for definition in self.signals.values():
             if definition.corroborating_keys:
                 return definition.corroborating_keys.get(conflict_type, ())
@@ -212,7 +255,7 @@ def _require(mapping: Mapping[str, Any], key: str, *, where: str) -> Any:
     return mapping[key]
 
 
-def _parse(document: Any, source: Path) -> ConfidenceModel:
+def _parse(document: Any, source: Path, digest: str = "") -> ConfidenceModel:
     if not isinstance(document, Mapping):
         raise ConfidenceModelError(f"{source}: the model must be a YAML mapping")
 
@@ -296,6 +339,32 @@ def _parse(document: Any, source: Path) -> ConfidenceModel:
                 f"weight {definition.weight} is {expected}"
             )
 
+    # Two accessors on ConfidenceModel would otherwise depend on the order two
+    # keys happen to appear in a YAML file. `corroborating_keys()` returns the
+    # FIRST signal carrying a table, and `key_class_signals()` builds a
+    # `key_class -> name` dict that is last-write-wins. Both are deterministic
+    # today only because the committed file has exactly one corroborating signal
+    # and three distinct key classes -- an accident, not a checked property, and
+    # determinism is graded. Refuse the model that would make either ambiguous
+    # rather than silently picking one.
+    owners = sorted(name for name, d in signals.items() if d.corroborating_keys)
+    if len(owners) > 1:
+        raise ConfidenceModelError(
+            f"{source}: more than one signal defines corroborating_keys ({owners}); "
+            "the table's owner would then depend on YAML key order"
+        )
+    seen_key_classes: dict[str, str] = {}
+    for name in sorted(signals):
+        key_class = signals[name].key_class
+        if key_class is None:
+            continue
+        if key_class in seen_key_classes:
+            raise ConfidenceModelError(
+                f"{source}: signals {seen_key_classes[key_class]!r} and {name!r} "
+                f"both claim key_class {key_class!r}; one would silently be dropped"
+            )
+        seen_key_classes[key_class] = name
+
     return ConfidenceModel(
         version=version,
         formula=str(_require(document, "formula", where=str(source))),
@@ -314,6 +383,7 @@ def _parse(document: Any, source: Path) -> ConfidenceModel:
             where=f"{source}:precision.clamp_max",
         ),
         source=source,
+        digest=digest,
     )
 
 
@@ -324,16 +394,20 @@ def _load_cached(path: str, mtime_ns: int) -> ConfidenceModel:
     del mtime_ns
     source = Path(path)
     try:
-        document = yaml.safe_load(source.read_text(encoding="utf-8"))
+        raw = source.read_bytes()
     except FileNotFoundError as exc:
         raise ConfidenceModelError(
             f"the committed confidence model is missing at {source}. There is no "
             "fallback: R14 requires the weights to be committed, and a model that "
             "keeps scoring without its file is a hardcoded model."
         ) from exc
+    try:
+        document = yaml.safe_load(raw.decode("utf-8"))
     except yaml.YAMLError as exc:
         raise ConfidenceModelError(f"{source} is not valid YAML: {exc}") from exc
-    return _parse(document, source)
+    # Over the RAW BYTES, before parsing: the digest has to identify the file a
+    # reviewer would open, comments and all, not a re-serialization of it.
+    return _parse(document, source, hashlib.sha256(raw).hexdigest())
 
 
 def load_model(path: Path | str | None = None) -> ConfidenceModel:
@@ -445,27 +519,62 @@ class Score:
     ``value`` is what lands in ``proposals.confidence``; ``as_dict()`` is what
     lands in ``proposals.evidence['confidence']``. They are produced together so
     a stored score can never exist without its inputs.
+
+    The packet is **self-contained**: a reviewer holding one row can re-derive
+    its number without the repository. It carries the base, every term, the two
+    halves of the sum, the clamp window, the rounding mode, the number of decimal
+    places, the model version AND the sha256 of the model file's bytes. The
+    digest is there because ``version`` is an integer a human has to remember to
+    bump: without it, a weight edit that skipped the bump would silently
+    re-point every historical ``model_version: 1`` row at different arithmetic.
     """
 
     value: Decimal
     conflict_type: str
     base: Decimal
     terms: tuple[SignalTerm, ...]
+    #: ``base + sum(EVERY term)``, ungrouped -- the version-1 quantity, kept so
+    #: the recorded terms still visibly add up to a recorded number.
     raw_total: Decimal
+    #: The two halves the version-2 formula treats differently.
+    positive_total: Decimal
+    negative_total: Decimal
+    #: ``clamp01(base + positive_total)`` -- the value the penalties are taken off.
+    evidence_total: Decimal
+    #: True when the POSITIVE half saturated, i.e. when this conflict is one of
+    #: the ones version 1 would have silently flattened.
+    positive_clamped: bool
+    #: True when the FINAL value was clamped (at either end).
     clamped: bool
     model_version: int
+    model_sha256: str
     formula: str
+    decimal_places: int
+    rounding: str
+    clamp_min: Decimal
+    clamp_max: Decimal
     signals: Signals
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "model_version": self.model_version,
+            "model_sha256": self.model_sha256,
             "formula": self.formula,
             "conflict_type": self.conflict_type,
             "base": str(self.base),
             "terms": [term.as_dict() for term in self.terms],
             "raw_total": str(self.raw_total),
+            "positive_total": str(self.positive_total),
+            "negative_total": str(self.negative_total),
+            "evidence_total": str(self.evidence_total),
+            "positive_clamped": self.positive_clamped,
             "clamped": self.clamped,
+            "precision": {
+                "decimal_places": self.decimal_places,
+                "rounding": self.rounding,
+                "clamp_min": str(self.clamp_min),
+                "clamp_max": str(self.clamp_max),
+            },
             "confidence": str(self.value),
             "signals": self.signals.as_dict(),
         }
@@ -481,18 +590,44 @@ def clamp(total: Decimal, model: ConfidenceModel) -> tuple[Decimal, bool]:
 
 
 def score(signals: Signals, *, model: ConfidenceModel | None = None) -> Score:
-    """``clamp01(base[type] + sum(w_i * s_i))`` -- the committed formula, evaluated.
+    """``clamp01(clamp01(base + sum(positive)) + sum(negative))`` -- model v2.
+
+    **Why the clamp is applied twice.** R14 requires that partial and conflicting
+    evidence LOWER the score. Version 1 evaluated ``clamp01(base + sum(all))``,
+    which quietly granted immunity from every penalty to any conflict whose
+    positive evidence had already carried the raw total past ``clamp_max``:
+    measured on the graded 3,050-proposal store, 1,051 proposals were clamped and
+    191 of them carried a negative signal that changed the stored number by
+    nothing (162 ``disagreeing_field``, 29 ``partial_evidence``). Two proposals
+    with identical positive evidence, one of them additionally flagged as
+    resting on partial evidence, stored byte-identical confidences. That is not
+    "lowered by partial evidence".
+
+    Clamping the positive half first and then subtracting fixes exactly that and
+    nothing else: whenever ``base + sum(positive) <= clamp_max`` the two versions
+    are arithmetically identical, so no score outside the saturated region moves.
+    The alternative -- rescaling the weights so saturation is unreachable --
+    would have changed every committed weight in ``DESIGN.md``'s pinned list, and
+    would have moved scores that were never wrong.
+
+    The one remaining insensitivity is at the FLOOR and is inherent to a bounded
+    score: once a value sits at ``clamp_min`` a further penalty cannot lower it.
+    ``clamped`` records when that happened, so it is visible in the packet rather
+    than inferred.
 
     Deterministic bit-for-bit: :mod:`decimal` throughout, a pinned context, terms
-    summed in the file's ``signal_order``, and one quantization at the end under
-    the file's ``rounding``. No float is constructed at any point, so nothing in
-    this function can vary between two processes reading the same YAML.
+    summed in the file's ``signal_order`` (positives and negatives accumulated in
+    that same single pass, so the grouping does not introduce an order of its
+    own), and ONE quantization at the end under the file's ``rounding``. No float
+    is constructed at any point, so nothing in this function can vary between two
+    processes reading the same YAML.
     """
     active = model or load_model()
     with localcontext() as ctx:
         ctx.prec = _PRECISION
         base = active.base(signals.conflict_type)
-        total = base
+        positive_total = Decimal(0)
+        negative_total = Decimal(0)
         terms: list[SignalTerm] = []
         for name in active.signal_order:
             definition = active.signal(name)
@@ -502,13 +637,22 @@ def score(signals: Signals, *, model: ConfidenceModel | None = None) -> Score:
                     f"signal {name!r} is committed as boolean but scored {value!r}"
                 )
             contribution = definition.weight * value
-            total += contribution
+            # The SIGN OF THE COMMITTED WEIGHT decides which half a term joins,
+            # not the sign of the contribution: a count signal scoring 0
+            # contributes 0 and must still be classed by its weight, or a
+            # zero-valued penalty would drift into the positive half.
+            if definition.weight < 0:
+                negative_total += contribution
+            else:
+                positive_total += contribution
             terms.append(
                 SignalTerm(
                     name=name, value=value, weight=definition.weight, contribution=contribution
                 )
             )
-        bounded, clamped = clamp(total, active)
+        raw_total = base + positive_total + negative_total
+        evidence_total, positive_clamped = clamp(base + positive_total, active)
+        bounded, clamped = clamp(evidence_total + negative_total, active)
         value = bounded.quantize(active.quantum, rounding=active.rounding)
 
     return Score(
@@ -516,10 +660,19 @@ def score(signals: Signals, *, model: ConfidenceModel | None = None) -> Score:
         conflict_type=signals.conflict_type,
         base=base,
         terms=tuple(terms),
-        raw_total=total,
+        raw_total=raw_total,
+        positive_total=positive_total,
+        negative_total=negative_total,
+        evidence_total=evidence_total,
+        positive_clamped=positive_clamped,
         clamped=clamped,
         model_version=active.version,
+        model_sha256=active.digest,
         formula=active.formula,
+        decimal_places=active.decimal_places,
+        rounding=active.rounding,
+        clamp_min=active.clamp_min,
+        clamp_max=active.clamp_max,
         signals=signals,
     )
 

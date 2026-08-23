@@ -227,3 +227,69 @@ def uncache_logger(proxy: Any) -> None:
     `create_app()` installed redacts.
     """
     proxy.__dict__.pop("bind", None)
+
+
+def _uncache_recon_loggers() -> None:
+    """Forget the bound logger structlog memoised on every `recon.*` proxy.
+
+    Found by walking the already-imported `recon.*` modules rather than by
+    listing them, so a module that grows a logger tomorrow inherits this instead
+    of quietly re-acquiring the defect below.
+    """
+    import structlog
+
+    for name, module in list(sys.modules.items()):
+        if not name.startswith("recon"):
+            continue
+        for value in vars(module).values():
+            if isinstance(value, structlog._config.BoundLoggerLazyProxy):
+                cast: Any = value
+                cast.__dict__.pop("bind", None)
+
+
+@pytest.fixture(autouse=True)
+def _never_leave_structlog_bound_to_a_closed_stream() -> Iterator[None]:
+    """Re-bind the process's logging to the REAL stderr after every test here.
+
+    **The defect this closes, which was not in the service.** This package is the
+    only one that calls `reset_logging_configuration()` + `configure_logging_once()`
+    inside a test -- `pristine_process` and `test_leak_hunt`'s equivalent both do
+    it in their *teardown*, deliberately, so the next test starts from a
+    configured process. But pytest's per-test capture is still installed at that
+    moment, so `structlog.WriteLoggerFactory(file=sys.stderr)` captured pytest's
+    capture object, and pytest closes it when the test ends. Every log line
+    emitted afterwards **in the same process** then raised
+    ``ValueError: I/O operation on closed file`` -- which is not a logging
+    nuisance: it is raised from inside `log.info(...)`, so it took out
+    `recon.ingest.ingest_source` and errored 63 tests in `tests/reconciler`
+    during setup, and made endpoints that log before returning a 4xx answer 500.
+
+    `tests/triggers/conftest.py` diagnosed this and refused to inherit it,
+    saying the fix belonged here. This is that fix. The restore configures
+    against `sys.__stderr__` -- the process's own stderr, which pytest redirects
+    at the file-descriptor level but never closes -- so the chain that outlives
+    this package is bound to a stream that stays open for the whole session.
+
+    Nothing is silenced and no assertion is affected: the full production chain,
+    redaction processor included, is what gets installed, and every test here
+    still installs and asserts on its own configuration while it runs.
+    """
+    yield
+
+    import structlog
+
+    from recon.config import get_settings
+    from recon.logging import configure_logging_once, reset_logging_configuration
+
+    saved = sys.stderr
+    durable = sys.__stderr__
+    if durable is not None and not durable.closed:
+        sys.stderr = durable
+    try:
+        structlog.reset_defaults()
+        reset_logging_configuration()
+        get_settings.cache_clear()
+        configure_logging_once()
+    finally:
+        sys.stderr = saved
+    _uncache_recon_loggers()

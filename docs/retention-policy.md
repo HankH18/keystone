@@ -60,6 +60,7 @@ time-based window.
 | `audit_log` | ts | 730 | purge | -- |
 | `entities` | -- | -- | retain | -- |
 | `entity_links` | -- | -- | retain | -- |
+| `budget_model_prices` | -- | -- | retain | -- |
 | `api_clients` | -- | -- | retain | -- |
 | `budget_ledger` | -- | -- | retain | -- |
 | `budget_reservations` | -- | -- | retain | -- |
@@ -146,6 +147,15 @@ joins it to `raw_records.natural_key`. It is surrogate in the generated dataset 
 but its content is chosen by the source, not by Keystone, so it is **not** treated as
 non-personal: `source_key` is off the log allow-list and is tokenised like `natural_key` (§4.0).
 The rows themselves are kept as long as the canonical rows they justify.
+
+**`budget_model_prices` — retained.** Reference data, not a record of anything that
+happened: the committed per-token rates from `prices.yaml`, seeded by migration 0010 and
+keyed by model name. No personal data, and no clock — rows change by migration only. It is
+owner-only on purpose (a capped party that could write a rate could write itself a refund),
+and migration 0010's reserve and settle triggers *read* it to derive the worst case and the
+settled amount, so a row aged out by a sweep would refuse every reservation for that model
+rather than release anything. Retention here is a correctness requirement, not just an
+absence of risk.
 
 **`api_clients`, `budget_ledger`, `budget_reservations`, `incidents` — retained.** Key hashes,
 money and cluster geometry. No personal data.
@@ -296,7 +306,8 @@ A processor chain is process-wide state, so it only covers anything if the proce
 `recon.logging.ENTRY_POINTS` — `recon/app.py`'s `create_app()` (what `make serve` and
 `uvicorn … --factory` run), the `recon` CLI (`recon/__main__.py`), `python -m recon.seed`
 (`recon/seed/__main__.py`), `python -m recon.suite` (`recon/suite/__main__.py`),
-`python -m recon.bench` (`recon/bench/__main__.py`), and alembic's `migrations/env.py`. `tests/privacy/test_logging_installed.py` asserts each one still
+`python -m recon.bench` (`recon/bench/__main__.py`), `python -m recon.invariants`
+(`recon/invariants/__main__.py`), and alembic's `migrations/env.py`. `tests/privacy/test_logging_installed.py` asserts each one still
 does, imports the **real** application and asserts the *active* structlog configuration contains
 the redaction processor, and runs each entry point in a subprocess to check the configuration a
 real process ends up with.
