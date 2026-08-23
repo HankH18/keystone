@@ -1,0 +1,299 @@
+# ---------------------------------------------------------------------------
+# Keystone — Render blueprint: the service plus the three scheduled jobs (R19).
+#
+# DESIGN pins the scheduling decision: **Render cron -> HTTPS + shared-secret
+# header**. pg_cron cannot carry the mandated trigger header and an in-process
+# scheduler dies with the web dyno, so the schedule lives here and the trigger
+# is an authenticated HTTPS POST.
+#
+# WHICH PRINCIPAL EACH PROCESS CONNECTS AS, AND WHY
+# --------------------------------------------------
+# Migrations 0002–0010 build a three-role write boundary and enforce it with
+# grants and `current_user`/`session_user`-keyed triggers. **A trigger keyed on
+# the connected role binds nothing at all if the process connects as the
+# database owner**, and until now this file gave the web service
+# `DATABASE_URL: fromDatabase … connectionString` — the owner — while its own
+# comment claimed it held "the capped party's credentials". Six red-team rounds
+# of boundary went out of the window on that one line.
+#
+#   process                     connects as        why
+#   --------------------------  -----------------  --------------------------
+#   keystone-service (web)      recon_writer       PROPOSES. Appends evidence
+#                                                  and proposals-born-pending;
+#                                                  reserves and settles spend.
+#     └ reviewer requests       review_writer      DECIDES. `recon.db.role_
+#                                                  connection(ROLE_REVIEW_
+#                                                  WRITER)` swaps credentials on
+#                                                  the same host/database.
+#     └ apply / rollback        apply_writer       APPLIES, under the cited-
+#                                                  proposal triggers.
+#     └ run-scope provisioning  ops                One narrow call. See the
+#         and `alembic upgrade`                    OPS_DATABASE_URL note below.
+#   keystone-budget-sweeper     ops                Closes somebody else's
+#                                                  reservation; refuses to run
+#                                                  as the capped party.
+#   keystone-sync / -reconcile  (no database)      They are `curl`; the work
+#                                                  happens in the web service.
+#
+# `recon.db.role_connection` derives every role DSN from `DATABASE_URL` by
+# swapping the username and password, so pointing `DATABASE_URL` at
+# `recon_writer` gives the reviewer and apply paths their own principals for
+# free — and gives the *default* path the restricted one, which is the part that
+# was wrong.
+#
+# THE ONE OWNER-GRADE CREDENTIAL THE WEB SERVICE STILL HOLDS
+# -----------------------------------------------------------
+# `OPS_DATABASE_URL` is the database owner and it is deliberately NOT
+# `DATABASE_URL`. Only `recon.budget.ops_engine()` reads it, and only four
+# operations use that engine: provisioning a run's ledger row, reading a ledger
+# row back, lifting an overspend halt, and sweeping dead leases. Everything the
+# service does while serving a request connects as `recon_writer`.
+#
+# It is here because `POST /internal/{sync,reconcile}` provisions `run:<id>`
+# through `recon.budget.provision_run_scope`, and migration 0005 revoked INSERT
+# on `budget_ledger` from `recon_writer` outright so that a capped party could
+# not conjure a scope with a cap of its choosing. That revocation is correct and
+# stays. **The residual gap is therefore real and is stated rather than hidden:
+# a web dyno that is fully compromised can reach an owner credential through its
+# own environment.** Closing it means moving run-scope provisioning off the
+# request path — an ops job, or a pre-provisioned pool of run scopes — which is
+# a change to `recon/api/internal.py` and not to this file.
+#
+# `alembic upgrade head` needs the owner too, and Render has no separate
+# migration job: `preDeployCommand` runs in the web service's environment. It is
+# spelled `DATABASE_URL="$OPS_DATABASE_URL" …` so that the *variable the
+# application reads* is never the owner's, even for that command's duration.
+#
+# NO SECRET VALUE APPEARS IN THIS FILE.
+# Every credential is declared with `sync: false`, which tells Render "this
+# variable exists, ask for its value in the dashboard and never read one from
+# the repository". A blueprint is committed; a committed secret is a leaked
+# secret the moment the repo is cloned. Generate the two trigger secrets with
+#     openssl rand -hex 32
+# and set them on BOTH the web service and the cron job that uses them — they
+# are per-job on purpose (R19/DESIGN), so `keystone-sync` never learns the
+# reconcile secret and rotating one does not rotate the other.
+#
+# The three role passwords must match the ones the roles were created with (see
+# `migrations/versions/0002_roles_and_grants.py` and `0005_three_role_boundary.py`,
+# which read `RECON_WRITER_PASSWORD`, `REVIEW_WRITER_PASSWORD` and
+# `APPLY_WRITER_PASSWORD` at migration time). Set them on the web service AND on
+# whatever runs the migration, or the roles are created with one password and
+# connected to with another.
+#
+# TLS (R20) is not optional and not configured here: Render terminates TLS on
+# every `onrender.com` host, and each cron below pins `--proto '=https'` so the
+# request fails rather than silently downgrading if the host variable is ever
+# edited to an http:// origin; `property: host` yields a bare hostname, so the
+# scheme is written literally in the command rather than inherited from a URL.
+# The composed `DATABASE_URL` pins `sslmode=require` for the same reason: it is
+# assembled here rather than handed over by `connectionString`, so the transport
+# setting has to be written down rather than inherited.
+# ---------------------------------------------------------------------------
+services:
+  - type: web
+    name: keystone-service
+    runtime: python
+    plan: starter
+    region: oregon
+    rootDir: service
+    healthCheckPath: /health
+    autoDeploy: false
+    buildCommand: pip install --upgrade uv && uv sync --frozen --no-dev
+    # Migrations run on release, not at import time: a web dyno that migrates on
+    # boot races itself the moment the service scales past one instance. They run
+    # as the OWNER, and the owner's DSN is passed to this one command rather than
+    # left in the variable the application reads.
+    preDeployCommand: DATABASE_URL="$OPS_DATABASE_URL" uv run alembic upgrade head
+    # THE CAPPED PARTY'S CREDENTIALS, for real this time. `DATABASE_URL` is
+    # assembled from the database's own host/port/name plus the recon_writer
+    # password, so the serving process authenticates as `recon_writer` and every
+    # grant and every role-keyed trigger in migrations 0002-0010 actually binds
+    # it. `recon.db.role_connection` swaps in review_writer / apply_writer on the
+    # same host for the paths that need them.
+    startCommand: >-
+      DATABASE_URL="postgresql://recon_writer:$RECON_WRITER_PASSWORD@$KEYSTONE_DB_HOST:$KEYSTONE_DB_PORT/$KEYSTONE_DB_NAME?sslmode=require"
+      uv run uvicorn recon.app:create_app --factory --host 0.0.0.0 --port $PORT
+    envVars:
+      # The pieces `DATABASE_URL` is assembled from. Non-secret on their own.
+      - key: KEYSTONE_DB_HOST
+        fromDatabase:
+          name: keystone-db
+          property: host
+      - key: KEYSTONE_DB_PORT
+        fromDatabase:
+          name: keystone-db
+          property: port
+      - key: KEYSTONE_DB_NAME
+        fromDatabase:
+          name: keystone-db
+          property: database
+      # The OWNER, for the pre-deploy migration and for the four ops-only
+      # operations in `recon.budget.ops_engine()` -- never for serving a request.
+      # See the header for the residual gap this represents and how to close it.
+      - key: OPS_DATABASE_URL
+        fromDatabase:
+          name: keystone-db
+          property: connectionString
+      # Per-job trigger secrets (R19). Values live only in the Render dashboard.
+      - key: TRIGGER_SECRET_SYNC
+        sync: false
+      - key: TRIGGER_SECRET_RECONCILE
+        sync: false
+      # Role passwords for the three-role write boundary (migration 0005).
+      # RECON_WRITER_PASSWORD is now load-bearing at RUNTIME as well as at
+      # migration time: the composed DATABASE_URL above authenticates with it.
+      - key: RECON_WRITER_PASSWORD
+        sync: false
+      - key: REVIEW_WRITER_PASSWORD
+        sync: false
+      - key: APPLY_WRITER_PASSWORD
+        sync: false
+      # Spend caps (R17). Read at migration time to provision the ledger rows
+      # and by `recon.budget` to provision each run's scope.
+      - key: DAILY_CAP_USD
+        value: "5.00"
+      - key: PER_RUN_CAP_USD
+        value: "1.00"
+      # `mock` needs no key and no network; flipping to `anthropic` requires
+      # ANTHROPIC_API_KEY, which fails loudly if absent rather than falling back.
+      - key: LLM_PROVIDER
+        value: mock
+      - key: LLM_MODEL
+        value: claude-opus-5
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      # `safe` redacts personal data out of stored logs (R21). Never `full` here.
+      - key: LOG_MODE
+        value: safe
+      - key: SEED
+        value: "20260822"
+
+  # -------------------------------------------------------------------------
+  # Scheduled jobs. Each carries ONLY its own secret.
+  #
+  # `--fail-with-body` makes a 401 a non-zero exit (so a broken secret shows up
+  # as a failed cron rather than a green one), `--proto '=https'` refuses a
+  # plaintext downgrade, and the run id is minted from the firing time so a
+  # Render retry of the same firing replays the same id and the endpoint
+  # answers `"status": "replayed"` instead of running the job twice.
+  # -------------------------------------------------------------------------
+  - type: cron
+    name: keystone-sync
+    runtime: python
+    plan: starter
+    region: oregon
+    rootDir: service
+    schedule: "0 * * * *"
+    buildCommand: "true"
+    startCommand: >-
+      curl --fail-with-body --show-error --silent --location
+      --proto '=https' --tlsv1.2 --max-time 300
+      -X POST "https://$KEYSTONE_API_HOST/internal/sync"
+      -H "X-Trigger-Secret: $TRIGGER_SECRET_SYNC"
+      -H "Content-Type: application/json"
+      -d "{\"run_id\": \"sync-$(date -u +%Y%m%dT%H%M%SZ)\"}"
+    envVars:
+      - key: KEYSTONE_API_HOST
+        fromService:
+          type: web
+          name: keystone-service
+          property: host
+      - key: TRIGGER_SECRET_SYNC
+        sync: false
+
+  - type: cron
+    name: keystone-reconcile
+    runtime: python
+    plan: starter
+    region: oregon
+    rootDir: service
+    schedule: "20 * * * *"
+    buildCommand: "true"
+    startCommand: >-
+      curl --fail-with-body --show-error --silent --location
+      --proto '=https' --tlsv1.2 --max-time 300
+      -X POST "https://$KEYSTONE_API_HOST/internal/reconcile"
+      -H "X-Trigger-Secret: $TRIGGER_SECRET_RECONCILE"
+      -H "Content-Type: application/json"
+      -d "{\"run_id\": \"reconcile-$(date -u +%Y%m%dT%H%M%SZ)\"}"
+    envVars:
+      - key: KEYSTONE_API_HOST
+        fromService:
+          type: web
+          name: keystone-service
+          property: host
+      - key: TRIGGER_SECRET_RECONCILE
+        sync: false
+
+  # -------------------------------------------------------------------------
+  # The budget-ledger sweeper (R17, DESIGN §Budget ledger: "TTL sweeper reclaims
+  # dead reservations"). DESIGN pinned it and, until this job existed, NOTHING
+  # CALLED IT: a process that died between reserving and settling held its
+  # worst-case reservation against the cap for ever.
+  #
+  # IT CHARGES. It does not refund. An expired lease is evidence the HOLDER is
+  # dead; it is NOT evidence that the paid CALL did not happen. The sweeper this
+  # replaced reclaimed the row, which released the whole reservation — so a child
+  # process that completed a billed call and was then SIGKILLed got a 100%
+  # refund, and a crash loop was a way to spend without limit. Every dead lease
+  # is now closed at its FULL reserved amount.
+  #
+  # The consequence is deliberate and is the correct direction: abandoned
+  # reservations consume budget permanently. Budget lost to a crash is
+  # recoverable by ops (reconcile the ledger, re-provision or widen the scope);
+  # money refunded for a call that did happen is not recoverable at all. If a
+  # scope bleeds budget to crashes, that is a crash to fix, visible as
+  # `budget_lease_expired` audit rows — not a refund to grant.
+  #
+  # The ONLY way this job releases anything is `--release-never-sent "<proof>"`,
+  # which an operator passes by hand after establishing that the calls never left
+  # the host (a provider incident report, an outbound-connection log). There is
+  # deliberately no flag meaning "release anyway".
+  #
+  # It is NOT an HTTPS trigger like the two above, and that is the point. It must
+  # run as the OPS principal: the web service connects as `recon_writer` (see the
+  # header -- it really does now), and a capped party able to close somebody
+  # else's reservation has re-invented "zero the spend". `recon.budget.main`
+  # refuses to sweep as `recon_writer` before it touches a row, so a
+  # misconfigured DATABASE_URL fails the cron loudly instead of quietly doing the
+  # wrong thing -- and `recon.suite`'s `spend-cap-burst` row now proves that
+  # refusal by misconfiguring one on purpose and watching it fire.
+  #
+  # `--sweep-unleased` is deliberately absent: a reservation with no lease
+  # duration in its key cannot be told apart from a call still in flight, and it
+  # is already fail-closed where it is (open, and fully charged).
+  # -------------------------------------------------------------------------
+  - type: cron
+    name: keystone-budget-sweeper
+    runtime: python
+    plan: starter
+    region: oregon
+    rootDir: service
+    schedule: "*/10 * * * *"
+    buildCommand: pip install --upgrade uv && uv sync --frozen --no-dev
+    startCommand: uv run python -m recon.budget sweep
+    envVars:
+      # The OPS principal, not the capped party: `fromDatabase` yields the
+      # database's own connection string, which is the whole reason this job
+      # exists as a job rather than as an endpoint on the web service. Here
+      # DATABASE_URL *is* the owner, deliberately, and no OPS_DATABASE_URL is
+      # set -- `recon.budget.ops_engine()` falls back to DATABASE_URL, which is
+      # already the right principal for this process.
+      #
+      # The same principal runs `python -m recon.budget resume --scope <s>
+      # --reason <r>`, the ONLY way to lift the durable halt a scope enters when
+      # a settlement reports more than its reservation could hold. The capped
+      # party can stop itself; only ops can start it again, after reconciling.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: keystone-db
+          property: connectionString
+      - key: LOG_MODE
+        value: safe
+
+databases:
+  - name: keystone-db
+    plan: basic-256mb
+    region: oregon
+    postgresMajorVersion: "16"

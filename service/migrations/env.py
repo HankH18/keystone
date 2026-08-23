@@ -18,6 +18,13 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from recon.db import database_url
+from recon.logging import configure_logging_once
+
+# Alembic runs as its own process with its own logging setup, so it installs the
+# privacy-safe structlog chain too -- `recon.db` and anything a revision imports
+# must not be able to log an unredacted value here either
+# (`recon.logging.ENTRY_POINTS`).
+configure_logging_once()
 
 config = context.config
 

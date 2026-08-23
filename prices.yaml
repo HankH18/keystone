@@ -1,0 +1,101 @@
+# ---------------------------------------------------------------------------
+# Keystone — committed model price table (SPEC R17).
+#
+# THIS FILE IS THE ONLY PLACE A TOKEN PRICE EXISTS. `recon.budget` refuses to
+# price a model that is not listed here (`UnknownModelError`) rather than
+# defaulting to zero: a zero-cost default is not a conservative fallback, it is
+# an unbounded spend path — every call would reserve nothing, the cap would
+# never be reached, and the burst test would pass while the bill grew.
+#
+# Units: **microusd per token**, as decimal strings. Money is parsed through
+# `decimal.Decimal` and never through a float, and every derived amount is
+# rounded UP to whole microusd, so rounding can only ever over-charge the
+# ledger — never under-charge it.
+#
+#   $5.00 / 1M tokens  =  5_000_000 microusd / 1_000_000 tokens  =  5 microusd/token
+#
+# Rate meanings (they map 1:1 onto the provider-reported `usage` fields):
+#   input        `usage.input_tokens`               — uncached prompt tokens
+#   output       `usage.output_tokens`              — includes thinking tokens
+#   cache_read   `usage.cache_read_input_tokens`    — 0.1x input
+#   cache_write  `usage.cache_creation_input_tokens`— 1.25x input (5-minute TTL)
+#
+# `cache_write` assumes the default 5-minute ephemeral TTL, which is what
+# `recon.llm` requests. A 1-hour TTL is billed at 2x input; if that is ever
+# turned on, this table must gain the rate BEFORE the code does, because the
+# reservation is computed from this file.
+#
+# Rates are Anthropic first-party API list prices. Where a model has a
+# promotional/introductory rate (Sonnet 5 is $2/$10 through 2026-08-31) the
+# LIST rate is committed, not the promo rate: the reservation must bound the
+# worst case, and a promo expiring must never turn a reservation into an
+# under-estimate.
+#
+# `version` is bumped on every rate change. It is stamped into the audit row of
+# every priced call, so a cost recorded last week can be re-derived from the
+# table that actually produced it.
+# ---------------------------------------------------------------------------
+version: 1
+units: microusd_per_token
+source: Anthropic first-party API list pricing
+captured: "2026-06-24"
+
+models:
+  claude-fable-5:
+    input: "10"
+    output: "50"
+    cache_read: "1"
+    cache_write: "12.5"
+
+  claude-opus-5:
+    input: "5"
+    output: "25"
+    cache_read: "0.5"
+    cache_write: "6.25"
+
+  claude-opus-4-8:
+    input: "5"
+    output: "25"
+    cache_read: "0.5"
+    cache_write: "6.25"
+
+  claude-opus-4-7:
+    input: "5"
+    output: "25"
+    cache_read: "0.5"
+    cache_write: "6.25"
+
+  claude-opus-4-6:
+    input: "5"
+    output: "25"
+    cache_read: "0.5"
+    cache_write: "6.25"
+
+  claude-sonnet-5:
+    input: "3"
+    output: "15"
+    cache_read: "0.3"
+    cache_write: "3.75"
+
+  claude-sonnet-4-6:
+    input: "3"
+    output: "15"
+    cache_read: "0.3"
+    cache_write: "3.75"
+
+  claude-haiku-4-5:
+    input: "1"
+    output: "5"
+    cache_read: "0.1"
+    cache_write: "1.25"
+
+  # The offline provider (`LLM_PROVIDER=mock`, the default). It is priced
+  # deliberately at the production rate rather than at zero: the mock exists so
+  # the graded burst test drives the REAL ledger arithmetic with no API key, and
+  # a free mock would have made that test a simulation of a cap instead of a
+  # test of one.
+  mock-rationale-v1:
+    input: "5"
+    output: "25"
+    cache_read: "0.5"
+    cache_write: "6.25"

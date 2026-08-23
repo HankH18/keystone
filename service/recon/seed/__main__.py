@@ -16,6 +16,8 @@ import os
 import sys
 from pathlib import Path
 
+from recon.logging import configure_logging_once
+
 from .plan import PROFILES
 from .run import DEFAULT_SEED, SeedFailure, run_seed
 
@@ -38,6 +40,10 @@ def _enforce_hash_seed(argv: list[str] | None) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Before anything can log: the redaction processor lives in the structlog
+    # configuration, so a process that does not install it logs raw personal
+    # data (`recon.logging.ENTRY_POINTS`).
+    configure_logging_once()
     parser = argparse.ArgumentParser(
         prog="python -m recon.seed",
         description=(

@@ -20,10 +20,41 @@ path" is not a code convention here -- it is a Postgres privilege boundary:
     manufacture its own work. Its canonical UPDATEs are additionally gated by
     the ``entities_require_proposal_event`` trigger from 0001.
 
+Concurrency: roles are a CLUSTER object and this migration is per-database
+--------------------------------------------------------------------------
+Two ``alembic upgrade head`` runs into **different** databases on one cluster --
+which is exactly what parallel test suites do, each with its own scratch
+database -- both reach this revision and both try to provision the same two
+cluster-global roles. The check-then-act below ("does the role exist? create it,
+else alter it") is not atomic across sessions, and neither branch is safe:
+
+``CREATE ROLE``
+    two sessions both see the role absent; one wins, the other gets
+    ``duplicate_object`` (42710).
+``ALTER ROLE``
+    ``pg_authid`` is a shared catalog updated without MVCC waiting, so a
+    concurrent ``ALTER ROLE`` does **not** block -- it fails with
+    ``tuple concurrently updated`` (``XX000``). Reproduced here as the common
+    case, because in a cluster that has run this migration once the roles always
+    exist: 4 concurrent upgrades into 4 fresh databases, 3 rounds, **9 of 12
+    crashed**, every one of them on
+    ``ALTER ROLE recon_writer ... PASSWORD ...``.
+
+An advisory lock alone does **not** fix it, and it is worth stating why rather
+than leaving the next person to find out: ``pg_advisory_*`` locks are scoped to
+the current *database*, not to the cluster. Measured on this Postgres --
+``pg_try_advisory_lock(987654321)`` in a second database, while a first database
+already holds it, returns ``true``, and ``pg_locks`` shows two advisory rows with
+two different ``database`` oids. So the lock is taken (it does serialise two runs
+that share one database, which is the other way this collides), but the thing
+that actually makes the cross-database race safe is treating both failures as
+what they are -- *someone else did it first* -- and retrying. See
+:func:`_provision_role_sql`.
+
 Operational notes
 -----------------
 * Roles are **cluster-scoped**, not database-scoped. Creation is idempotent
-  (created if absent, password re-applied if present).
+  (created if absent, password re-applied if present) and concurrency-safe.
 * ``downgrade()`` therefore revokes every privilege and runs ``DROP OWNED BY``
   *in this database only*; it does not ``DROP ROLE``. Dropping a shared cluster
   role while another database still grants to it either fails or silently
@@ -138,15 +169,46 @@ def _set_role_password(role: str) -> str:
     return guc
 
 
-def upgrade() -> None:
-    for role in ROLES:
-        guc = _set_role_password(role)
-        op.execute(
-            sa.text(
-                f"""
-                DO $$
-                DECLARE
-                    pw text := current_setting('{guc}');
+#: How many times a role provision may lose the cluster-global race before it is
+#: reported as a real failure. Ten x the backoff below is ~2.7s of patience, which
+#: is orders of magnitude more than the microseconds an ``ALTER ROLE`` collision
+#: actually lasts; a bound is kept so a genuinely broken catalog still fails.
+ROLE_PROVISION_ATTEMPTS = 10
+
+#: The cluster-wide name every run of this revision serialises on *within* one
+#: database. Advisory locks do not span databases (see the module docstring), so
+#: this is the first line of defence and never the only one.
+ROLE_LOCK_KEY = "keystone:migrations:0002:roles"
+
+
+def _provision_role_sql(role: str, guc: str) -> str:
+    """Create-or-alter ``role``, safe against another database doing it too.
+
+    The retry loop is the fix, not decoration. Both losing branches are *someone
+    else provisioned this role a microsecond ago*, and the correct response to
+    both is to look again:
+
+    ``duplicate_object`` (42710)
+        the role appeared between the ``EXISTS`` probe and the ``CREATE``; the
+        next pass takes the ``ALTER`` branch and applies our password.
+    ``internal_error`` / ``tuple concurrently updated`` (``XX000``)
+        two ``ALTER ROLE``s hit the shared ``pg_authid`` tuple at once. Matched on
+        the message because ``XX000`` is a catch-all: any *other* internal error
+        is re-raised rather than swallowed and retried into a timeout.
+
+    Each attempt runs inside a plpgsql ``BEGIN ... EXCEPTION`` block, which is a
+    subtransaction: the failed statement rolls back to its own savepoint and the
+    surrounding alembic transaction stays usable. Without that, the first
+    collision poisons the whole migration transaction even if the error is caught.
+    """
+    return f"""
+        DO $$
+        DECLARE
+            pw text := current_setting('{guc}');
+            attempt int := 0;
+        BEGIN
+            LOOP
+                attempt := attempt + 1;
                 BEGIN
                     IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{role}') THEN
                         EXECUTE format(
@@ -157,10 +219,35 @@ def upgrade() -> None:
                             'CREATE ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB '
                             'NOCREATEROLE NOBYPASSRLS PASSWORD %L', '{role}', pw);
                     END IF;
-                END $$;
-                """
-            )
-        )
+                    EXIT;
+                EXCEPTION
+                    WHEN duplicate_object THEN
+                        NULL;
+                    WHEN internal_error THEN
+                        IF SQLERRM NOT LIKE '%tuple concurrently updated%' THEN
+                            RAISE;
+                        END IF;
+                END;
+                IF attempt >= {ROLE_PROVISION_ATTEMPTS} THEN
+                    RAISE EXCEPTION
+                        'could not provision cluster role % after % attempts: %',
+                        '{role}', attempt, SQLERRM;
+                END IF;
+                PERFORM pg_sleep(0.05 * attempt);
+            END LOOP;
+        END $$;
+        """
+
+
+def upgrade() -> None:
+    # Serialises two runs that share a database. It cannot serialise two
+    # databases -- that is what the retry loop inside the DO block is for.
+    op.get_bind().execute(
+        sa.text("SELECT pg_advisory_xact_lock(hashtext(:key))"), {"key": ROLE_LOCK_KEY}
+    )
+    for role in ROLES:
+        guc = _set_role_password(role)
+        op.execute(sa.text(_provision_role_sql(role, guc)))
 
     # Never rely on default PUBLIC privileges: strip them, then grant explicitly.
     op.execute("REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC")

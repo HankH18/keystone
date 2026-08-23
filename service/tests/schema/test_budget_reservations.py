@@ -385,10 +385,19 @@ def test_a_reservation_is_born_open_and_cannot_be_pre_settled(
 def test_the_reserve_insert_grant_is_exactly_what_the_caller_supplies(
     owner_engine: Engine, column: str
 ) -> None:
-    """The caller names scope, key and amount. Everything else is the database's.
+    """The caller names scope, key, amount and price binding. The rest is the DB's.
 
     A reservation whose ``state``, ``settled_at`` or ``created_at`` the writer
-    chooses is not a reservation; it is a note the writer can back-date.
+    chooses is not a reservation; it is a note the writer can back-date. Those
+    five are the parametrised cases and none of them is grantable.
+
+    Migration 0010 added ``model`` and the two token bounds to what the caller
+    supplies -- the **price binding**, which is how the settle trigger derives
+    the settled amount from the row instead of accepting a number the caller
+    names. They are not a widening in the dangerous direction: the reserve
+    trigger refuses an INSERT whose ``reserve_microusd`` is not exactly the worst
+    case the committed rates give for those bounds, so a caller cannot deflate
+    the binding it will later settle against.
     """
     with owner_engine.connect() as conn:
         granted = set(
@@ -403,7 +412,14 @@ def test_the_reserve_insert_grant_is_exactly_what_the_caller_supplies(
             .scalars()
             .all()
         )
-    assert granted == {"scope", "idempotency_key", "reserve_microusd"}, granted
+    assert granted == {
+        "scope",
+        "idempotency_key",
+        "reserve_microusd",
+        "model",
+        "max_input_tokens",
+        "max_output_tokens",
+    }, granted
     assert column not in granted
 
 

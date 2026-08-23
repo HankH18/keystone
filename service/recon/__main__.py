@@ -9,8 +9,19 @@ import typer
 
 from recon import __version__
 from recon.app import create_app
+from recon.logging import configure_logging_once
 
 cli = typer.Typer(add_completion=False, no_args_is_help=True, help="Keystone service CLI.")
+
+
+@cli.callback()
+def _bootstrap() -> None:
+    """Install the privacy-safe logging chain before any command runs.
+
+    Typer invokes this for every subcommand, so no command can be added that
+    forgets it (`recon.logging.ENTRY_POINTS`).
+    """
+    configure_logging_once()
 
 
 @cli.command()

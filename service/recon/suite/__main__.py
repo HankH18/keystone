@@ -5,7 +5,11 @@ DESIGN pins. T-14 registers the remaining checks (golden diff, clean-sample,
 join hash, proposal safety, oscillation, burst cap, determinism) in ``CHECKS``;
 the CLI surface below does not change.
 
-One check is registered today: ``mirror-unchanged`` (see :mod:`recon.suite
+Two checks are registered today. ``spend-cap-burst`` (see :mod:`recon.suite
+.burst`) is SPEC gate 1's *"burst test halts exactly at cap"*: it runs the real
+120-thread burst through :func:`recon.llm.generate_rationale` against real
+Postgres and reports the observed vector, PASS or FAIL. The other is
+``mirror-unchanged`` (see :mod:`recon.suite
 .mirror`). It is the compensating control migration 0006's provenance floor
 cites -- the reason "fabrication has to leave a row in the landing table"
 means anything is that something reads the landing table. It hashes every
@@ -23,10 +27,12 @@ from __future__ import annotations
 
 import argparse
 import sys
-import traceback
 from collections.abc import Callable, Sequence
 
 from recon import __version__
+from recon.logging import configure_logging_once, console, get_logger
+from recon.suite.burst import CHECK_NAME as SPEND_CAP_BURST
+from recon.suite.burst import check_spend_cap_burst
 from recon.suite.checks import CheckResult, NotYetImplemented
 from recon.suite.mirror import CHECK_NAME as MIRROR_UNCHANGED
 from recon.suite.mirror import check_mirror_unchanged
@@ -35,7 +41,10 @@ from recon.suite.mirror import check_mirror_unchanged
 #: they run and print.
 CHECKS: dict[str, Callable[[], CheckResult]] = {
     MIRROR_UNCHANGED: check_mirror_unchanged,
+    SPEND_CAP_BURST: check_spend_cap_burst,
 }
+
+log = get_logger("recon.suite")
 
 HEADER_TITLE = f"Keystone reconciliation suite -- scorecard (v{__version__})"
 COLUMNS = f"{'CHECK':<40} {'STATUS':<8} DETAIL"
@@ -82,43 +91,58 @@ def run_check(name: str, check: Callable[[], CheckResult]) -> CheckResult:
       skip: a check whose subject does not exist has not passed;
     * it raises anything else -- FAIL, with the exception type and message, so
       a broken check cannot vanish from the scorecard by crashing the runner.
+
+    The traceback used to go out as ``traceback.print_exc(file=sys.stderr)``,
+    which is a sink with nothing in front of it: a check that dies holding a
+    record prints that record, frame locals' repr included, straight to the
+    terminal. It is emitted as a structlog event with ``exc_info`` instead, so
+    the same traceback is formatted *inside* the chain and redacted like every
+    other event (``recon.logging.SINKS``).
     """
     try:
         return check()
     except NotYetImplemented as exc:
         return CheckResult.failed(name, f"not yet implemented: {exc}")
     except Exception as exc:  # a crashing check is a failing check, never a silent one
-        traceback.print_exc(file=sys.stderr)
+        log.error("suite.check_raised", rule=name, error=f"{type(exc).__name__}", exc_info=True)
         return CheckResult.failed(name, f"check raised {type(exc).__name__}: {exc}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Print the scorecard. Returns the process exit code."""
+    """Print the scorecard. Returns the process exit code.
+
+    Every line goes out through :func:`recon.logging.console`, not ``print``: a
+    check's ``detail`` string quotes what the check compared, and the scorecard
+    is written to a terminal an operator and a grader read. ``console`` scrubs
+    it in the default `safe` mode and leaves the column layout alone.
+    """
+    # `recon.logging.ENTRY_POINTS`: install the redaction processor first.
+    configure_logging_once()
     args = build_parser().parse_args(argv)
 
     if args.list:
         for name in CHECKS:
-            print(name)
+            console(name)
         if not CHECKS:
-            print(EMPTY_MESSAGE)
+            console(EMPTY_MESSAGE)
         return 0
 
-    print(HEADER_TITLE)
-    print(RULE)
-    print(COLUMNS)
+    console(HEADER_TITLE)
+    console(RULE)
+    console(COLUMNS)
 
     selected = select_checks(args.only)
     if not selected:
-        print(EMPTY_MESSAGE)
+        console(EMPTY_MESSAGE)
         return 0
 
     results = [run_check(name, check) for name, check in selected.items()]
     for result in results:
-        print(result.row())
+        console(result.row())
 
     failed = [result for result in results if not result.ok]
-    print(RULE)
-    print(f"{len(results) - len(failed)}/{len(results)} passed")
+    console(RULE)
+    console(f"{len(results) - len(failed)}/{len(results)} passed")
     return 1 if failed else 0
 
 
