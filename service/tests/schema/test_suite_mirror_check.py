@@ -26,6 +26,7 @@ cleanly along what is and is not implemented:
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 import uuid
@@ -49,6 +50,22 @@ from recon.suite.mirror import (
     reconciler_entrypoint,
 )
 from tests.schema.conftest import INSERT_RAW_RECORD, TEST_TAG, raw_record_params
+
+
+def _check_row(stdout: str, name: str) -> str:
+    """Return the status+detail of one scorecard row, by check name."""
+    for line in stdout.splitlines():
+        if line.startswith(name):
+            return line[len(name) :].strip()
+    raise AssertionError(f"no scorecard row named {name!r} in:\n{stdout}")
+
+
+def _passed_count(stdout: str) -> tuple[int, int]:
+    """Return (passed, total) from the scorecard's trailing tally."""
+    match = re.search(r"(\d+)/(\d+) passed", stdout)
+    assert match is not None, f"no tally in:\n{stdout}"
+    return int(match.group(1)), int(match.group(2))
+
 
 #: This module's landing generation, distinct from every other module's.
 GENERATION = 93
@@ -312,4 +329,9 @@ def test_the_suite_exits_non_zero_while_a_registered_check_is_unimplemented(
     assert result.returncode != 0, result.stdout
     assert CHECK_NAME in result.stdout
     assert FAIL in result.stdout
-    assert "0/1 passed" in result.stdout
+    # Assert THIS check's row is failing, not the suite-wide tally. The tally
+    # encoded "the registry holds exactly one check", which every ticket that
+    # registers a graded check breaks by construction -- and SPEC gate 1
+    # requires several more. `_check_row` reads the row for CHECK_NAME.
+    assert _check_row(result.stdout, CHECK_NAME).startswith(FAIL), result.stdout
+    assert _passed_count(result.stdout)[0] < _passed_count(result.stdout)[1]
