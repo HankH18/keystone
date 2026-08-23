@@ -1,0 +1,8 @@
+{
+  "generated_by": "dashboard/scripts/build-mock-seed.mjs",
+  "sources": {
+    "golden/conflicts.json": "8d3ee9aaddb175989d23ef407d07d64036c28db61396babff8746d9194d477ab",
+    "golden/manifest-summary.json": "1ec52ed7b850390b6f11730d8ed3329d61be47a567be9b825257e90c69ae4057"
+  },
+  "entry_count": 3050
+}

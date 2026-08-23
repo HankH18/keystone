@@ -6,6 +6,8 @@
     "module": "esnext",
     "types": ["vite/client"],
     "allowArbitraryExtensions": true,
+    /* The mock seed (src/mocks/seed/*.json) is imported as a module. */
+    "resolveJsonModule": true,
     "skipLibCheck": true,
 
     /* Bundler mode */

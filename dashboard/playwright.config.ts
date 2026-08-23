@@ -1,13 +1,17 @@
 import { defineConfig, devices } from '@playwright/test'
 
 /**
- * Playwright config for the axe-core accessibility gate (R12).
+ * Playwright config for the accessibility gate (R12): the per-route axe sweep,
+ * the keyboard-only walkthrough, and the computed-contrast check.
  *
- * T-0 ships a single smoke spec against the placeholder shell. T-10 adds a
- * per-route axe sweep (zero serious/critical) plus the keyboard-only walkthrough.
- * The dev server is started by Playwright itself so `pnpm test:a11y` is one command.
+ * The dev server is started by Playwright itself so `pnpm test:a11y` is one
+ * command, and it is started WITH VITE_USE_MOCK_API=1 — the service API does
+ * not exist yet (T-5/T-7/T-8), and an a11y sweep over empty error states would
+ * prove nothing. It runs on its own port and never reuses an existing server,
+ * so it can never accidentally audit a `pnpm dev` process started without the
+ * flag.
  */
-const PORT = 5173
+const PORT = 5199
 // `localhost`, not `127.0.0.1`: Vite 8 binds the loopback name (which resolves
 // to ::1 on macOS), so probing the IPv4 literal gets ECONNREFUSED.
 const BASE_URL = `http://localhost:${PORT}`
@@ -32,7 +36,8 @@ export default defineConfig({
   webServer: {
     command: `pnpm exec vite --port ${PORT} --strictPort`,
     url: BASE_URL,
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
+    env: { VITE_USE_MOCK_API: '1' },
     stdout: 'ignore',
     stderr: 'pipe',
     timeout: 120_000,

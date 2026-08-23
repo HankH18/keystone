@@ -1,10 +1,19 @@
 @import 'tailwindcss';
 
 /*
- * Keystone design system (T-0 scaffold).
- * Tailwind v4: configuration is CSS-first via @theme; there is no
- * tailwind.config.js and no PostCSS config — @tailwindcss/vite does the work.
- * Palette/spacing tokens land here in T-10; this file stays intentionally bare.
+ * Keystone dashboard styles.
+ *
+ * Tailwind v4 is used for its preflight/reset only; the dashboard's own
+ * vocabulary is plain semantic CSS below. That is deliberate: R12 requires
+ * contrast to be CHECKED, and a small named palette is something a test can
+ * enumerate and a reviewer can read. e2e/contrast.spec.ts computes the WCAG
+ * ratio of every rendered text node against its real painted background, so
+ * these values are verified rather than asserted.
+ *
+ * Measured ratios against --color-bg (#ffffff) / --color-surface (#f7f8fa):
+ *   text 17.4 / 16.4   muted 7.5 / 7.1   link 8.6 / 8.1
+ *   positive 6.6 / 6.2  negative 7.8 / 7.3  warning 7.4 / 7.0  hold 8.4 / 7.9
+ *   border 3.6 / 3.4 (non-text, AA needs 3.0)
  */
 
 @theme {
@@ -13,6 +22,507 @@
     Arial, sans-serif;
   /* Confidence/count columns must line up: tabular numerals (T-10, R11). */
   --font-mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+}
+
+:root {
+  --color-bg: #ffffff;
+  --color-surface: #f7f8fa;
+  --color-surface-2: #eef1f5;
+  --color-text: #111a2b;
+  --color-muted: #4b5567;
+  --color-link: #1543ad;
+  --color-border: #7d8798;
+  --color-border-soft: #d6dbe3;
+  --color-neutral: #33415c;
+  --color-positive: #0f6b3c;
+  --color-negative: #a4161a;
+  --color-warning: #7a4b00;
+  --color-hold: #553c9a;
+  --color-header-bg: #1f2937;
+  --focus-ring: #1543ad;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+/* ---- Focus: always visible, never removed ------------------------------- */
+
+:focus-visible {
+  outline: 3px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* ---- Skip link ---------------------------------------------------------- */
+
+.skip-link {
+  position: absolute;
+  left: -9999px;
+  top: 0;
+  z-index: 100;
+  background: var(--color-bg);
+  color: var(--color-link);
+  padding: 0.6rem 1rem;
+  border: 2px solid var(--focus-ring);
+  font-weight: 600;
+}
+
+.skip-link:focus {
+  left: 0.5rem;
+  top: 0.5rem;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* ---- Layout ------------------------------------------------------------- */
+
+.app-header {
+  background: var(--color-header-bg);
+  color: #ffffff;
+  padding: 0.75rem 1.25rem;
+}
+
+.app-header a {
+  color: #ffffff;
+}
+
+.app-title {
+  font-size: 1.05rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  margin: 0;
+}
+
+.app-nav ul {
+  display: flex;
+  gap: 0.25rem;
+  list-style: none;
+  margin: 0.5rem 0 0;
+  padding: 0;
+  flex-wrap: wrap;
+}
+
+.app-nav a {
+  display: inline-block;
+  padding: 0.35rem 0.7rem;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  text-decoration: none;
+  font-weight: 600;
+}
+
+.app-nav a:hover {
+  text-decoration: underline;
+}
+
+.app-nav a[aria-current='page'] {
+  background: #ffffff;
+  color: var(--color-header-bg);
+  border-color: #ffffff;
+}
+
+main {
+  padding: 1.25rem;
+  max-width: 92rem;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 0 0 0.25rem;
+}
+
+h2 {
+  font-size: 1.1rem;
+  font-weight: 700;
+  margin: 1.5rem 0 0.5rem;
+}
+
+h3 {
+  font-size: 0.95rem;
+  font-weight: 700;
+  margin: 1rem 0 0.35rem;
+}
+
+.page-intro {
+  color: var(--color-muted);
+  margin: 0 0 1rem;
+  max-width: 60rem;
+}
+
+a {
+  color: var(--color-link);
+}
+
+/* ---- Mock banner -------------------------------------------------------- */
+
+.mock-banner {
+  background: #fff4d6;
+  color: #4a3200;
+  border-bottom: 2px solid #7a4b00;
+  padding: 0.5rem 1.25rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+
+/* ---- Filters ------------------------------------------------------------ */
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem 1rem;
+  align-items: flex-end;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-soft);
+  border-radius: 6px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1rem;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+
+.field label {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--color-muted);
+}
+
+.field select {
+  min-width: 12rem;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font: inherit;
+}
+
+.button {
+  font: inherit;
+  font-weight: 600;
+  padding: 0.4rem 0.85rem;
+  border-radius: 4px;
+  border: 1px solid var(--color-border);
+  background: var(--color-bg);
+  color: var(--color-text);
+  cursor: pointer;
+}
+
+.button:hover:not(:disabled):not([aria-disabled='true']) {
+  background: var(--color-surface-2);
+}
+
+.button:disabled,
+.button[aria-disabled='true'] {
+  cursor: not-allowed;
+  color: var(--color-muted);
+  border-style: dashed;
+}
+
+.button-primary[aria-disabled='true'],
+.button-danger[aria-disabled='true'] {
+  background: var(--color-surface-2);
+  color: var(--color-muted);
+  border-color: var(--color-border);
+}
+
+.button-primary {
+  background: var(--color-positive);
+  border-color: var(--color-positive);
+  color: #ffffff;
+}
+
+.button-primary:hover:not(:disabled):not([aria-disabled='true']) {
+  background: #0b5530;
+}
+
+.button-danger {
+  background: var(--color-bg);
+  border-color: var(--color-negative);
+  color: var(--color-negative);
+}
+
+.button-danger:hover:not(:disabled):not([aria-disabled='true']) {
+  background: #fdeceb;
+}
+
+/* ---- Tables ------------------------------------------------------------- */
+
+.table-scroll {
+  overflow-x: auto;
+  border: 1px solid var(--color-border-soft);
+  border-radius: 6px;
+}
+
+table.data-table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.9rem;
+}
+
+table.data-table caption {
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  color: var(--color-muted);
+  font-size: 0.85rem;
+  border-bottom: 1px solid var(--color-border-soft);
+}
+
+table.data-table th,
+table.data-table td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--color-border-soft);
+  vertical-align: top;
+}
+
+table.data-table thead th {
+  background: var(--color-surface-2);
+  font-weight: 700;
+  white-space: nowrap;
+  border-bottom: 2px solid var(--color-border);
+}
+
+table.data-table tbody tr:hover {
+  background: var(--color-surface);
+}
+
+.num {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+.ref {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  word-break: break-all;
+}
+
+.truncate-id {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+}
+
+/* ---- Status badge ------------------------------------------------------- */
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.12rem 0.5rem;
+  border-radius: 3px;
+  background: var(--color-surface);
+  font-size: 0.82rem;
+  font-weight: 700;
+  white-space: nowrap;
+  border-width: 2px;
+  border-color: var(--color-border);
+}
+
+/*
+ * Colour is NEVER the only channel (R12): every state also carries a text
+ * label, a distinct icon silhouette, and a distinct border treatment. Remove
+ * all colour from this stylesheet and the six states are still tellable apart.
+ */
+.status-badge[data-status='pending'] {
+  color: var(--color-neutral);
+  border-style: dashed;
+}
+
+.status-badge[data-status='approved'] {
+  color: var(--color-positive);
+  border-style: solid;
+}
+
+.status-badge[data-status='rejected'] {
+  color: var(--color-negative);
+  border-style: solid;
+  border-left-width: 6px;
+}
+
+.status-badge[data-status='applied'] {
+  color: var(--color-positive);
+  border-style: double;
+  border-width: 4px;
+}
+
+.status-badge[data-status='rolled_back'] {
+  color: var(--color-warning);
+  border-style: dotted;
+}
+
+.status-badge[data-status='sensitive_hold'] {
+  color: var(--color-hold);
+  border-style: solid;
+  border-left-width: 6px;
+  border-radius: 999px;
+}
+
+.status-badge[data-status='open'] {
+  color: var(--color-neutral);
+  border-style: solid;
+}
+
+.status-badge[data-status='escalated:oscillation'] {
+  color: var(--color-warning);
+  border-style: dotted;
+  border-left-width: 6px;
+}
+
+.status-badge[data-status='unknown'] {
+  color: var(--color-muted);
+  border-style: dashed;
+}
+
+.status-icon {
+  flex: 0 0 auto;
+}
+
+/* ---- Definition lists / detail panes ------------------------------------ */
+
+.panel {
+  border: 1px solid var(--color-border-soft);
+  border-radius: 6px;
+  padding: 0.85rem 1rem;
+  margin-bottom: 1rem;
+  background: var(--color-bg);
+}
+
+.panel > h2:first-child,
+.panel > h3:first-child {
+  margin-top: 0;
+}
+
+dl.kv {
+  display: grid;
+  grid-template-columns: minmax(9rem, 14rem) 1fr;
+  gap: 0.35rem 1rem;
+  margin: 0;
+}
+
+dl.kv dt {
+  font-weight: 700;
+  color: var(--color-muted);
+}
+
+dl.kv dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.evidence-tree {
+  margin: 0;
+  padding-left: 1rem;
+  list-style: none;
+  border-left: 2px solid var(--color-border-soft);
+}
+
+.evidence-key {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--color-muted);
+}
+
+.evidence-value {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.evidence-empty {
+  color: var(--color-muted);
+  font-style: italic;
+}
+
+/* ---- Alerts ------------------------------------------------------------- */
+
+.alert {
+  border: 2px solid var(--color-negative);
+  border-left-width: 8px;
+  border-radius: 4px;
+  background: #fdeceb;
+  color: #7a1013;
+  padding: 0.7rem 0.9rem;
+  margin: 0.75rem 0;
+}
+
+.alert h2,
+.alert h3 {
+  margin: 0 0 0.25rem;
+  font-size: 0.95rem;
+}
+
+.notice {
+  border: 1px solid var(--color-border);
+  border-left: 8px solid var(--color-hold);
+  border-radius: 4px;
+  background: var(--color-surface);
+  color: var(--color-text);
+  padding: 0.7rem 0.9rem;
+  margin: 0.75rem 0;
+}
+
+/* ---- Pagination --------------------------------------------------------- */
+
+.pagination {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.pagination-status {
+  color: var(--color-muted);
+  font-size: 0.85rem;
+}
+
+.actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-wrap: wrap;
+  align-items: center;
+  margin-top: 0.5rem;
+}
+
+.match-ok {
+  color: var(--color-positive);
+  font-weight: 700;
+}
+
+.match-bad {
+  color: var(--color-negative);
+  font-weight: 700;
 }
 
 /* Respect users who ask for less motion — WCAG AA by contract, not intention. */

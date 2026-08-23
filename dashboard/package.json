@@ -12,7 +12,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "test:a11y": "node scripts/run-a11y.mjs"
+    "test:a11y": "node scripts/run-a11y.mjs",
+    "dev:mock": "VITE_USE_MOCK_API=1 vite",
+    "mock:seed": "node scripts/build-mock-seed.mjs",
+    "preview:mock": "VITE_USE_MOCK_API=1 vite preview"
   },
   "dependencies": {
     "@tanstack/react-query": "^5.101.4",

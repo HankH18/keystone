@@ -30,6 +30,13 @@ export default tseslint.config(
     },
   },
   {
+    // `src/lib/**` holds contract types, hooks and pure helpers, not component
+    // modules. Fast Refresh boundaries do not apply there, and forcing one
+    // export per file would scatter the contract across a dozen modules.
+    files: ['src/lib/**/*.{ts,tsx}'],
+    rules: { 'react-refresh/only-export-components': 'off' },
+  },
+  {
     // Node-side tooling config files.
     files: ['*.config.{ts,js}', 'scripts/**/*.{ts,js,mjs}'],
     languageOptions: {

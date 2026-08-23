@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 /**
- * Runs the Playwright accessibility suite (`playwright test --config=playwright.config.ts`),
- * but degrades to a loud SKIP when the Chromium build Playwright expects is not
- * present on this machine and cannot be fetched (offline CI, sandboxed runner).
+ * Runs the Playwright accessibility suite (`playwright test --config=playwright.config.ts`).
  *
- * IMPORTANT: this guard ONLY covers "no browser binary". Once the browser is
- * present, the real `playwright test` runs and its exit code is propagated
- * unchanged — a failing a11y assertion still fails the command.
+ * MISSING BROWSER IS A FAILURE, NOT A SKIP. The T-0 version of this script
+ * exited 0 when Chromium was absent, which produced a green accessibility gate
+ * that had never run — the worst possible outcome for a requirement (R12) whose
+ * whole point is that it is tested rather than intended. The skip now requires
+ * an explicit ALLOW_A11Y_SKIP=1 from whoever is choosing to run blind, and it
+ * still says loudly that the gate did not run.
+ *
+ * This guard ONLY covers "no browser binary". Once the browser is present, the
+ * real `playwright test` runs and its exit code is propagated unchanged — a
+ * failing a11y assertion still fails the command.
  */
 import { existsSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
@@ -48,14 +53,24 @@ if (!present) {
 
 if (!present) {
   const bar = '='.repeat(72)
-  console.warn(
+  const allowSkip = process.env.ALLOW_A11Y_SKIP === '1'
+  const message =
     `\n${bar}\n` +
-      'SKIPPED: pnpm test:a11y — Playwright Chromium is not installed and could\n' +
-      'not be downloaded (offline?). The accessibility gate did NOT run.\n' +
-      'Install it with:  pnpm exec playwright install --with-deps chromium\n' +
-      `${bar}\n`,
+    'Playwright Chromium is not installed and could not be downloaded\n' +
+    '(offline?). THE ACCESSIBILITY GATE DID NOT RUN.\n' +
+    'Install it with:  pnpm exec playwright install --with-deps chromium\n' +
+    `${bar}\n`
+
+  if (allowSkip) {
+    console.warn(`${message}Skipping because ALLOW_A11Y_SKIP=1 was set.\n`)
+    process.exit(0)
+  }
+
+  console.error(
+    `${message}Failing rather than reporting a green gate that never ran.\n` +
+      'Set ALLOW_A11Y_SKIP=1 to override deliberately.\n',
   )
-  process.exit(0)
+  process.exit(1)
 }
 
 const result = playwright(['test', '--config=playwright.config.ts', ...args])
