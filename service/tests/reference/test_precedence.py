@@ -24,6 +24,7 @@ from recon.reference import (
     assert_unique_conflict_keys,
     conflict_key,
     conflict_refs,
+    conflict_type_for_paths,
 )
 
 STUDENT_A = "appdb:student:sA"
@@ -556,6 +557,48 @@ def test_rule_1_in_isolation_keeps_the_c6_for_a_mixed_set() -> None:
         report=report,
     )
     assert types(survivors) == ["C6"]
+    _only_rule_fired(report, 1)
+
+
+def test_rule_1_keeps_the_c6_when_the_co_located_pair_lists_no_paths_at_all() -> None:
+    """SS5.5 (C14): "The empty set never fires C14", so the partition's fallback is C6.
+
+    A co-located C6/C14 pair carrying no `disagreeing_fields` is degenerate -- nothing in
+    `golden/` is built that way -- but rule 1 is a total function and the fallback it
+    lands on is a real decision, not a formality: C14 forces `sensitive_hold` while C6 is
+    the auto-apply-eligible type, so keeping the C14 here would hold a proposal on the
+    strength of an EMPTY sensitive set. `conflict_type_for_paths` returns `None` for the
+    empty set precisely so this choice is made once, by SS5.5's predicate.
+
+    Nothing else in the suite reaches the fallback, and coverage cannot report the gap:
+    `coverage.py` measures the `or` expression as one statement/branch pair and does not
+    distinguish its short-circuit arms, so `... or "C6"` reads as fully covered while
+    only the left arm has ever produced the value.
+    """
+    refs = person(STUDENT_A, CONTACT_A)
+    assert conflict_type_for_paths(()) is None  # the fallback is what decides
+
+    c6 = entry("C6", refs, [])
+    c14 = entry("C14", refs, [])
+    report: dict[int, int] = {}
+    survivors = apply_precedence([c6, c14], report=report)
+
+    assert types(survivors) == ["C6"]
+    assert survivors[0] is c6
+    _only_rule_fired(report, 1)
+
+
+def test_rule_1_keeps_the_c6_when_only_one_side_lists_paths() -> None:
+    """The union of the pair's paths is what rule 1 classifies (SS5.7(1)), so a C14 that
+    lists nothing beside a mixed C6 is still a mixed set -- C6 survives."""
+    refs = person(STUDENT_A, CONTACT_A)
+    c6 = entry("C6", refs, sorted(NAME_PATHS + GRADE_PATHS))
+    c14 = entry("C14", refs, [])
+    report: dict[int, int] = {}
+    survivors = apply_precedence([c6, c14], report=report)
+
+    assert types(survivors) == ["C6"]
+    assert survivors[0] is c6
     _only_rule_fired(report, 1)
 
 

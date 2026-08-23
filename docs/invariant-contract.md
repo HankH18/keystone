@@ -378,6 +378,20 @@ canon_value(seq) = RS + concat( e + RS  for e in sorted(elements) )
 Worked, so a re-implementer lands on the same bytes: `canon_value([]) == "\x1e"`;
 `canon_value(["a"]) == "\x1ea\x1e"`; `canon_value(["b","a"]) == canon_value({"a","b"}) == "\x1ea\x1eb\x1e"`.
 
+**Worked, for the ESCAPED sort specifically** — the one input shape where the two candidate orders part
+company, so a re-implementer can tell which one it built:
+
+```
+# Python string literals: `\x1e` is the RAW separator, `\\x1e` its four-character escape
+canon_value(["Z", ["a"]]) == "\x1eZ\x1e\\x1ea\\x1e\x1e"
+```
+
+The nested child canonicalizes to `\x1ea\x1e`, which sorts **below** `Z` raw (U+001E < U+005A) and
+**above** it once escaped (its leading `\x1e` becomes a backslash, U+005C > U+005A). Sorting the raw
+canonical forms and escaping afterwards would put the child first; this contract puts `Z` first. Only a
+*separator* can expose the difference: the backslash pass alone is a prefix-free, monotone code and
+therefore preserves order, which is why no backslash-only example distinguishes the two.
+
 **The encoding is INJECTIVE, and that is a graded property, not a nicety.** The leading `\x1e`, the
 per-element trailing `\x1e` and the escaping of `\x1e` inside every element are each load-bearing:
 
@@ -777,7 +791,17 @@ and the payload escapes its elements anyway for a ref that reaches the hash with
 Sorting is over the **escaped** encodings, matching §2.5's sequence case. No committed ref and no
 `COMPARED_FIELDS` path contains a backslash, `\x1f` or `\x1e`, so escaped and raw order coincide for
 every value this contract can produce and **no committed digest literal moves** — but only one of the two
-orders may be pinned, and it is this one.
+orders may be pinned, and it is this one. Worked, on the one input shape where they part company:
+
+```
+# Python string literals: `\x1f` is the RAW joiner, `\\x1f` its four-character escape
+entity_refs = ["appdb:student:a\x1fb", "appdb:student:aZ"]
+section 2   = "appdb:student:aZ" + "\x1f" + "appdb:student:a\\x1fb"
+```
+
+The joiner-bearing ref sorts **first** raw (U+001F < U+005A) and **last** escaped (its `\x1f` becomes a
+leading backslash at that position, U+005C > U+005A). Section 3 behaves identically on
+`["crm.contact.grade\x1fx", "crm.contact.gradeZ"]`.
 
 A worked example, byte for byte — `type="C8"`, one ref, no disagreeing fields, three observed values:
 
@@ -930,7 +954,12 @@ rule 2 alone carries a ref-class filter while rules 3–8 take the winner's whol
 
 1. **C14 over C6** — if a person's disagreeing paths are *entirely* sensitive, the conflict is C14 and
    `R-006` must not also emit C6 for that person. Mixed sets emit C6 only, with the sensitive paths listed
-   in `disagreeing_fields` (the proposal is still `sensitive_hold`).
+   in `disagreeing_fields` (the proposal is still `sensitive_hold`). The set classified is the **union**
+   of the co-located pair's `disagreeing_fields`, and the union being **empty** keeps the **C6**: §5.5's
+   C14 predicate is *non-empty and wholly ⊆ `SENSITIVE_FIELDS`*, so the empty set never fires C14 and the
+   partition falls back to C6 rather than holding a proposal on an empty sensitive set. *(Degenerate —
+   nothing in `golden/` is built that way — but rule 1 is a total function and the fallback is pinned
+   here rather than left to the implementation.)*
 2. **C10 over C6/C14/C4** — C6, **C14** and C4 are suppressed for any conflict whose `entity_refs`
    contain the collapsed contact ref. *(Derived in v2, and load-bearing: the C10 contact is `L1`-linked to
    student A while its `(first_norm, last_norm, dob_norm)` equals student **B**'s, so the `name_first`,

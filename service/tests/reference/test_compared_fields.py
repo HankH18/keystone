@@ -252,6 +252,48 @@ def test_compare_field_accepts_a_row_object_as_well_as_its_logical_name() -> Non
 
 
 # =====================================================================================
+# SS5.5 -- the subset test itself: `paths <= SENSITIVE_FIELDS`, at both boundaries
+# =====================================================================================
+#
+# Every test above feeds `conflict_type_for_paths` a set drawn from ONE comparison row,
+# which is a PROPER subset of `SENSITIVE_FIELDS` two paths wide. Such a set says nothing
+# about either boundary of the subset test: `<` would answer identically, and so would a
+# right-hand side narrowed to just the sensitive paths that appear in `COMPARED_FIELDS`.
+
+
+def test_the_sensitive_vocabulary_is_wider_than_the_compared_paths() -> None:
+    """The premise of the two tests below: over half of `SENSITIVE_FIELDS` never appears
+    in a `COMPARED_FIELDS` row, so a right-hand side built from the compared paths is a
+    strictly narrower classifier -- not a harmless restatement of the same one."""
+    assert not set(COMPARED_FIELD_PATHS) >= SENSITIVE_FIELDS
+    assert SENSITIVE_FIELDS - set(COMPARED_FIELD_PATHS)
+
+
+@pytest.mark.parametrize("path", sorted(SENSITIVE_FIELDS))
+def test_every_sensitive_path_alone_fires_c14(path: str) -> None:
+    """SS5.5/SS6: sensitivity is a pure function of the path against the WHOLE committed
+    set, not against the subset that happens to be compared. Eleven of these paths
+    (`payments.payment.payer_email`, `appdb.student.student_number`, ...) are in no
+    `COMPARED_FIELDS` row at all, so a narrowed right-hand side misclassifies them C6 --
+    and C6 is auto-apply territory while C14 forces `sensitive_hold`."""
+    assert conflict_type_for_paths([path]) == "C14"
+
+
+def test_the_whole_sensitive_set_is_wholly_sensitive() -> None:
+    """SS5.5's test is `<=`, not `<`: "non-empty and wholly subset of SENSITIVE_FIELDS".
+    A disagreeing set that EQUALS the vocabulary is wholly sensitive, and a proper-subset
+    test would send it to C6 -- auto-apply territory for the most sensitive set there is.
+    """
+    assert conflict_type_for_paths(SENSITIVE_FIELDS) == "C14"
+    assert conflict_type_for_paths(set(SENSITIVE_FIELDS)) == "C14"
+
+
+def test_one_non_sensitive_path_added_to_the_whole_set_is_c6() -> None:
+    """The other side of the same boundary: superset, so not wholly sensitive."""
+    assert conflict_type_for_paths({*SENSITIVE_FIELDS, "crm.contact.grade"}) == "C6"
+
+
+# =====================================================================================
 # SS5.1 / SS5.8 ruling 5 -- the `unparseable_value` reason
 # =====================================================================================
 
