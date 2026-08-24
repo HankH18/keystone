@@ -50,9 +50,15 @@
 #     lower the score even when the positive evidence has already saturated. No
 #     base and no weight changed; in the region `base + sum(positive) <= 1.0` v2
 #     is arithmetically identical to v1, so only the scores v1 was flattening
-#     moved. v1 stored 1.0000 for 1,057 of the graded 3,050 proposals and left a
-#     penalty arithmetically invisible on 191 of them -- which does not discharge
-#     R14's "partial/conflicting evidence lowers it".
+#     moved. Three DISTINCT quantities, measured on the graded 3,050-proposal
+#     store and named here because they were previously conflated: 1,057
+#     proposals are POSITIVE-SATURATED (`base + sum(positive) > 1.0000`); v1
+#     stored exactly 1.0000 for 1,047 of them; and on 181 the penalty was
+#     ARITHMETICALLY INVISIBLE -- v1's stored number was identical whether the
+#     penalty fired or not -- which does not discharge R14's
+#     "partial/conflicting evidence lowers it". (Of the 1,057, 191 carried a
+#     penalty at all; on 10 of those -- C6 rows with both a disagreeing field
+#     and observed oscillation -- v1 showed part of it.)
 # v1: clamp01(base + sum(all weights)).
 version: 2
 

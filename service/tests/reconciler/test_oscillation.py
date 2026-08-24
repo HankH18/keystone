@@ -42,16 +42,29 @@ and escalates with the columns it holds; the reason always reaches the
 ``conflict.escalated`` audit row, and ``report.escalation_reason_persisted`` says
 whether it also reached the column.
 
-WHAT IS STILL NOT PROVEN
--------------------------
-``conflicts.escalation_reason`` is **not** populated under ``recon_writer`` today,
-because the grant does not exist. The dashboard's ``escalated:oscillation`` label
-is reconstructible from ``conflicts.status`` plus the audit row, not from the
-conflict row alone. **The fix is a one-line migration** adding
-``escalation_reason`` to ``CONFLICT_UPDATE_COLUMNS`` (migration 0004); this ticket
-may not add a migration, and :func:`test_the_escalation_reason_column_is_ungranted`
-pins the current state so the day the grant lands, that test turns red and is
-updated deliberately rather than silently.
+THE GRANT, AND WHAT USED NOT TO BE PROVEN
+-----------------------------------------
+This section read: *"``conflicts.escalation_reason`` is **not** populated under
+``recon_writer`` today, because the grant does not exist ... **The fix is a
+one-line migration** adding ``escalation_reason`` to ``CONFLICT_UPDATE_COLUMNS``
+(migration 0004); this ticket may not add a migration, and
+:func:`test_the_escalation_reason_column_is_ungranted` pins the current state so
+the day the grant lands, that test turns red and is updated deliberately rather
+than silently."*
+
+The grant landed: ``migrations/versions/0015_escalation_reason_grant.py`` adds
+``escalation_reason`` to that column-scoped list. The pinning test turned red,
+was updated deliberately, and is now
+:func:`test_the_escalation_reason_column_is_granted_to_recon_writer` -- which
+asserts the inverse *and* the thing the old docstring asked for, that all 25
+escalated rows carry the reason in the column. The reviewer surface therefore
+serves ``escalated:oscillation`` from the conflict row itself, not only by
+reconstructing it from ``conflicts.oscillating``.
+
+``_escalate``'s degraded branch is still live and still tested through
+``report.escalation_reason_persisted``, because it is driven by
+``has_column_privilege`` per run rather than by an assumption about which
+migrations have been applied.
 """
 
 from __future__ import annotations
@@ -64,6 +77,7 @@ from sqlalchemy import Connection, text
 
 from recon.invariants.oscillation import scan_field_lineage
 from recon.reconciler import (
+    ESCALATION_OSCILLATION,
     LINEAGE_GENERATIONS_REQUIRED,
     OSCILLATION_FROM_ROW,
     OSCILLATION_FROM_SCAN,
@@ -381,18 +395,32 @@ def test_the_escalated_set_is_exactly_goldens_oscillating_set(writer: Connection
     assert escalated == _golden_oscillating_keys()
 
 
-def test_the_escalation_reason_column_is_ungranted_to_recon_writer(writer: Connection) -> None:
-    """Pins the DEGRADED state so the fix is a deliberate, visible change.
+def test_the_escalation_reason_column_is_granted_to_recon_writer(writer: Connection) -> None:
+    """The remediation this test asked for, applied. Migration 0015.
 
-    Migration 0004 narrowed ``recon_writer``'s UPDATE on ``conflicts`` to
-    ``(status, last_seen_run)``. ``escalation_reason`` is not in that list, so the
+    **This test used to pin the degraded state**, under the name
+    ``test_the_escalation_reason_column_is_ungranted_to_recon_writer``, and its
+    docstring named the conditions of its own replacement: *"Migration 0004
+    narrowed ``recon_writer``'s UPDATE on ``conflicts`` to ``(status,
+    last_seen_run)``. ``escalation_reason`` is not in that list, so the
     reconciler writes the reason to the audit row only and reports
     ``escalation_reason_persisted=False``. The proper fix is a migration adding
-    the column to ``CONFLICT_UPDATE_COLUMNS``; this ticket may not add one.
-
-    **When that migration lands this test turns red**, which is the point: the
+    the column to ``CONFLICT_UPDATE_COLUMNS``; this ticket may not add one. **When
+    that migration lands this test turns red**, which is the point: the
     remediation is then applied deliberately (flip both assertions and assert the
-    column is populated) rather than leaving a stale caveat in the docs.
+    column is populated) rather than leaving a stale caveat in the docs."*
+
+    ``migrations/versions/0015_escalation_reason_grant.py`` is that migration, so
+    this is that deliberate update: the grant assertion is inverted, and the
+    assertion the old docstring asked for -- **the column is populated on all 25
+    escalations** -- is added rather than the old one merely being deleted. The
+    contract is strictly stronger than it was: the degraded path proved a NULL,
+    this proves a value.
+
+    Nothing is loosened. ``report.escalation_reason_persisted is granted`` is
+    unchanged and still binds the report to the catalogue rather than to a
+    constant, so a future migration that narrowed the grant again would fail here
+    on ``granted is True`` and not silently pass.
     """
     granted = writer.execute(
         text(
@@ -401,16 +429,34 @@ def test_the_escalation_reason_column_is_ungranted_to_recon_writer(writer: Conne
     ).scalar_one()
     report = reconcile(conn=writer, run_id="t7-osc-grant")
     assert report.escalation_reason_persisted is granted
-    assert granted is False, (
-        "recon_writer can now write conflicts.escalation_reason. Good -- update "
-        "this test and assert the column is populated on all 25 escalations."
+    assert granted is True, (
+        "recon_writer holds no UPDATE on conflicts.escalation_reason. Migration "
+        "0015 grants it (column-scoped, alongside status and last_seen_run); if "
+        "that migration has been reverted, the reconciler degrades to writing the "
+        "reason into the conflict.escalated audit row only and this contract is "
+        "the weaker one again"
     )
-    # The escalation still happened, and the reason is still recorded.
+    # The escalation happened, the reason is on the row, and it is still in the
+    # audit row too -- the audit trail did not stop carrying it when the column
+    # started to.
     assert report.escalated_oscillation == 25
+    on_row = writer.execute(
+        text(
+            "SELECT count(*) FROM conflicts "
+            " WHERE status = 'escalated' AND escalation_reason = :reason"
+        ),
+        {"reason": ESCALATION_OSCILLATION},
+    ).scalar_one()
+    assert on_row == 25, (
+        f"{on_row} of 25 escalated conflicts carry escalation_reason="
+        f"{ESCALATION_OSCILLATION!r} on the row. With the 0015 grant in place the "
+        "reviewer surface serves 'escalated:<reason>' from the conflict row itself "
+        "instead of reconstructing it from the oscillating flag"
+    )
     body_has_reason = writer.execute(
         text(
             "SELECT count(*) FROM audit_log WHERE action = 'conflict.escalated' "
-            "  AND detail::text LIKE '%reason_in_audit_row_only%'"
+            "  AND detail::text LIKE '%reason_on_conflict_row%'"
         )
     ).scalar_one()
     assert body_has_reason == 25

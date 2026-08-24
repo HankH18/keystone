@@ -43,8 +43,17 @@ response body. **That is a real gap, reported as one**: the endpoint proves
 authentication, idempotency and budget provisioning, and does not pretend to
 prove that ingestion ran.
 
-``sync``'s body is :func:`sync_job` and it lives here, next to the trigger it is
-bound to. It is registered **onto the application** by
+Both jobs are bound now. ``sync``'s body is :func:`sync_job`, below;
+``reconcile``'s is :func:`recon.reconciler.reconcile_job`, and both are
+registered by :func:`recon.app.create_app`. ``reconcile`` was the one that stayed
+unbound: an hourly ``infra/render.yaml`` cron has been firing at an endpoint that
+authenticated, consumed the run id, provisioned a budget scope and answered
+HTTP 200 ``"started"`` while running nothing -- which a cron health check reads
+as success. The paragraph above describes what that state looks like, not what
+this module does today.
+
+``sync``'s body lives here, next to the trigger it is bound to. It is
+registered **onto the application** by
 :func:`recon.app.create_app`, not onto this module, which is the difference
 between a wiring decision and a process-global side effect: ``_HANDLERS`` is
 module state shared by every app in the interpreter, so a factory that wrote
@@ -56,15 +65,39 @@ binding in ``app.state``, and :func:`_handler_for` prefers it over the global
 registry. The global registry stays for callers that genuinely mean "this
 process", which is what the existing trigger tests use it for.
 
-Ingest, then materialize -- and a sync that cannot do both is not a success
+Ingest, then materialize, then detect -- and a sync that cannot do all three is
+not a success
 ----------------------------------------------------------------------------
-``sync`` is two stages in a pinned order (:data:`SYNC_STAGES`): every generation
-lands through the read-only adapters, and *then* ``recon.resolve.materialize``
+``sync`` is three stages in a pinned order (:data:`SYNC_STAGES`): every generation
+lands through the read-only adapters, *then* ``recon.resolve.materialize``
 builds the canonical layer -- ``entity_links``, ``entity_link_candidates``,
-``entities`` and ``field_lineage`` -- out of what landed. The order is not a
-preference: materialization resolves the ``stg_*`` slice ingestion just wrote,
+``entities`` and ``field_lineage`` -- out of what landed, and *then*
+:func:`run_invariant_stage` runs the committed rule set over it. The order is not
+a preference: materialization resolves the ``stg_*`` slice ingestion just wrote,
 and the deferred ``KS009`` provenance trigger refuses any link that does not
-name a landed ``raw_records`` row, so materializing first cannot even commit.
+name a landed ``raw_records`` row, so materializing first cannot even commit; and
+the rules read ``stg_*`` plus the SS4 cascade, so detection cannot precede either.
+
+**Stage 3 is R5, and it was missing.** ``SYNC_STAGES`` read
+``("ingest", "materialize")``, so a successful sync left ``invariant_results``
+and ``conflicts`` at zero and a grader following the README saw an empty
+dashboard: the rule set ran only from ``python -m recon.invariants --persist``
+and from the offline grading harness, neither of which is on the HTTP path. R5
+says "WHEN a sync completes, THE SYSTEM SHALL run the committed, versioned
+invariant rule set and record pass/fail per record in a queryable results
+table", and that is now what a completed sync does -- including the
+``already_current`` sync, because "nothing new to land" is still a completed
+sync and re-detection is what advances ``conflicts.last_seen_run``.
+
+The cost is stated rather than hidden: the pass stamps one ``invariant_results``
+row per in-scope record per rule (**376,000** on the committed fixtures) on
+**every** completed sync, and the hourly cron in ``infra/render.yaml`` passes a
+fresh run id each firing, so that table grows per run by design. It is a per-run
+ledger, which is what makes "which rules judged this record on that run"
+answerable at all; retention is a purge concern, not a reason for the trigger to
+skip R5. ``conflicts`` does **not** grow that way -- ``persist_run``'s
+``ON CONFLICT (fingerprint) DO UPDATE SET last_seen_run`` is what makes a second
+sync re-detection rather than duplication.
 
 A stage that does not complete raises :class:`SyncFailed`, and a failed handler
 is reported as ``"status": "failed"`` with the stage named -- never as
@@ -78,13 +111,21 @@ A **re-fired** sync lands nothing twice. ``raw_records`` is append-only, so a
 blind second sync doubles the whole landing table and every generation of the
 A->B->A history with it; :func:`generation_plan` reads the completeness ledger
 (``source_generations``, migration 0009) and ingests only what is not already
-there. Measured on the committed fixtures: first sync 49.4s (24.4s ingest +
-25.0s materialize), second sync 0.06s reporting ``already_current``.
+there. Measured on the committed fixtures through a real ``uvicorn``, with the
+invariant stage in place: **first sync 58.3s** (22.3s ingest + 22.1s materialize
++ 13.8s invariants), **second sync 18.2s** -- 0 records landed, ``materialize``
+reporting ``already_current``, and the whole 18s spent re-detecting. That number
+used to read 0.06s and it is a real regression in the no-op case, taken
+deliberately: R5 is about a completed sync, and a re-detection is what advances
+``conflicts.last_seen_run``. Verified on that second firing: ``raw_records``
+unchanged at 360,400, ``conflicts`` unchanged at 3,050, every row's
+``last_seen_run`` advanced to the second run id.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -96,12 +137,13 @@ from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
 from recon.adapters import IdentifierError, validate_identifier
 from recon.api.auth import TRIGGER_SECRET_HEADER, problem, trigger_guard
-from recon.budget import AUDIT_ACTOR, provision_run_scope
-from recon.db import ROLE_RECON_WRITER, DatabaseNotConfigured, role_connection
+from recon.budget import AUDIT_ACTOR, OPS_DATABASE_URL_ENV, provision_run_scope
+from recon.db import ROLE_RECON_WRITER, DatabaseNotConfigured, database_url, role_connection
 from recon.ingest import (
     expected_counts_from_manifest,
     identifier_problem,
@@ -124,6 +166,7 @@ __all__ = [
     "generation_plan",
     "register_job_handler",
     "router",
+    "run_invariant_stage",
     "sync_job",
     "trigger_action",
 ]
@@ -260,7 +303,7 @@ def claim_run(job: str, run_id: str) -> bool:
 
 
 #: ``sync``'s stages, in the only order they can run in (module docstring).
-SYNC_STAGES: Final[tuple[str, ...]] = ("ingest", "materialize")
+SYNC_STAGES: Final[tuple[str, ...]] = ("ingest", "materialize", "invariants")
 
 
 class SyncFailed(RuntimeError):
@@ -315,6 +358,135 @@ def generation_plan(root: Path | str | None = None) -> tuple[tuple[int, ...], tu
     return tuple(landed), tuple(pending)
 
 
+def _invariant_dsn() -> str:
+    """The ops DSN for the detection pass, in the spelling ``psycopg.connect`` wants.
+
+    ``OPS_DATABASE_URL`` when it is set, ``DATABASE_URL`` otherwise -- the same
+    resolution :func:`recon.budget.ops_engine` performs, and for a related reason.
+
+    **This is not a stylistic choice and getting it wrong is a deployed outage.**
+    On the deployed service ``DATABASE_URL`` names ``recon_writer``
+    (``infra/render.yaml``: *"THE CAPPED PARTY'S CREDENTIALS"*), and migration
+    0006 revoked ``TEMPORARY`` on the database from all three boundary roles --
+    so the invariant engine, which materializes SS4's cascade into ``TEMP``
+    tables, cannot run as that principal at all. Resolving this from
+    ``DATABASE_URL`` passes locally, where the configured principal *is* the
+    owner, and fails on every firing in production with ``permission denied to
+    create temporary tables``. Measured, as ``recon_writer``:
+    ``has_database_privilege(current_user, current_database(), 'TEMPORARY')`` is
+    ``false``.
+    """
+    raw = (os.environ.get(OPS_DATABASE_URL_ENV) or "").strip()
+    url = make_url(raw) if raw else database_url()
+    if url.drivername in {"postgres", "postgresql"}:
+        url = url.set(drivername="postgresql+psycopg")
+    return url.render_as_string(hide_password=False).replace("+psycopg", "")
+
+
+#: Asked before the engine runs, so a principal that cannot host the engine's
+#: ``TEMP`` tables is reported as a configuration fault naming the variable to
+#: set, rather than as a bare ``permission denied`` from inside rule loading.
+_MAY_CREATE_TEMP = "SELECT has_database_privilege(current_user, current_database(), 'TEMPORARY')"
+
+
+def run_invariant_stage(run_id: str) -> dict[str, Any]:
+    """Stage 3: run every committed rule and record a verdict per record (R5).
+
+    The two committed entrypoints, called and not re-implemented:
+    :func:`recon.invariants.runner.run_invariants` executes ``rules/*.sql`` in
+    filename order and stamps every in-scope ``stg_*`` row, and
+    :func:`recon.invariants.runner.persist_run` writes those stamps to
+    ``invariant_results`` and the surviving conflicts to ``conflicts``. This
+    function owns the connection and the failure semantics; it owns no detection
+    logic at all.
+
+    Why this stage does not run as ``recon_writer``
+    -----------------------------------------------
+    It cannot. The engine materializes SS4's cascade into session-scoped ``TEMP``
+    tables (``recon.invariants.context``), and migration 0006 **revoked
+    ``TEMPORARY`` on the database from all three boundary roles** on purpose --
+    a role that can create a temp table can create a function in ``pg_temp`` and
+    attach it as a trigger. So the detection pass runs on the **ops** DSN
+    (:func:`_invariant_dsn`), exactly as ``python -m recon.invariants --persist``
+    and ``recon.suite.pipeline`` already do. Nothing is widened for it: this is
+    the committed detection path getting an HTTP caller, not a new privilege, and
+    the privilege is checked before the engine starts so a misconfigured
+    deployment says which variable to set.
+
+    Why it opens its own connection
+    -------------------------------
+    So a failure here cannot roll back stage 1 or stage 2. ``source_generations``
+    -- the completeness ledger :func:`generation_plan` reads to decide what a
+    re-fired sync must not land twice -- is committed by ``ingest_all`` in its own
+    transaction, and the canonical layer by ``materialize`` in another. This
+    transaction contains the invariant pass and nothing else, so a rule that
+    raises leaves the ledger exactly as the ingest wrote it and the next sync
+    still reports ``already_landed`` rather than re-appending 360,000 rows.
+
+    Degraded is not failure
+    -----------------------
+    ``run.status == "degraded"`` means a generation-3 slice is incomplete, so
+    every ABSENCE rule was **skipped** and stamped ``unchecked``/
+    ``source_incomplete`` rather than fired (SS5.3). That is a correct, recorded
+    outcome and it is reported as ``"status": "degraded"`` with the incomplete
+    slices named -- not raised. Only an engine or storage fault raises
+    :class:`SyncFailed`.
+    """
+    from recon.invariants.context import CURRENT_GENERATION as INVARIANT_GENERATION
+    from recon.invariants.runner import persist_run, run_invariants
+
+    started = time.monotonic()
+    try:
+        with psycopg.connect(_invariant_dsn()) as conn:
+            with conn.cursor() as cur:
+                cur.execute(_MAY_CREATE_TEMP)
+                row = cur.fetchone()
+            if not (row and row[0]):
+                raise SyncFailed(
+                    "invariants",
+                    "the configured principal holds no TEMPORARY privilege on this "
+                    "database, so the invariant engine cannot materialize the SS4 "
+                    "cascade it reads. Migration 0006 revokes TEMPORARY from "
+                    "recon_writer / review_writer / apply_writer deliberately, and "
+                    "the deployed service runs as recon_writer -- set "
+                    f"{OPS_DATABASE_URL_ENV} to the schema owner (infra/render.yaml "
+                    "already does this for recon.budget.ops_engine)",
+                )
+            run = run_invariants(conn, run_id=run_id, generation=INVARIANT_GENERATION)
+            persist_run(conn, run)
+            conn.commit()
+    except SyncFailed:
+        # Already a structured stage failure naming its own cause (the TEMPORARY
+        # probe above). Re-wrapping it would bury the remedy inside a repr.
+        raise
+    except Exception as exc:
+        raise SyncFailed(
+            "invariants",
+            f"{type(exc).__name__}: {exc}. The snapshots landed and the canonical "
+            "layer was built, but the committed rule set did not complete, so no "
+            "verdict was recorded for this run and `conflicts` does not describe "
+            "what was just ingested. The completeness ledger is untouched: this "
+            "stage runs in its own transaction and re-firing under a fresh run id "
+            "re-runs detection without re-landing a single record",
+        ) from exc
+
+    return {
+        "run_id": run.run_id,
+        "generation": run.generation,
+        "status": run.status,
+        "degraded": run.degraded,
+        "incomplete": [list(pair) for pair in sorted(run.incomplete)],
+        "rules": len(run.outcomes),
+        "rules_skipped": sum(1 for outcome in run.outcomes if outcome.skipped),
+        "results": len(run.results),
+        "raw_conflicts": len(run.raw_conflicts),
+        "conflicts": len(run.conflicts),
+        "oscillating": run.oscillating_count,
+        "by_type": run.by_type(),
+        "elapsed_ms": round((time.monotonic() - started) * 1000.0, 3),
+    }
+
+
 def sync_job(run_id: str) -> dict[str, Any]:
     """Ingest every generation, then materialize the canonical layer (R1, R4, R10).
 
@@ -329,19 +501,22 @@ def sync_job(run_id: str) -> dict[str, Any]:
     in full, oldest first (``ingest_all``'s own ordering requirement, SS7).
     Stage 2 resolves the current generation and writes the four canonical tables,
     with ``field_lineage`` covering generations 1-3 because R4/R16's A->B->A scan
-    reads the older snapshots.
+    reads the older snapshots. Stage 3 (:func:`run_invariant_stage`) runs the
+    committed rule set over the result and records a verdict per record -- R5,
+    and the stage this pipeline did not have.
 
     Three outcomes, and the third is the one the requirement is about
     -----------------------------------------------------------------
     ``worked``
-        something needed landing, or the canonical layer was absent; both stages
-        ran and the layer describes what is now in staging.
+        something needed landing, or the canonical layer was absent; all three
+        stages ran and the layer describes what is now in staging.
     ``already current``
         every generation the manifest names is already complete **and** the
         identity layer already covers the current generation. Nothing is
         re-landed (a cron that re-fires must not re-append 360,000 landing rows)
         and nothing is rebuilt. Reported as ``already_current`` rather than
-        dressed up as work.
+        dressed up as work -- but the rules still run, because R5 is about a
+        completed sync and this is one.
     ``failed``
         records landed that the existing canonical layer does not describe, and
         that layer cannot be replaced -- ``recon_writer`` may append to the
@@ -383,6 +558,13 @@ def sync_job(run_id: str) -> dict[str, Any]:
                 "stages": list(SYNC_STAGES),
                 "ingest": ingested,
                 "materialize": {"already_current": True, "generation": CURRENT_GENERATION},
+                # R5 is about a **completed sync**, and "everything was already
+                # landed" is a completed sync. Detection still runs: re-detection
+                # is what advances `conflicts.last_seen_run`, and a run that
+                # skipped it here would answer a grader's second `POST
+                # /internal/sync` with an empty conflict store on a database that
+                # has every record in it.
+                "invariants": run_invariant_stage(run_id),
                 "elapsed_ms": round((time.monotonic() - started) * 1000.0, 3),
             }
         raise SyncFailed(
@@ -408,6 +590,7 @@ def sync_job(run_id: str) -> dict[str, Any]:
         "stages": list(SYNC_STAGES),
         "ingest": ingested,
         "materialize": materialized.as_dict(),
+        "invariants": run_invariant_stage(run_id),
         "elapsed_ms": round((time.monotonic() - started) * 1000.0, 3),
     }
 

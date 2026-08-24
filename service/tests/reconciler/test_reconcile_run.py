@@ -727,8 +727,10 @@ def test_no_conflict_type_saturates_at_full_confidence(
 
     ASSERTION STRENGTHENED. The old SQL was
     ``GROUP BY c.type HAVING min(p.confidence) >= 1.0``, which fails only if EVERY
-    proposal of a type is 1.0 -- it passed happily with 1,057 proposals at exactly
-    1.0000 and 34% of the store clamped, while the test's name and docstring
+    proposal of a type is 1.0, so it passed happily on a store full of saturated
+    scores. Under model v1 that store held 1,047 proposals stored at exactly
+    1.0000, with v1's clamp having fired on 1,041 of 3,050 (34.1%); under v2 it
+    still holds 866 at exactly 1.0000. Meanwhile the test's name and docstring
     claimed saturation was ruled out. Both claims are now asserted: no type is
     uniformly saturated, AND the clamp is not the operative rule for the store as
     a whole.
@@ -753,9 +755,12 @@ def test_no_stored_score_was_produced_by_the_clamp(
 
     ``confidence.clamped`` is true when the FINAL value was pinned to the window's
     edge, i.e. when the number stored is the clamp's answer rather than the
-    model's. Under model v1 that was 1,051 of 3,050 proposals, and a penalty on
-    any of them moved the stored number by zero -- 191 proposals carried a
-    negative signal that was arithmetically invisible.
+    model's. Under model v1 it fired on 1,041 of 3,050 proposals -- a further 6
+    landed on ``clamp_max`` exactly, so 1,047 stored 1.0000 without being clamped
+    at all. Separately, 191 proposals were **positive-saturated AND penalised**,
+    and on 181 of those the penalty was **arithmetically invisible**: v1 stored
+    the same digits with it and without it. (The other 10 are C6 rows whose
+    oscillation penalty was large enough that v1 did show part of it.)
 
     Under v2 the clamp is applied to the positive half first, so a penalty always
     comes off a bounded number. ``positive_clamped`` records the conflicts whose

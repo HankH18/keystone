@@ -196,6 +196,11 @@ const METHODS: {
     ok: proposal({ status: 'applied' }),
   },
   {
+    name: 'rollbackProposal',
+    invoke: () => httpClient.rollbackProposal('p-1'),
+    ok: proposal({ status: 'rolled_back' }),
+  },
+  {
     name: 'getScorecard',
     invoke: (signal) => httpClient.getScorecard(signal),
     ok: SCORECARD,
@@ -224,7 +229,12 @@ describe('the exact request each method makes', () => {
     const covered = new Set(METHODS.map((m) => m.name))
     const exposed = Object.keys(httpClient).sort()
     expect(exposed).toEqual([...covered].sort())
-    expect(exposed).toHaveLength(8)
+    // 8 -> 9: `rollbackProposal` was ADDED to the client, and this count is the
+    // registration that forces it into `METHODS` and `CASES` above rather than
+    // letting a ninth method ship untested. The number only ever moves UP with a
+    // new method, and only together with its rows in both tables — moving it
+    // without them is the failure this assertion exists to catch.
+    expect(exposed).toHaveLength(9)
   })
 
   const CASES: {
@@ -284,6 +294,13 @@ describe('the exact request each method makes', () => {
       ok: proposal(),
     },
     {
+      name: 'rollbackProposal',
+      invoke: () => httpClient.rollbackProposal('p-1'),
+      pathname: '/api/proposals/p-1/rollback',
+      method: 'POST',
+      ok: proposal({ status: 'rolled_back' }),
+    },
+    {
       name: 'getScorecard',
       invoke: () => httpClient.getScorecard(),
       pathname: '/api/scorecard',
@@ -309,16 +326,23 @@ describe('the exact request each method makes', () => {
    * two — a reviewer's approve becoming a reject is silent data damage.
    */
   it.each([
-    ['approveProposal', 'approve', ['reject', 'apply']],
-    ['rejectProposal', 'reject', ['approve', 'apply']],
-    ['applyProposal', 'apply', ['approve', 'reject']],
+    ['approveProposal', 'approve', ['reject', 'apply', 'rollback']],
+    ['rejectProposal', 'reject', ['approve', 'apply', 'rollback']],
+    ['applyProposal', 'apply', ['approve', 'reject', 'rollback']],
+    // `rollback` is the only one of the four that WRITES BACK, so a rollback
+    // that landed on /apply would re-apply the fix it was asked to undo.
+    ['rollbackProposal', 'rollback', ['approve', 'reject', 'apply']],
   ] as const)(
     '%s posts to /%s and to nothing else',
     async (method, segment, forbidden) => {
       installFetch(() => json(proposal()))
-      await (
-        httpClient[method as 'approveProposal' | 'rejectProposal' | 'applyProposal']
-      )('p-42')
+      await httpClient[
+        method as
+          | 'approveProposal'
+          | 'rejectProposal'
+          | 'applyProposal'
+          | 'rollbackProposal'
+      ]('p-42')
       const request = only()
       expect(request.method).toBe('POST')
       expect(request.url.pathname).toBe(`/api/proposals/p-42/${segment}`)
@@ -327,6 +351,109 @@ describe('the exact request each method makes', () => {
       }
     },
   )
+
+  /**
+   * =========================================================================
+   * R24: `?auto` IS the difference between two writes, so it is tested on the
+   * wire and not merely at the interface.
+   * =========================================================================
+   * `review.py::apply_endpoint` takes `auto: bool = Query(default=False)`:
+   * `?auto=true` runs `recon.apply.auto_apply` — the ten-condition gate — and
+   * no parameter runs `recon.apply.apply_proposal`, the reviewer's own write,
+   * with no gate at all.
+   *
+   * This client sent NO `auto` parameter from anywhere, so the dashboard's only
+   * apply button was the ungated path 100% of the time and R24's guarded
+   * auto-apply was unreachable from the UI. Nothing was red: the manual path
+   * 200s, which is exactly why the gap survived. These two tests are the wire
+   * evidence that both paths are now reachable and distinguishable.
+   */
+  it('applyProposal("auto") asks for R24 with ?auto=true', async () => {
+    installFetch(() => json(proposal({ status: 'applied' })))
+    await httpClient.applyProposal('p-42', 'auto')
+    const request = only()
+    expect(request.method).toBe('POST')
+    expect(request.url.pathname).toBe('/api/proposals/p-42/apply')
+    expect(params(request)).toEqual({ auto: 'true' })
+  })
+
+  it('applyProposal("manual") — and the default — send NO auto parameter', async () => {
+    // The ABSENT parameter is the endpoint's pinned default, so the manual
+    // request stays byte-identical to the one this client always sent. Sending a
+    // redundant `auto=false` would change the working path to decorate it.
+    installFetch(() => json(proposal({ status: 'applied' })))
+    await httpClient.applyProposal('p-42', 'manual')
+    expect(params(only())).toEqual({})
+
+    calls = []
+    await httpClient.applyProposal('p-42')
+    expect(params(calls[0])).toEqual({})
+  })
+
+  it('carries the refused gate verdict off the 409 problem document', async () => {
+    // The refusal IS the safety property demonstrating itself, so the decision
+    // has to survive the trip through `toProblem()` intact.
+    installFetch(() =>
+      json(
+        {
+          type: 'https://keystone.example/problems/auto-apply-refused',
+          title: 'auto-apply refused',
+          status: 409,
+          detail: "R24's gate refused proposal 6102: confidence 0.9000 < 0.95 (R24)",
+          auto_apply: {
+            proposal_id: 6102,
+            allowed: false,
+            reason: 'confidence_floor',
+            detail: 'confidence 0.9000 < 0.95 (R24)',
+            checks: [
+              {
+                check: 'confidence_floor',
+                passed: false,
+                detail: 'confidence 0.9000 < 0.95 (R24)',
+              },
+            ],
+          },
+        },
+        409,
+      ),
+    )
+    const error = await httpClient
+      .applyProposal('p-1', 'auto')
+      .catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(ApiError)
+    const problem = (error as ApiError).problem
+    expect(problem.detail).toContain('confidence 0.9000 < 0.95 (R24)')
+    expect(problem.auto_apply?.reason).toBe('confidence_floor')
+    expect(problem.auto_apply?.checks).toHaveLength(1)
+  })
+
+  it('rollbackProposal hands back null for a body that is not a proposal row', async () => {
+    // `POST …/rollback` has no pinned response shape: the service may answer
+    // with the row, with `RollbackResult.as_dict` (digests, no row), or with
+    // 204. The client must not mis-type any of those as a proposal.
+    installFetch(() =>
+      json({
+        proposal_id: 6268,
+        canonical_id: '84990991-6cb1-56b9-9511-0fae07ec1fa4',
+        event_id: 91,
+        byte_identical: true,
+      }),
+    )
+    await expect(httpClient.rollbackProposal('p-1')).resolves.toBeNull()
+
+    calls = []
+    await expect(
+      httpClient.rollbackProposal('p-1'),
+    ).resolves.toBeNull()
+  })
+
+  it('rollbackProposal returns the row when the service does answer with one', async () => {
+    installFetch(() => json(proposal({ status: 'rolled_back' })))
+    await expect(httpClient.rollbackProposal('p-1')).resolves.toMatchObject({
+      id: 'p-1',
+      status: 'rolled_back',
+    })
+  })
 
   it('percent-encodes an id so it cannot escape its path segment', async () => {
     installFetch(() => json(conflict()))

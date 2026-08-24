@@ -82,10 +82,52 @@ TRIGGER_ENDPOINTS: tuple[tuple[str, str], ...] = (
 #: exists to close. So they are covered here, by the guard they actually use, and
 #: the coverage assertion below requires every mutating route to be in ONE of the
 #: two lists and to carry the matching header.
+#:
+#: `rollback` joined the list when R24's reversal leg was exposed over HTTP. It is
+#: on it for the same reason the other three are, and it had to earn the same
+#: three things before the line was written rather than after: it requires
+#: `X-Api-Key` with org-wide scope (asserted from the resolved dependency tree by
+#: `api_key_scope`, below), it binds no caller-supplied text (so it belongs in the
+#: identifier matrix's parsed-type half -- `tests/triggers/test_identifier_rule.py`),
+#: and it is fired at under every configuration of that credential by
+#: `test_the_api_key_matrix`. Membership without those is a route added to an
+#: exemption list, which is how a sweep gets quietly hollowed out.
 API_KEY_ENDPOINTS: tuple[tuple[str, str], ...] = (
     ("/api/proposals/{proposal_id}/approve", auth_module.SCOPE_ADMIN),
     ("/api/proposals/{proposal_id}/reject", auth_module.SCOPE_ADMIN),
     ("/api/proposals/{proposal_id}/apply", auth_module.SCOPE_ADMIN),
+    ("/api/proposals/{proposal_id}/rollback", auth_module.SCOPE_ADMIN),
+)
+
+#: The committed demo keys, spelled out for the reason `tests/api/conftest.py`
+#: spells them out: they are the credentials migration 0003 seeded, and a value
+#: derived from the same helper the service uses would agree with itself even if
+#: both changed. `client` and `admin` differ only in the scope they carry.
+DEMO_CLIENT_API_KEY = "keystone-demo-client-3f7a19c4e2b84d05"
+DEMO_ADMIN_API_KEY = "keystone-demo-admin-8c25e0b71a94f36d"
+
+#: A well-formed id no proposal carries, so the admitted cell of the matrix below
+#: reaches a *lookup* and mutates nothing. `9223372036854775807` is max bigint.
+UNUSED_PROPOSAL_ID = 9223372036854775807
+
+#: `(case, presented header, expected status)` -- every configuration of the
+#: client-API credential, the counterpart of :data:`CONFIGURATIONS` for the
+#: routes that take `X-Api-Key` rather than a trigger secret.
+#:
+#: Exactly one cell is admitted past the guard, and "admitted" is spelled as the
+#: **resource** verdict (404 for an id nobody holds) rather than as "not 401":
+#: a guard that answered 401 to a valid admin key would satisfy every deny row
+#: and still be a closed door rather than authentication.
+API_KEY_PRESENTATIONS: tuple[tuple[str, str | None, int], ...] = (
+    ("absent", None, 401),
+    ("empty", "", 401),
+    ("space", " ", 401),
+    ("whitespace", "   ", 401),
+    ("tab", "\t", 401),
+    ("unknown", "not-a-real-key", 401),
+    ("prefix_of_the_real_key", DEMO_ADMIN_API_KEY[:-1], 401),
+    ("client_scope", DEMO_CLIENT_API_KEY, 403),
+    ("admin_scope", DEMO_ADMIN_API_KEY, 404),
 )
 
 
@@ -493,6 +535,82 @@ def test_ingest_and_internal_sync_agree_on_every_configuration(
                 f"configured={value!r} presented={presented!r}: "
                 f"/internal/ingest/records denied={records}, /internal/sync denied={sync}"
             )
+
+
+# ===========================================================================
+# behavioural -- the matrix, second half: the CLIENT API credential
+# ===========================================================================
+@pytest.fixture
+def api_key_client(owner_engine: Engine) -> Iterator[TestClient]:
+    """The real application. No trigger router: these routes take no trigger secret.
+
+    Nothing is swept afterwards because nothing is written: every cell fires at
+    :data:`UNUSED_PROPOSAL_ID`, and the one cell that gets past the credential is
+    answered by the row lookup with a 404 before any handler reaches a write.
+    """
+    with TestClient(create_app()) as client:
+        yield client
+
+
+@pytest.mark.parametrize(
+    ("path", "scope"),
+    API_KEY_ENDPOINTS,
+    ids=[path.rsplit("/", 1)[-1] for path, _ in API_KEY_ENDPOINTS],
+)
+@pytest.mark.parametrize(
+    ("case", "presented", "expected"),
+    API_KEY_PRESENTATIONS,
+    ids=[case for case, _, _ in API_KEY_PRESENTATIONS],
+)
+def test_the_api_key_matrix(
+    api_key_client: TestClient,
+    path: str,
+    scope: str,
+    case: str,
+    presented: str | None,
+    expected: int,
+) -> None:
+    """Every configuration of `X-Api-Key` x every mutating route that requires one.
+
+    This is what makes :data:`API_KEY_ENDPOINTS` membership mean something. The
+    coverage assertion above says "every endpoint that writes must be run through
+    every configuration of the credential it requires"; for the trigger half that
+    is `test_the_guard_matrix`, and until this existed the client-API half was a
+    list with no matrix behind it -- a route could be added to it and never be
+    presented with a missing, malformed, unknown or under-scoped key at all.
+
+    The distinction the matrix pins is `recon.api.auth`'s own: **401 for missing
+    or unknown, 403 for authenticated-with-the-wrong-scope**. Answering 403 to an
+    unknown key would tell a caller the key exists; answering 401 to the client
+    key would hide that reviewer actions are scope-gated at all.
+    """
+    assert scope == auth_module.SCOPE_ADMIN, (
+        f"{path} is listed under scope {scope!r}, which this matrix has no row for. "
+        "A mutating route with a different scope requirement must extend "
+        "API_KEY_PRESENTATIONS rather than be judged by the wrong expectations."
+    )
+    url = path.replace("{proposal_id}", str(UNUSED_PROPOSAL_ID))
+    headers = {} if presented is None else {auth_module.API_KEY_HEADER: presented}
+    response = api_key_client.post(url, headers=headers)
+    assert response.status_code == expected, (
+        f"{path} answered {response.status_code} to the {case} key, not {expected}: {response.text}"
+    )
+    body = response.json()
+    if expected == 404:
+        assert body["type"].endswith("proposal-not-found"), (
+            f"{path} admitted the admin key but did not reach the row lookup: {body}. "
+            "A guard whose admitted cell never gets past the door is a closed door, "
+            "not authentication."
+        )
+    else:
+        kind = "unauthorized" if expected == 401 else "forbidden"
+        assert body["type"].endswith(kind), (
+            f"{path} refused the {case} key with a {body['type']!r} body, not {kind!r}: "
+            "401 and 403 are the two halves of the R20 distinction and may not blur"
+        )
+        assert set(body) == {"type", "title", "status", "detail"}, (
+            f"{path} handed a refused caller more than the RFC7807 body: {body}"
+        )
 
 
 # ===========================================================================

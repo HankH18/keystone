@@ -96,8 +96,13 @@ def test_a6_the_conflict_status_vocabulary(review_api: TestClient, reader: Any) 
     The client assumes `open` and `escalated:oscillation` and renders anything
     else as a labelled badge. The service serves the composite when the row
     carries an `escalation_reason` or the `oscillating` flag, and bare
-    `escalated` otherwise -- which is the usual case, because `recon_writer` has
-    no grant on `escalation_reason` (§8 of `docs/proposal-policy.md`).
+    `escalated` otherwise.
+
+    Bare `escalated` *used* to be the usual case, because `recon_writer` held no
+    grant on `escalation_reason` (§8 of `docs/proposal-policy.md`). Migration
+    **0015** adds that column to the column-scoped UPDATE grant, so a row
+    escalated since then carries its reason and only a pre-0015 row -- or one
+    written while the grant is narrowed -- falls through to bare `escalated`.
 
     **This store has no escalated conflict at all**, and the test says so out
     loud rather than passing quietly: `tests/apply/store.py` inherits a

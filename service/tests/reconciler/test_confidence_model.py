@@ -67,9 +67,9 @@ def test_worked_example_all_three_key_classes_agree() -> None:
     conflict's disagreement penalty changes the stored number by NOTHING because
     the positive evidence had already saturated the clamp. R14 requires that
     "partial/conflicting evidence lowers it", so the old expectation encoded the
-    defect as the contract. Measured on the graded store, 1,051 of 3,050
-    proposals were clamped and 191 of them carried a penalty that moved the
-    number by zero.
+    defect as the contract. Measured on the graded store: v1's clamp fired on
+    1,041 of 3,050 proposals, and on 181 the penalty was arithmetically
+    invisible -- the stored number was identical whether it fired or not.
 
     ``raw_total`` is unchanged (1.10) because it is still the ungrouped sum -- the
     recorded terms still add up to a recorded number. What moved is where the
@@ -487,7 +487,7 @@ def _cube() -> list[Signals]:
 def test_turning_a_penalty_on_strictly_lowers_every_score_above_the_floor(signal: str) -> None:
     """R14's "partial/conflicting evidence lowers it", over the WHOLE cube.
 
-    This assertion fails against model v1: for the 1,051 clamped proposals in the
+    This assertion fails against model v1: for the 1,041 clamped proposals in the
     graded store, turning a penalty on left the quantized score identical. The
     only permitted exception is the floor -- a score already at ``clamp_min``
     cannot go lower, which is inherent to a bounded score rather than a defect,

@@ -526,14 +526,33 @@ asserted in prose" while inspecting three strings; §8.7 called a nested sensiti
 it two conditions earlier; and §4 called `VIEW_FIELDS` "the object the dashboard renders" when the
 dashboard's client never calls the entities endpoint at all — an overclaim about who would NOTICE an
 invisible write, which is how the observability gap stayed comfortable. All six are repaired above.
-This list is what is still true.
+This list is what is still true — with the deliberate exception of §8.1, §8.2 and §8.7, which record
+a gap that has since been **closed** and say so at the top of the entry. They are kept rather than
+deleted because the opposite error, a document claiming a control is MISSING when it exists, misleads
+the same reader just as badly, and because §8's numbering is cited by name from `docs/` and
+`tests/apply/`.
 
-1. **`conflicts.escalation_reason` is usually NULL.** `recon_writer`'s UPDATE grant on `conflicts`
-   is column-scoped to `(status, last_seen_run)` (migration 0004), so `_escalate` writes the status
-   and puts the reason in the audit row only. The API renders `escalated:<reason>` when the row
-   carries one and bare `escalated` otherwise; the dashboard shows the latter as a labelled unknown
-   status (a loud failure, `contract.ts` A6). Fixing it means widening a grant in a migration this
-   ticket does not own.
+1. **Not a gap any more: `conflicts.escalation_reason` IS written.** This entry used to read
+   "`conflicts.escalation_reason` is usually NULL", because migration 0004 column-scoped
+   `recon_writer`'s UPDATE grant on `conflicts` to `(status, last_seen_run)`, and closing it "means
+   widening a grant in a migration this ticket does not own". Migration 0015 owns it:
+   `0015_escalation_reason_grant.py:90` pins `CONFLICT_UPDATE_COLUMNS = ("status", "last_seen_run",
+   "escalation_reason")` and `_rescope` (`:100-102`, called by `upgrade()` at `:105-106`) re-grants
+   exactly those three — still a closed list, still narrower than the table: `fingerprint`, `type`,
+   `entity_refs`, `first_seen_run` and `oscillating` stay ungranted. So `_escalate` issues the
+   single statement it was always meant to (`_ESCALATE_CONFLICT`, `reconciler.py:876-885`, which
+   sets `escalation_reason = :reason` at `:880`) whenever the once-per-run catalogue probe
+   `has_column_privilege(current_user, 'conflicts', 'escalation_reason', 'UPDATE')`
+   (`reconciler.py:905-907`) says it holds the column; the run reports the answer as
+   `escalation_reason_persisted` (`:485`, `:1652`). The status-only fallback
+   (`_ESCALATE_CONFLICT_STATUS_ONLY`, `:892-899`) is kept for a database still on 0014, which is why
+   the probe stays rather than the grant being assumed. After `alembic upgrade head` the grant reads
+   `{escalation_reason, last_seen_run, status}`, so the API's `escalated:<reason>` branch — not the
+   bare `escalated` one — is what now serves an escalated row, and `contract.ts` A6's labelled
+   unknown status is the degraded path rather than the usual one. **The entry is kept, and not
+   deleted, for exactly the reason §8.2 gives**: a document claiming a control is MISSING when it
+   exists is the inverse phantom control, and this list is the first place a reader looks to decide
+   what still has to be built.
 2. **Not a gap any more: `GET /api/scorecard` IS built.** This entry used to read "`GET
    /api/scorecard` is not built"; T-14 built `recon/api/scorecard.py`, `create_app()` mounts it
    (`tests/integration/test_route_table.py` pins the mount) and

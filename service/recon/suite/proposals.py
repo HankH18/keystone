@@ -36,7 +36,11 @@ from __future__ import annotations
 
 import json
 
+from sqlalchemy import text
+
+from recon.db import get_engine
 from recon.invariants.grading import golden_dir
+from recon.reconciler import ESCALATION_OSCILLATION
 from recon.sensitive import BIRTH_STATUSES, STATUS_SENSITIVE_HOLD, classify
 from recon.suite.checks import CheckResult
 from recon.suite.mirror import MIRROR_TABLES
@@ -52,6 +56,52 @@ __all__ = [
 
 PROPOSAL_SAFETY = "proposal-safety"
 OSCILLATION_DEDUP = "oscillation-dedup"
+
+#: The fallback the degraded branch of :func:`check_oscillation_dedup` names, read
+#: back instead of asserted in prose. Counted over the same population as
+#: ``escalated`` -- proposals joined to their conflict, exactly as
+#: ``recon.suite.pipeline._PROPOSAL_ROWS`` joins them -- so the two numbers compare.
+#:
+#: The LATERAL takes the **latest** ``conflict.escalated`` row for the fingerprint,
+#: not any of them. ``audit_log`` is append-only and no graded step truncates it, so
+#: an `EXISTS` here passes on a row an earlier run wrote: with the reason dropped
+#: from the audit body, ``EXISTS`` still found 25/25 and the check still said PASS.
+#: A conflict with no audit row at all is dropped by the join and is therefore
+#: counted as missing, which is what it is.
+_REASON_IN_AUDIT_ROW = text(
+    """
+    SELECT count(*) AS n
+      FROM proposals p
+      JOIN conflicts c ON c.id = p.conflict_id
+      JOIN LATERAL (
+               SELECT a.detail -> 'body' ->> 'label' AS label
+                 FROM audit_log a
+                WHERE a.action = 'conflict.escalated'
+                  AND a.subject = c.fingerprint
+                ORDER BY a.id DESC
+                LIMIT 1
+           ) latest ON true
+     WHERE c.status = 'escalated'
+       AND latest.label = :label
+    """
+)
+
+
+def escalation_reasons_in_audit() -> int:
+    """Escalated conflicts whose latest ``conflict.escalated`` row carries the reason.
+
+    ``audit_log.detail`` is ``{"mode", "body_sha256", "body"}`` under ``LOG_MODE=safe``
+    and ``{"mode", "body"}`` under ``full``, so ``detail -> 'body'`` is the payload in
+    either mode, and ``label`` is allow-listed (``recon.privacy.SAFE_KEYS``) rather
+    than tokenised -- confirmed by reading a row back, not assumed.
+    """
+    with get_engine().connect() as conn:
+        return int(
+            conn.execute(
+                _REASON_IN_AUDIT_ROW, {"label": f"escalated:{ESCALATION_OSCILLATION}"}
+            ).scalar_one()
+        )
+
 
 _DETAIL_LIMIT = 5
 
@@ -208,6 +258,41 @@ def check_oscillation_dedup() -> CheckResult:
             f"{escalated_and_oscillating} are in the conflicts table"
         )
 
+    # R16's escalation is required to record WHY. Until migration 0015,
+    # `recon_writer` held no UPDATE on `conflicts.escalation_reason`, so the
+    # reconciler wrote the reason to the `conflict.escalated` audit row and left
+    # the column NULL -- and this check said so in a caveat. The grant exists now,
+    # so the column is READ BACK rather than the caveat being deleted: the flag
+    # `escalation_reason_persisted` is a `has_column_privilege` probe, and a grant
+    # is not a write. Whichever way it comes out is reported below; neither
+    # outcome is silence.
+    reasons_written = sum(
+        1
+        for row in run.proposals
+        if row.conflict_status == "escalated" and row.escalation_reason is not None
+    )
+    audited_reasons = -1
+    if first.escalation_reason_persisted:
+        if reasons_written != escalated:
+            failures.append(
+                f"recon_writer holds UPDATE on conflicts.escalation_reason (migration 0015) "
+                f"but only {reasons_written} of {escalated} escalated conflict(s) carry a "
+                f"reason on the row"
+            )
+    else:
+        # The branch that used to assert nothing. Without the grant this check was
+        # a PASS with a note, so an `alembic downgrade` past 0015 or a stray REVOKE
+        # switched a graded assertion off while the scorecard still printed PASS --
+        # and the note's consolation ("the reason lives in the audit row") was
+        # never itself checked. It is checked here.
+        audited_reasons = escalation_reasons_in_audit()
+        if audited_reasons != escalated:
+            failures.append(
+                f"conflicts.escalation_reason is not writable by recon_writer AND only "
+                f"{audited_reasons} of {escalated} escalated conflict(s) carry the reason "
+                f"in a conflict.escalated audit row: R16's escalation recorded WHY nowhere"
+            )
+
     lineage_note = f"lineage {first.lineage_rows} rows over {first.lineage_generations} generations"
     detail = (
         f"second pass proposed {second.proposed} "
@@ -215,10 +300,16 @@ def check_oscillation_dedup() -> CheckResult:
         f"oscillating {detected_oscillating}/{expected_oscillating} golden, all escalated="
         f"{escalated_and_oscillating}; {lineage_note}"
     )
-    if not first.escalation_reason_persisted:
+    if first.escalation_reason_persisted:
+        # The positive half. It reports the READ-BACK count, not the privilege:
+        # "granted" is a fact about the catalogue and `escalation_reason=N/N` is a
+        # fact about the rows, and only the second one is evidence that R16's
+        # escalation recorded its reason where a reviewer can see it.
+        detail += f"; escalation_reason on the row {reasons_written}/{escalated} (migration 0015)"
+    else:
         detail += (
-            "; NOTE conflicts.escalation_reason is not writable by recon_writer, so the "
-            "reason lives in the conflict.escalated audit row only"
+            "; NOTE conflicts.escalation_reason is not writable by recon_writer; "
+            f"reason in the conflict.escalated audit row {audited_reasons}/{escalated}"
         )
     if failures:
         return CheckResult.failed(OSCILLATION_DEDUP, f"{detail} | " + " | ".join(failures))

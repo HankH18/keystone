@@ -1,15 +1,15 @@
 ================================================================================================
 Keystone reconciliation suite -- scorecard (v0.1.0)
-generated 2026-08-23T21:04:57+00:00
-database ks_verify_hh   run recon-299d6d2c4fe3d1d6   dataset 360400 landed records / 43375 entities
+generated 2026-08-24T19:58:50+00:00
+database ks_final_hh   run recon-299d6d2c4fe3d1d6   dataset 360400 landed records / 43375 entities
 ================================================================================================
 CHECKS                         STATUS DETAIL
 ------------------------------------------------------------------------------------------------
-coverage                       PASS   combined 92.5% (floor 80%) over 7 core modules
-                                      [adapters:92.0% budget:87.6% confidence:89.2% er:93.2%
-                                      invariants:94.2% normalize:100.0% reconciler:96.1%]; 3966
-                                      passed, 1 skipped, 56 warnings in 1413.58s (0:23:33);
-                                      measured by a real pytest run in 1416s
+coverage                       PASS   combined 92.8% (floor 80%) over 7 core modules
+                                      [adapters:92.0% budget:89.0% confidence:89.2% er:93.2%
+                                      invariants:94.4% normalize:100.0% reconciler:96.2%]; 4235
+                                      passed, 2 skipped, 56 warnings in 1923.41s (0:32:03);
+                                      measured by a real pytest run in 1925s
 golden-diff                    PASS   FN=0 FP=0 field-mismatches=0 matched=3050/3050
                                       golden/detected per type [C1:500/500 C10:50/50 C11:50/50
                                       C12:100/100 C13:100/100 C14:50/50 C2:200/200 C3:300/300
@@ -28,13 +28,11 @@ proposal-safety                PASS   3050 conflicts -> 3050 proposals (pending=
                                       byte-unchanged; run=recon-299d6d2c4fe3d1d6
 oscillation-dedup              PASS   second pass proposed 0 (skipped_fingerprint=3050/3050);
                                       oscillating 25/25 golden, all escalated=25; lineage
-                                      1279575 rows over 3 generations; NOTE
-                                      conflicts.escalation_reason is not writable by
-                                      recon_writer, so the reason lives in the
-                                      conflict.escalated audit row only
+                                      1279575 rows over 3 generations; escalation_reason on the
+                                      row 25/25 (migration 0015)
 mirror-unchanged               PASS   7 landing/staging tables, 720809 rows, byte-unchanged
 determinism                    PASS   dataset 642d160a46bfdf75 == 642d160a46bfdf75 over 21 files
-                                      (profile=full, seed=20260822, 27.3s + 27.0s,
+                                      (profile=full, seed=20260822, 25.7s + 25.7s,
                                       PYTHONHASHSEED=0 subprocesses; committed golden/
                                       reproduced byte-for-byte); conflict set 3050 fingerprints,
                                       payload 77cf192e9e79b5cb == 77cf192e9e79b5cb; confidence
@@ -62,20 +60,20 @@ spend-cap-burst                PASS   contenders=120 granted=6 refused=114 other
                                       'self-attested-outage:KS007']/13600->1797
                                       replay=receipt:True/refused:True/13600
                                       sweep_as_capped=refused:True/open:1/13600
-                                      failed_call_priced=refused:True/13600 elapsed=2.8s
+                                      failed_call_priced=refused:True/13600 elapsed=2.9s
 ------------------------------------------------------------------------------------------------
 BENCHMARKS                     STATUS DETAIL
 ------------------------------------------------------------------------------------------------
-bench:cross-source-query-p95   PASS   n=20 min=4.6ms p50=5.6ms p95=6.3ms max=6.3ms threshold<1s
+bench:cross-source-query-p95   PASS   n=20 min=4.2ms p50=6.5ms p95=7.4ms max=7.4ms threshold<1s
                                       (warm-up discarded; 43375 entities, 360400 landed records;
                                       in-process ASGI)
-bench:invariant-pass           PASS   22.94s total = invariants 12.94s + persist 2.72s +
-                                      reconcile 7.29s (threshold <30s); 3050 conflicts over
+bench:invariant-pass           PASS   23.33s total = invariants 12.04s + persist 2.78s +
+                                      reconcile 8.52s (threshold <30s); 3050 conflicts over
                                       360400 landed records
-bench:ingestion-rps            PASS   13961 rec/s sustained over 240200 records in 17.20s
-                                      (threshold >=500); gen1:120200rec/7.37s(warm-up)
-                                      gen2:120200rec/8.32s=14447rps
-                                      gen3:120000rec/8.89s=13506rps; measured inside a
+bench:ingestion-rps            PASS   14963 rec/s sustained over 240200 records in 16.05s
+                                      (threshold >=500); gen1:120200rec/7.86s(warm-up)
+                                      gen2:120200rec/7.85s=15317rps
+                                      gen3:120000rec/8.21s=14624rps; measured inside a
                                       rolled-back transaction, mirror restored=True
 bench:conflict-accuracy        PASS   precision 1.000000 recall 1.000000 on 3050 golden entries
                                       (FN=0 FP=0 field-mismatches=0); clean sample 1000/1000
@@ -84,7 +82,7 @@ bench:spend-cap-exact          PASS   cap=81600uUSD granted=6/6 of 120 contender
                                       reserved-while-open=81600 (== cap); settled spend=10782
                                       (== 1797 x 6); ledger violations=0; over-admitted=False;
                                       threshold: EXACT
-bench:dashboard-load-p95       PASS   n=20 min=59.7ms p50=68.9ms p95=75.2ms max=79.0ms
+bench:dashboard-load-p95       PASS   n=20 min=67.8ms p50=145.8ms p95=190.6ms max=203.7ms
                                       threshold<1s; 15 server calls per load (GET /api/scorecard
                                       + 14 x GET /api/conflicts?type=..&page_size=1), 43375
                                       entities / 3050 proposals; SERVICE SIDE ONLY -- in-process
@@ -92,8 +90,11 @@ bench:dashboard-load-p95       PASS   n=20 min=59.7ms p50=68.9ms p95=75.2ms max=
                                       render; this is a floor on a page load, not a page load
 ------------------------------------------------------------------------------------------------
 16/16 passed
-note: conflicts.escalation_reason was not writable by recon_writer; the escalation reason is in
-      the conflict.escalated audit row only
+note: conflicts.escalation_reason IS writable by recon_writer (migration 0015), so the
+      escalation reason is persisted on the conflict row as well as in the conflict.escalated
+      audit row
+note: R25 incident clustering (stretch #8): 3050 conflicts -> 38 incidents (largest 500, 5
+      singleton) via mock-embedding-v1 at threshold 0.1 in 2.2s
 note: SCOPE: every row except `manifest` and `determinism`'s dataset half grades the committed
       FULL-profile dataset (~360k landed records over 3 generations, 43,375 entities) in the
       database DATABASE_URL names. `determinism` and `manifest` additionally regenerate that

@@ -15,7 +15,7 @@ import {
   Loading,
 } from '../components/common'
 import { useAnnounce } from '../lib/announcer'
-import { targetPath } from '../lib/proposal'
+import { actionShape, describeWritePaths, writePaths } from '../lib/proposal'
 import { StatusBadge } from '../components/StatusBadge'
 import { PageHeading } from '../components/PageHeading'
 import { Link } from '../lib/router'
@@ -45,12 +45,28 @@ const columns: Columns<Proposal> = helper.columns([
   helper.accessor('action', {
     id: 'target',
     header: 'Proposed fix',
+    // A10: read off `action.set` (the only interior migration 0007 permits),
+    // never off a `target_path` sibling the database refuses. Every path the
+    // action writes is named, not just the first.
     cell: ({ getValue }) => {
-      const path = targetPath(getValue())
-      return path ? (
-        <span className="ref">write {path}</span>
+      const action = getValue()
+      const shape = actionShape(action)
+      if (shape === 'unreadable') {
+        return (
+          <span className="evidence-empty" data-testid="fix-unreadable">
+            unreadable action — not the committed {'{"set": …}'} shape
+          </span>
+        )
+      }
+      const paths = writePaths(action)
+      return paths.length === 0 ? (
+        <span data-testid="fix-evidence-only">
+          evidence only — no field write
+        </span>
       ) : (
-        <span>evidence only — no field write</span>
+        <span className="ref" data-testid="fix-target">
+          {describeWritePaths(paths)}
+        </span>
       )
     },
   }),

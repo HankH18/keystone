@@ -25,6 +25,7 @@ from recon.budget import (
     KS_CAP_EXCEEDED,
     KS_RESERVATION_LIFECYCLE,
     MAX_LEASE_SECONDS,
+    OPS_DATABASE_URL_ENV,
     BudgetCapExceeded,
     BudgetError,
     BudgetOverspend,
@@ -44,6 +45,7 @@ from recon.budget import (
     fire_alert,
     halted_scopes,
     ledger_row,
+    ops_engine,
     provision_run_scope,
     register_alert_sink,
     reserve,
@@ -647,30 +649,84 @@ def test_a_reservation_with_no_lease_signal_is_left_alone(
     )
 
 
+@pytest.mark.parametrize("ambient_ops_dsn", [False, True], ids=["ops-unset", "ops-set"])
 def test_the_sweeper_refuses_to_run_as_the_capped_party(
-    monkeypatch: pytest.MonkeyPatch, configured_url: str
+    monkeypatch: pytest.MonkeyPatch, configured_url: str, ambient_ops_dsn: bool
 ) -> None:
     """Reclaiming belongs to ops. Connected as ``recon_writer``, it refuses.
 
     Migration 0005 already refuses ``open -> reclaimed`` to that role, so this
     is not the enforcement point and does not pretend to be one -- it is here so
-    a misconfigured ``DATABASE_URL`` fails the ops cron with a legible message
-    instead of a ``KS007`` from somewhere in the middle of a sweep.
+    a misconfigured ops DSN fails the ops cron with a legible message instead of
+    a ``KS007`` from somewhere in the middle of a sweep.
+
+    **The misconfiguration has to reach the DSN the sweeper actually uses.**
+    This test used to override ``DATABASE_URL`` alone, and :func:`ops_engine`
+    *prefers* ``OPS_DATABASE_URL``: on any machine with that variable set -- the
+    deployed configuration, which ``infra/render.yaml`` writes -- the sweep ran
+    as the owner, the guard never fired, and this test raised nothing. So it is
+    parametrized over the ambient variable and misconfigures **both**, which is
+    the only way the assertion below means what it says in either environment.
+
+    **What the parametrization guards, exactly.** It is the *test* it holds to
+    account, not ``reset_engine_cache``: regress the misconfiguration below to
+    the ``DATABASE_URL``-only form and ``[ops-set]`` goes red with
+    ``DID NOT RAISE`` while ``[ops-unset]`` stays green -- measured. It does
+    **not** catch an uncleared ops engine cache, and this docstring used to say
+    it did: both parameters give the code under test the same two variables set
+    to the same ``writer_dsn``, and ``ops_engine``'s cache is keyed by the DSN
+    string, so the switch gets a fresh engine from the key alone whether or not
+    anything was cleared. Disabling the ops cache clear leaves both parameters
+    green; the check that goes red is
+    :func:`test_reset_engine_cache_drops_the_ops_engine_too` below, which is
+    where that property belongs. Materializing a live ops engine under the
+    ambient configuration first is still worth the line -- it is the state both
+    deployed processes are in when a sweep starts -- it just is not a detector.
     """
     from recon.db import reset_engine_cache, role_url
 
-    env_settings(
-        monkeypatch,
-        DATABASE_URL=role_url(ROLE_RECON_WRITER).render_as_string(hide_password=False),
-    )
+    writer_dsn = role_url(ROLE_RECON_WRITER).render_as_string(hide_password=False)
+    ambient = configured_url if ambient_ops_dsn else None
+
+    env_settings(monkeypatch, DATABASE_URL=configured_url, OPS_DATABASE_URL=ambient)
+    reset_engine_cache()
+    ops_engine()  # populate whatever cache the ambient configuration uses
+
+    env_settings(monkeypatch, DATABASE_URL=writer_dsn, OPS_DATABASE_URL=writer_dsn)
     reset_engine_cache()
     try:
         with pytest.raises(BudgetError) as excinfo:
             sweep_expired_reservations()
     finally:
-        env_settings(monkeypatch, DATABASE_URL=configured_url)
+        env_settings(monkeypatch, DATABASE_URL=configured_url, OPS_DATABASE_URL=ambient)
         reset_engine_cache()
     assert ROLE_RECON_WRITER in str(excinfo.value)
+
+
+def test_reset_engine_cache_drops_the_ops_engine_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``reset_engine_cache`` must clear every engine cache, ops included.
+
+    :func:`ops_engine` keeps its own ``lru_cache`` keyed by the explicit
+    ``OPS_DATABASE_URL``, outside ``recon.db``. While that cache went uncleared,
+    "drop cached engines" was untrue of a quarter of them; what that did and did
+    not cost is recorded on :func:`recon.db.reset_engine_cache`.
+
+    No connection is made: ``create_engine`` is lazy, so an unroutable host is
+    enough to compare object identity across the reset.
+    """
+    from recon.db import reset_engine_cache
+
+    dsn = "postgresql://ops@ops.invalid:5432/keystone"
+    env_settings(monkeypatch, **{OPS_DATABASE_URL_ENV: dsn})
+    try:
+        first = ops_engine()
+        assert ops_engine() is first, "the ops engine is cached, or this proves nothing"
+        reset_engine_cache()
+        assert ops_engine() is not first, (
+            "reset_engine_cache left a live engine on the previous ops DSN"
+        )
+    finally:
+        reset_engine_cache()
 
 
 def test_the_sweeper_is_a_no_op_when_nothing_has_expired(

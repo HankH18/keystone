@@ -24,10 +24,13 @@ Three properties make it generalizable to the rest of the test tree:
 * **The name carries the pid and a random token**, so two concurrent pytest processes
   -- and two agents -- never collide, and a leaked database is traceable to the run
   that leaked it.
-* **Nothing is cached across the boundary.** `recon.config.get_settings` and
-  `recon.db`'s engine caches are `lru_cache`d on `DATABASE_URL`; :func:`use_database`
-  sets the variable *and* clears both, so a module that grabbed an engine before the
-  scratch database existed cannot keep writing to the old one.
+* **Nothing is cached across the boundary, and nothing is left pointing home.**
+  `recon.config.get_settings` and `recon.db`'s engine caches are `lru_cache`d on the
+  DSN variables; :func:`use_database` sets *every* variable in
+  :data:`recon.db.PRINCIPAL_ENV_VARS` -- ``OPS_DATABASE_URL`` as well as
+  ``DATABASE_URL``, or the ops half of the process keeps writing to the database it
+  was told to leave -- and clears both caches, so a module that grabbed an engine
+  before the scratch database existed cannot keep writing to the old one.
 * **Migrations run in a subprocess.** Alembic mutates global state (its own config,
   the logging tree, the SQLAlchemy metadata); a subprocess keeps that out of the test
   process entirely, and it is also how a human would create the database.
@@ -79,26 +82,24 @@ def psycopg_dsn(url: URL) -> str:
 def use_database(dsn: str) -> Iterator[str]:
     """Point the whole process at `dsn`, dropping every cached engine/settings object.
 
-    Restores the previous value (and clears the caches again) on the way out, so a
-    test that runs after this one does not inherit a scratch database that no longer
-    exists.
-    """
-    from recon.config import get_settings
-    from recon.db import reset_engine_cache
+    **Every** principal variable moves, not just ``DATABASE_URL``.
+    :data:`recon.db.PRINCIPAL_ENV_VARS` is the list, and the second entry is the
+    one this helper used to leave behind: ``recon.budget.ops_engine`` and
+    ``recon.api.internal._invariant_dsn`` both *prefer* ``OPS_DATABASE_URL``
+    whenever it is set, so a fixture that repointed the first alone left every
+    ops call -- a provisioned ledger scope, a lease sweep, a whole invariant
+    pass -- transacting against whatever the second named. On a shell configured
+    like the deployed service that is the production owner DSN, which is the
+    opposite of the isolation this module exists for.
 
-    previous = os.environ.get("DATABASE_URL")
-    os.environ["DATABASE_URL"] = dsn
-    get_settings.cache_clear()
-    reset_engine_cache()
-    try:
-        yield dsn
-    finally:
-        if previous is None:
-            os.environ.pop("DATABASE_URL", None)
-        else:
-            os.environ["DATABASE_URL"] = previous
-        get_settings.cache_clear()
-        reset_engine_cache()
+    Restores the previous environment exactly (and clears the caches again) on
+    the way out, unset staying unset, so a test that runs after this one does not
+    inherit a scratch database that no longer exists.
+    """
+    from recon.db import connected_to
+
+    with connected_to(dsn) as active:
+        yield active
 
 
 def _run_migrations(dsn: str) -> None:

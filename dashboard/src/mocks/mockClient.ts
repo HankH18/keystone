@@ -3,10 +3,15 @@
  *  MOCK SERVICE — NOT THE REAL API.
  * ===========================================================================
  *
- * The Keystone HTTP API does not exist yet (T-5 / T-7 / T-8 build it). This
- * module is an in-browser stand-in that implements `KeystoneApi` exactly as
+ * This module is an in-browser stand-in that implements `KeystoneApi` exactly as
  * src/lib/contract.ts declares it, so the dashboard can be built and tested
- * against the pinned contract before the service lands.
+ * without a service.
+ *
+ * It was written when the Keystone HTTP API did not exist. IT NOW DOES (T-5 /
+ * T-7 / T-8 landed), which changes what this file is FOR: it is no longer a
+ * placeholder for an unknown shape, it is a stand-in that must MATCH a known one.
+ * Every remaining difference is therefore a divergence to be justified, and the
+ * ones that remain are enumerated below rather than left to be discovered.
  *
  * Honesty rules this module keeps, deliberately:
  *   1. It is the ONLY mock, it lives under src/mocks/, and nothing outside
@@ -32,17 +37,48 @@
  * NOT invented (read from the golden artifacts / committed contract):
  *   - conflict type, entity_refs, sources, disagreeing_fields, observed_values,
  *     the fingerprint, the per-type fix target and its sensitivity.
+ *
+ * WHERE THIS MOCK KNOWINGLY DIVERGES FROM THE SERVICE, and why.
+ * This block did not exist when the service did not, and its absence is what
+ * let the mock invent the DASHBOARD's shape instead of the service's — an
+ * `action.target_path` the database refuses and a top-level
+ * `evidence.observed_values` nothing writes. Both are now fixed. What remains:
+ *   1. `action` carries `kind` / `conflict_type` / `rule_id` beside `set`.
+ *      The real action has exactly ONE top-level key
+ *      (`ck_proposals_action_vocabulary`, migration 0007). Kept only because
+ *      `src/routes/ProposalDetail.test.tsx:182` asserts `action.kind` and this
+ *      ticket may not edit an existing test. Inert: the UI reads `action.set`.
+ *   2. R24's GATE is re-derived here, it is not the service's gate. `mockGate()`
+ *      below evaluates the six conditions this module has the data for and
+ *      names the two it cannot see (complete evidence, and whether the single-use
+ *      citation indexes are unspent) in the check details. It exists because the
+ *      alternative is worse: a mock whose `?auto=true` always succeeded would be
+ *      inventing a safety property, and the refusal is the half of R24 worth
+ *      demonstrating. The real verdict is `recon.apply.auto_apply_decision`.
+ *   3. A proposal row here carries NO `conflict_type` / `conflict_sources`.
+ *      The real `_proposal_row` does, and `filterGuard` verifies A8's
+ *      source/type filters from them. Deliberate: without them the mock is a
+ *      faithful stand-in for the OTHER A8 case — a service that serves the
+ *      filters with no JOIN — and it keeps the `unverifiable` arm exercised
+ *      (`src/routes/filterHonesty.test.tsx`). The verified arm is covered by
+ *      `src/lib/filterGuardA8.test.ts` with rows that do carry them.
+ * Anything driven by a REAL service body lives in
+ * `src/routes/serviceShape.test.tsx`, which uses no mock at all.
  */
 import {
   AUTO_APPLY_ELIGIBLE,
   COMPARED_FIELDS,
   SENSITIVE_FIELDS,
+  type ApplyMode,
+  type AutoApplyCheck,
+  type AutoApplyVerdict,
   type Conflict,
   type ConflictQuery,
   type ConflictType,
   type KeystoneApi,
   type Page,
   type Proposal,
+  type ProposalEvent,
   type ProposalQuery,
   type ProposalStatus,
   type Scorecard,
@@ -141,12 +177,177 @@ function mockStatus(
   return 'rolled_back'
 }
 
+/**
+ * MOCK-ONLY: the VALUE a fix would write.
+ *
+ * The committed derivation is the reconciler's fix templates. The mock takes
+ * the counterpart observed value where COMPARED_FIELDS pairs the target with
+ * one, and `null` otherwise — enough for the action to be a real
+ * `{"set": {<path>: <value>}}` payload rather than an empty gesture.
+ */
+function mockFixValue(
+  path: string,
+  observed: Record<string, unknown>,
+): unknown {
+  const row = COMPARED_FIELDS.find(
+    (candidate) => candidate.left === path || candidate.right === path,
+  )
+  if (!row) return null
+  return observed[row.left === path ? row.right : row.left] ?? null
+}
+
 /** MOCK-ONLY: confidence.yaml (T-7) is the real source. */
 function mockConfidence(seedHash: number, action: FixAction): number {
   const base = action.kind === 'evidence_only' ? 0.52 : 0.68
   const spread = action.kind === 'evidence_only' ? 0.33 : 0.31
   const raw = base + ((seedHash >>> 7) % 1000) / 1000 * spread
   return Math.round(raw * 100) / 100
+}
+
+/** MOCK-ONLY: `recon.apply.AUTO_APPLY_CONFIDENCE_FLOOR`, restated. */
+const CONFIDENCE_FLOOR = 0.95
+
+/**
+ * MOCK-ONLY: R24's gate, re-derived from what this module can see.
+ *
+ * Mirrors `recon.apply.auto_apply_decision` in structure, including its
+ * SHORT-CIRCUIT: a sensitive proposal is refused with exactly one check
+ * (`not_sensitive`), before its confidence has been read at all, because §6's
+ * classification wins over confidence and reading the number first would imply
+ * otherwise. The two conditions this module has no data for are named as
+ * unverifiable in their own detail rather than being silently passed.
+ */
+function mockGate(proposal: Proposal): AutoApplyVerdict {
+  const proposalId = Number(proposal.id.replace(/\D/g, '').slice(0, 12)) || 0
+  const paths = Object.keys(
+    (proposal.action.set as Record<string, unknown> | undefined) ?? {},
+  )
+  const refuse = (
+    reason: string,
+    detail: string,
+    checks: AutoApplyCheck[],
+  ): AutoApplyVerdict => ({
+    proposal_id: proposalId,
+    allowed: false,
+    reason,
+    detail,
+    checks,
+  })
+
+  if (proposal.sensitive || proposal.status === 'sensitive_hold') {
+    return refuse(
+      'sensitive',
+      `${paths[0] ?? 'the target field'} is classified sensitive by ` +
+        'invariant-contract §6; auto-apply is forbidden at any confidence',
+      [
+        {
+          check: 'not_sensitive',
+          passed: false,
+          detail:
+            `target ${paths[0] ?? 'unknown'} is on §6's sensitive list, so the gate ` +
+            'stops here — the confidence of this proposal was never read',
+        },
+      ],
+    )
+  }
+
+  const eligible = paths.filter((path) => AUTO_APPLY_ELIGIBLE.has(path))
+  const checks: AutoApplyCheck[] = [
+    {
+      check: 'not_sensitive',
+      passed: true,
+      detail: `no path in ${JSON.stringify(paths)} is classified sensitive by §6`,
+    },
+    {
+      check: 'writes_a_field',
+      passed: paths.length > 0,
+      detail:
+        paths.length > 0
+          ? `the action writes ${JSON.stringify(paths)}`
+          : 'the action is {"set": {}} — an evidence-only proposal writes no field',
+    },
+    {
+      check: 'target_on_allowlist',
+      passed: paths.length > 0 && eligible.length === paths.length,
+      detail:
+        paths.length > 0 && eligible.length === paths.length
+          ? `every target is on §6's AUTO_APPLY_ELIGIBLE allowlist`
+          : `${JSON.stringify(
+              paths.filter((path) => !AUTO_APPLY_ELIGIBLE.has(path)),
+            )} is not on §6's AUTO_APPLY_ELIGIBLE allowlist`,
+    },
+    {
+      check: 'confidence_floor',
+      passed: proposal.confidence >= CONFIDENCE_FLOOR,
+      detail:
+        `confidence ${proposal.confidence.toFixed(4)} ` +
+        `${proposal.confidence >= CONFIDENCE_FLOOR ? '>=' : '<'} ${CONFIDENCE_FLOOR} (R24)`,
+    },
+    {
+      check: 'status_appliable',
+      passed: proposal.status === 'approved',
+      detail:
+        `status is '${proposal.status}'; apply_writer may only move 'approved' -> ` +
+        "'applied' (SQLSTATE KS004)",
+    },
+    {
+      check: 'complete_evidence',
+      passed: proposal.evidence.schema === 'keystone.evidence.v1',
+      detail:
+        proposal.evidence.schema === 'keystone.evidence.v1'
+          ? 'the evidence packet carries the committed schema. MOCK: the service also ' +
+            'checks every required member, which this stand-in does not model'
+          : 'the evidence packet is not keystone.evidence.v1',
+    },
+  ]
+  const failed = checks.filter((check) => !check.passed)
+  if (failed.length === 0) {
+    return {
+      proposal_id: proposalId,
+      allowed: true,
+      reason: 'allowed',
+      detail: 'every condition R24 names held',
+      checks,
+    }
+  }
+  return refuse(failed[0].check, failed[0].detail, checks)
+}
+
+/**
+ * MOCK-ONLY: one `proposal_events` row in `review.py::_event_row`'s shape —
+ * `event_id` / `txid` as STRINGS (they are `bigint` columns and a JSON number is
+ * an IEEE double in every browser), digests rather than the before/after
+ * documents, and a fixed clock rather than `Date.now()`.
+ *
+ * The digests are MOCK-ONLY placeholders derived from the id: they are the right
+ * length and stable per row, and nothing in the dashboard compares them to
+ * anything, but they are not sha256 of a real canonical record. What they stand
+ * in for is the SIGNAL — a non-null `before_digest` means a before-image exists,
+ * which is what `reversibility()` reads.
+ */
+function mockEvent(
+  event: 'applied' | 'rolled_back',
+  index: number,
+  actor: string,
+  targetPath: string | null,
+): ProposalEvent {
+  const digest = (salt: string) =>
+    fnv1a(`${salt}:${event}:${index}`).toString(16).padStart(8, '0').repeat(8)
+  return {
+    event_id: String(1000 + index),
+    event,
+    actor,
+    ts: event === 'applied' ? '2026-08-22T11:00:00Z' : '2026-08-22T11:42:00Z',
+    txid: String(55000 + index),
+    canonical_id: null,
+    // Both legs capture what they overwrote: the apply captured the row before
+    // the fix, the reversal captured the row it restored over. A null here would
+    // mean that write has nothing to restore from.
+    before_digest: digest('before'),
+    after_digest: digest('after'),
+    // `text`, comma-joined by `string_agg` in migration 0008 — not a list.
+    differing_paths: targetPath,
+  }
 }
 
 const RUN_IDS = ['run-0001', 'run-0002', 'run-0003'] as const
@@ -180,6 +381,9 @@ export async function buildMockDataset(
       entity_refs: entry.entity_refs,
       sources: entry.sources_involved as SourceId[],
       disagreeing_fields: entry.disagreeing_fields,
+      // A9, and NOT invented: the golden entry's own observed values, on the
+      // conflict row where `review.py::_conflict_row` puts them.
+      observed_values: entry.observed_values,
       status: entry.oscillating ? 'escalated:oscillation' : 'open',
       first_seen_run: RUN_IDS[fnv1a(`first:${fingerprint}`) % RUN_IDS.length],
       last_seen_run: 'run-0003',
@@ -194,6 +398,19 @@ export async function buildMockDataset(
     const decided = status !== 'pending' && status !== 'sensitive_hold'
     const proposalHash = fnv1a(`proposal:${fingerprint}`)
 
+    // A10: the committed action vocabulary. Migration 0007's
+    // `ck_proposals_action_vocabulary` admits `{"set": {<path>: <value>, …}}`
+    // and NOTHING else, with `{"set": {}}` the evidence-only proposal.
+    const setPayload: Record<string, unknown> =
+      action.kind === 'set_field'
+        ? {
+            [action.target_path]: mockFixValue(
+              action.target_path,
+              entry.observed_values,
+            ),
+          }
+        : {}
+
     proposals.push({
       // Derived from the SECOND half of the fingerprint so it is stable,
       // opaque, and as collision-free as the fingerprint itself.
@@ -201,21 +418,48 @@ export async function buildMockDataset(
       conflict_id: conflictId,
       fingerprint,
       action: {
+        set: setPayload,
+        // MOCK-ONLY DIVERGENCE, and the one this module cannot currently close:
+        // the real `action` has EXACTLY ONE top-level key, so these three
+        // siblings would be REFUSED by `ck_proposals_action_vocabulary`. They
+        // survive only because `src/routes/ProposalDetail.test.tsx:182` asserts
+        // `proposal.action.kind`, and this ticket may not edit an existing
+        // test. Nothing the dashboard renders reads them: `writePaths()` reads
+        // `action.set` alone, and `src/routes/serviceShape.test.tsx` drives
+        // every action-dependent surface with `{"set": …}`-only bodies.
         kind: action.kind,
-        ...(action.kind === 'set_field'
-          ? { target_path: action.target_path }
-          : {}),
         conflict_type: entry.type,
         rule_id: entry.rule_id,
       },
       confidence: mockConfidence(fnv1a(`confidence:${fingerprint}`), action),
       evidence: {
+        schema: 'keystone.evidence.v1',
         rule_id: entry.rule_id,
         detection_generation: 3,
         sources_involved: entry.sources_involved,
         entity_refs: entry.entity_refs,
         disagreeing_fields: entry.disagreeing_fields,
-        observed_values: entry.observed_values,
+        // A9: `observed_values` is NESTED under `conflict`, which is where
+        // `recon/reconciler.py::EvidencePacket.as_dict` puts it. It used to sit
+        // at the top level of `evidence` here — a key nothing in the service
+        // writes — so the conflict detail read a key that only ever existed in
+        // this file, and showed "—" against the real service on every row.
+        conflict: {
+          type: entry.type,
+          rule_id: entry.rule_id,
+          fingerprint,
+          entity_refs: entry.entity_refs,
+          sources_involved: entry.sources_involved,
+          disagreeing_fields: entry.disagreeing_fields,
+          observed_values: entry.observed_values,
+        },
+        fix: {
+          conflict_type: entry.type,
+          target_path:
+            action.kind === 'set_field' ? action.target_path : null,
+          container: null,
+          action: { set: setPayload },
+        },
       },
       rationale:
         proposalHash % 5 === 0
@@ -232,6 +476,37 @@ export async function buildMockDataset(
       created_run: 'run-0003',
       decided_by: decided ? 'reviewer@keystone.example' : null,
       decided_at: decided ? '2026-08-22T09:15:00Z' : null,
+      // MOCK-ONLY: the reversal ledger a proposal in this status MUST have. An
+      // `applied` proposal with an empty ledger is not a thing the schema can
+      // produce — migration 0001's `entities` trigger refuses a canonical write
+      // without a same-transaction `proposal_events` row — so seeding it empty
+      // would make the mock demonstrate an impossible state.
+      events:
+        status === 'applied'
+          ? [
+              mockEvent(
+                'applied',
+                proposalHash % 900,
+                'system:apply',
+                action.kind === 'set_field' ? action.target_path : null,
+              ),
+            ]
+          : status === 'rolled_back'
+            ? [
+                mockEvent(
+                  'applied',
+                  proposalHash % 900,
+                  'system:apply',
+                  action.kind === 'set_field' ? action.target_path : null,
+                ),
+                mockEvent(
+                  'rolled_back',
+                  (proposalHash % 900) + 1,
+                  'reviewer@keystone.example',
+                  action.kind === 'set_field' ? action.target_path : null,
+                ),
+              ]
+            : [],
     })
   }
 
@@ -268,6 +543,23 @@ function notFound(what: string, id: string): ApiError {
     title: 'Not Found',
     status: 404,
     detail: `No ${what} with id ${id}`,
+  })
+}
+
+/**
+ * The 409 `review.py::apply_endpoint` answers a refused `?auto=true` with —
+ * problem document plus the whole decision on an `auto_apply` member.
+ */
+function autoApplyRefused(
+  proposalId: string,
+  verdict: AutoApplyVerdict,
+): ApiError {
+  return new ApiError({
+    type: 'https://keystone.example/problems/auto-apply-refused',
+    title: 'auto-apply refused',
+    status: 409,
+    detail: `R24's gate refused proposal ${proposalId}: ${verdict.detail}`,
+    auto_apply: verdict,
   })
 }
 
@@ -331,7 +623,12 @@ export function createMockClient(
       const data = await ready()
       const found = data.proposalById.get(id)
       if (!found) throw notFound('proposal', id)
-      return found
+      // The real `GET /api/proposals/{id}` computes R24's verdict on every read
+      // (`review.py::get_proposal` -> `apply.evaluate_auto_apply`). Attaching it
+      // here too is what keeps the gate panel — and the reason a proposal is not
+      // auto-appliable — reachable in the mock demo instead of only against a
+      // live service. MOCK-ONLY: the verdict is `mockGate`, not the real one.
+      return { ...found, auto_apply: mockGate(found) }
     },
 
     async approveProposal(id: string): Promise<Proposal> {
@@ -342,10 +639,37 @@ export function createMockClient(
       return decide(await ready(), id, 'rejected')
     },
 
-    async applyProposal(id: string): Promise<Proposal> {
+    /**
+     * The two writes, kept as two paths — the same shape as the service.
+     *
+     * `'auto'` runs `mockGate` FIRST and refuses with the 409 document that
+     * carries the whole decision. `'manual'` keeps exactly the guards this
+     * method always had. A mock in which `?auto=true` simply succeeded would be
+     * inventing R24's safety property rather than standing in for it.
+     */
+    async applyProposal(id: string, mode: ApplyMode = 'manual'): Promise<Proposal> {
       const data = await ready()
       const current = data.proposalById.get(id)
       if (!current) throw notFound('proposal', id)
+
+      if (mode === 'auto') {
+        const verdict = mockGate(current)
+        if (!verdict.allowed) throw autoApplyRefused(id, verdict)
+        return decide(
+          data,
+          id,
+          'applied',
+          mockEvent(
+            'applied',
+            fnv1a(`event:${id}`) % 900,
+            'system:auto-apply',
+            Object.keys(
+              (current.action.set as Record<string, unknown> | undefined) ?? {},
+            )[0] ?? null,
+          ),
+        )
+      }
+
       // Mirrors the service's guard: apply is approved-only, and a sensitive
       // proposal can never reach the apply function (R15/R24).
       if (current.sensitive || current.status === 'sensitive_hold') {
@@ -365,7 +689,84 @@ export function createMockClient(
           detail: 'Only an approved proposal can be applied.',
         })
       }
-      return decide(data, id, 'applied')
+      return decide(
+        data,
+        id,
+        'applied',
+        // `system:apply`, not `system:auto-apply` — the ledger records WHICH
+        // authority took the write, which is the whole reason the actor column
+        // is worth showing on the reviewer surface.
+        mockEvent(
+          'applied',
+          fnv1a(`event:${id}`) % 900,
+          'system:apply',
+          Object.keys(
+            (current.action.set as Record<string, unknown> | undefined) ?? {},
+          )[0] ?? null,
+        ),
+      )
+    },
+
+    /**
+     * `POST /api/proposals/{id}/rollback` — the reversal leg.
+     *
+     * `apply_writer` may only move `applied` -> `rolled_back` (SQLSTATE KS004),
+     * so anything else is the 409 the service would answer, not a silent no-op.
+     */
+    async rollbackProposal(id: string): Promise<Proposal | null> {
+      const data = await ready()
+      const current = data.proposalById.get(id)
+      if (!current) throw notFound('proposal', id)
+      if (current.status !== 'applied') {
+        throw new ApiError({
+          type: 'https://keystone.example/problems/apply-not-applied',
+          title: 'Conflict',
+          status: 409,
+          detail:
+            `proposal ${id} is '${current.status}': only an 'applied' proposal has a ` +
+            'write to reverse (SQLSTATE KS004).',
+        })
+      }
+      const applied = (current.events ?? []).find(
+        (event) => event.event === 'applied',
+      )
+      const rolled = decide(
+        data,
+        id,
+        'rolled_back',
+        mockEvent(
+          'rolled_back',
+          (fnv1a(`event:${id}`) % 900) + 1,
+          'reviewer@keystone.example',
+          Object.keys(
+            (current.action.set as Record<string, unknown> | undefined) ?? {},
+          )[0] ?? null,
+        ),
+      )
+      // The 200 body is the proposal row PLUS a `rollback` member —
+      // `RollbackResult.as_dict`. Omitting it here made the mock a stand-in that
+      // silently dropped the one claim the reversal beat is about
+      // (`byte_identical`), and `e2e/apply.spec.ts` caught it: the receipt
+      // rendered against the live service and never against the mock.
+      //
+      // The cast is deliberate: `rollback` is not a `proposals` column and rides
+      // on exactly one response, which is why `rollbackReceipt()` reads it off
+      // `unknown` rather than off a widened `Proposal`.
+      return {
+        ...rolled,
+        rollback: {
+          proposal_id: id,
+          canonical_id: applied?.canonical_id ?? null,
+          event_id: (fnv1a(`event:${id}`) % 900) + 1,
+          applied_before_digest: applied?.before_digest ?? null,
+          // `rollback_proposal` copies `proposal_events.before` back column to
+          // column inside the database, so the restored bytes ARE the captured
+          // bytes — the mock states the same identity rather than inventing a
+          // second digest that would imply a comparison it never made.
+          restored_digest: applied?.before_digest ?? null,
+          byte_identical: true,
+        },
+      } as Proposal
     },
 
     async getScorecard(): Promise<Scorecard> {
@@ -397,10 +798,18 @@ export function createMockClient(
   }
 }
 
+/**
+ * Move a proposal to `status`, optionally APPENDING a reversal-ledger row.
+ *
+ * The event is append-only, exactly as `proposal_events` is: a rollback records
+ * a second row and never rewrites the `applied` one, because the ledger's value
+ * is that it holds both legs of the guarded path.
+ */
 function decide(
   data: MockDataset,
   id: string,
   status: ProposalStatus,
+  event?: ProposalEvent,
 ): Proposal {
   const current = data.proposalById.get(id)
   if (!current) throw notFound('proposal', id)
@@ -409,6 +818,7 @@ function decide(
     status,
     decided_by: 'reviewer@keystone.example',
     decided_at: '2026-08-22T10:00:00Z',
+    events: event ? [...(current.events ?? []), event] : current.events,
   }
   data.proposalById.set(id, updated)
   const index = data.proposals.findIndex((p) => p.id === id)

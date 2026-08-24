@@ -28,8 +28,11 @@ Per conflict, in this sequence:
    classification wins over confidence because the classifier has no confidence
    parameter to be overridden by;
 5. **dedup / oscillation** -- R16, below;
-6. **INSERT** one proposal, then one ``audit_log`` row through the redacting
-   chokepoint ``recon.logging.insert_audit_row``.
+6. **INSERT** one proposal, and one ``audit_log`` row per proposal through the
+   redacting chokepoint ``recon.logging.insert_audit_row`` -- in the run loop
+   the rows are built per proposal and written by its many-row form
+   ``recon.logging.insert_audit_rows`` in one statement after the loop, which is
+   the same sink, the same redaction and the same order (see :func:`reconcile`).
 
 Steps 3 and 4 are in DESIGN's order, but note that swapping them would change
 nothing: that is the point. The hold does not depend on when the score is
@@ -78,15 +81,26 @@ the scan decides; without it the run falls back to the ``conflicts.oscillating``
 column and, if that is unset too, reports ``OSCILLATION_NO_INPUT`` -- "nobody
 knows" -- rather than ``False``.
 
-The LLM is a seam, and it is empty in this ticket
---------------------------------------------------
-T-7's non-goals say "no LLM calls". :func:`reconcile` therefore takes a
-``rationale`` callable defaulting to :func:`no_rationale`, which returns
-``None``. T-8 wires ``recon.llm.generate_rationale`` into that parameter without
-touching a line of the proposer. The seam is wrapped in ``try/except`` and a
-failing hook is logged and ignored, because the brief's rule is absolute: if the
-rationale fails or the cap is hit, **the proposal still lands, with rationale
-null**. ``tests/reconciler`` asserts that with a hook that raises.
+The LLM is a seam, and it is wired at exactly one entry point
+-------------------------------------------------------------
+:func:`reconcile` takes a ``rationale`` callable defaulting to
+:func:`no_rationale`, which returns ``None``. The seam is wrapped in
+``try/except`` and a failing hook is logged and ignored, because the brief's rule
+is absolute: if the rationale fails or the cap is hit, **the proposal still
+lands, with rationale null**. ``tests/reconciler`` asserts that with a hook that
+raises.
+
+The seam was left empty on every path, and that was the defect.
+``recon.llm.generate_rationale`` -- and behind it the whole R17
+reserve -> call -> settle chain and its spend cap -- had **no non-test caller**:
+:func:`reconcile` was only ever invoked with the default. :func:`reconcile_job`,
+the body of ``POST /internal/reconcile``, now asks :func:`rationale_hook_for`,
+which returns :func:`no_rationale` itself under the default
+``LLM_PROVIDER=mock`` (so every graded path is byte-identical) and a real
+``generate_rationale`` hook when the environment names a live provider. The
+rationale is still text and only text: it is produced *after* detection, scoring
+and classification are finished, and its value reaches nothing but one nullable
+column.
 
 Write boundary
 --------------
@@ -125,7 +139,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from sqlalchemy import Connection, text
 
@@ -140,8 +154,9 @@ from recon.confidence import (
     partial_evidence_reasons,
     score,
 )
+from recon.config import get_settings
 from recon.db import ROLE_RECON_WRITER, role_connection
-from recon.logging import get_logger, insert_audit_row
+from recon.logging import get_logger, insert_audit_row, insert_audit_rows
 from recon.privacy import canonical_json
 from recon.reference import (
     AUTO_APPLY_ELIGIBLE,
@@ -157,12 +172,16 @@ from recon.reference import (
 from recon.resolve import SURVIVED_PATHS
 from recon.sensitive import STATUS_PENDING, STATUS_SENSITIVE_HOLD, Classification, classify
 
+if TYPE_CHECKING:  # `recon.llm` is imported lazily; this is the annotation only
+    from recon.llm import RationaleProvider
+
 __all__ = [
     "AUDIT_ACTOR",
     "CURRENT_GENERATION",
     "ESCALATION_OSCILLATION",
     "LINEAGE_GENERATIONS_REQUIRED",
     "NESTED_FIX_TARGETS",
+    "RATIONALE_KEY_PREFIX",
     "SKIP_FINGERPRINT",
     "SKIP_OSCILLATION",
     "ConflictRow",
@@ -174,6 +193,8 @@ __all__ = [
     "fix_action",
     "lineage_generation_count",
     "no_rationale",
+    "rationale_hook_for",
+    "rationale_prompt",
     "reconcile",
     "reconcile_job",
     "run_once",
@@ -1295,7 +1316,7 @@ def build_packet(
 
 
 # =====================================================================================
-# the rationale seam (empty in T-7 -- see the module docstring)
+# the rationale seam
 # =====================================================================================
 RationaleHook = Callable[[EvidencePacket], str | None]
 
@@ -1303,12 +1324,131 @@ RationaleHook = Callable[[EvidencePacket], str | None]
 def no_rationale(packet: EvidencePacket) -> None:
     """The default hook: no LLM call, rationale ``NULL``.
 
-    T-7's non-goals are "no LLM calls". T-8 passes
-    ``recon.llm.generate_rationale`` in here; nothing else in this module changes,
-    and the proposal is identical either way except for one nullable text column.
+    Still the default of :func:`reconcile`, and still what every graded path
+    gets: ``recon.suite`` and ``run_once`` call ``reconcile()`` with no hook, so
+    the suite makes no LLM call and reserves nothing. The wired production
+    entrypoint is :func:`reconcile_job`, which asks
+    :func:`rationale_hook_for` -- and that returns *this function itself* unless
+    the environment names a live provider.
     """
     del packet
     return None
+
+
+#: Prefix of the ``budget_reservations`` idempotency key a reconciler rationale
+#: takes. The key is ``<prefix>:<run_id>:<fingerprint>``: derived, never random,
+#: so a re-fired run under the same run id replays the reservation (SQLSTATE
+#: ``23505`` -> ``recon.llm`` returns the replayed no-op) instead of paying twice.
+RATIONALE_KEY_PREFIX: Final = "reconcile-rationale"
+
+
+def rationale_prompt(packet: EvidencePacket) -> str:
+    """The evidence packet, as the prompt text the model is asked to explain.
+
+    ``canonical_json`` and not ``repr``/f-strings: the same
+    ``sort_keys``/``separators`` spelling the proposal's ``evidence`` column
+    uses, so the prompt for a given packet is byte-stable and the reservation's
+    worst-case input-token bound is computed from a stable string.
+
+    This carries personal data, which is the documented contract of
+    :class:`recon.llm.RationaleRequest` (``prompt`` does, ``subject`` must not).
+    ``subject`` is the conflict fingerprint -- an identifier, and the value that
+    lands unredacted in ``audit_log.subject``.
+    """
+    return canonical_json(packet.as_dict())
+
+
+def rationale_hook_for(run_id: str, *, provider: RationaleProvider | None = None) -> RationaleHook:
+    """The production rationale hook for ``run_id``, or :func:`no_rationale`.
+
+    **This is the wiring that did not exist.** ``recon.llm``'s
+    reserve -> call -> settle chain had no non-test caller at all: the reconciler
+    was only ever invoked with the default hook, so the R17 spend cap was armed,
+    correct, and never once exercised by the service. The endpoint is bound to
+    :func:`reconcile_job`, and :func:`reconcile_job` asks this function.
+
+    Two behaviours, and the first one is the graded one
+    ---------------------------------------------------
+    ``LLM_PROVIDER=mock`` (the default, and every graded path)
+        returns :func:`no_rationale` **itself** -- the identical object, not an
+        equivalent wrapper. No provider is built, no reservation is taken, no
+        prompt is rendered, and the proposals a run writes are byte-identical to
+        what it wrote before this function existed. That is the determinism
+        requirement, and identity rather than equivalence is how it is checked.
+    ``LLM_PROVIDER=anthropic``
+        returns a hook that calls :func:`recon.llm.generate_rationale`, which
+        reserves the worst-case cost **before** the call and settles the actual
+        cost **after** it. The cap is therefore real money on a real ledger.
+
+    What the hook may and may not do
+    --------------------------------
+    It is handed a packet whose conflict was already detected by ``rules/*.sql``,
+    whose confidence was already computed by ``recon.confidence.score`` and whose
+    sensitivity was already decided by ``recon.sensitive.classify``. Its return
+    value reaches exactly one place: the ``rationale`` text column of the
+    proposal, plus the ``rationale_attached`` flag on the audit row. It cannot
+    detect, cannot score, cannot classify and cannot write -- not by convention
+    but by position: :func:`reconcile` calls it after :func:`build_packet` has
+    returned and discards everything about it except a ``str | None``.
+
+    A provider failure is swallowed
+    -------------------------------
+    :func:`recon.llm.generate_rationale` is documented never to raise and returns
+    ``text=None`` with a status for a cap hit, a provider error, a halted scope
+    or an internal fault. This hook turns all of those into ``None``, which
+    :func:`reconcile` records as ``rationale NULL`` on a proposal that lands
+    anyway. Building the provider is guarded for the same reason: a deployment
+    that sets ``LLM_PROVIDER=anthropic`` and forgets ``ANTHROPIC_API_KEY`` gets a
+    logged warning and a reconcile run with no rationales, not a 500 on the cron.
+    """
+    from recon.llm import ProviderError, RationaleRequest, build_provider, generate_rationale
+
+    configured = (get_settings().llm_provider or "mock").strip().lower()
+    if configured == "mock":
+        return no_rationale
+
+    if provider is None:
+        try:
+            provider = build_provider()
+        except ProviderError as exc:
+            log.warning(
+                "reconciler.rationale_provider_unavailable",
+                run_id=run_id,
+                error=f"{type(exc).__name__}: {exc}",
+                detail=(
+                    "LLM_PROVIDER names a live provider that could not be built; "
+                    "this run proposes with rationale NULL rather than failing"
+                ),
+            )
+            return no_rationale
+
+    active = provider
+
+    def hook(packet: EvidencePacket) -> str | None:
+        fingerprint = packet.conflict.fingerprint
+        outcome = generate_rationale(
+            RationaleRequest(subject=fingerprint, prompt=rationale_prompt(packet)),
+            run_id=run_id,
+            idempotency_key=f"{RATIONALE_KEY_PREFIX}:{run_id}:{fingerprint}",
+            provider=active,
+        )
+        if not outcome.ok or not outcome.text:
+            log.info(
+                "reconciler.rationale_unavailable",
+                fingerprint=fingerprint,
+                status=outcome.status,
+                sqlstate=outcome.sqlstate,
+                detail="the proposal lands with rationale NULL; this is not a failure",
+            )
+            return None
+        return outcome.text
+
+    log.info(
+        "reconciler.rationale_hook_wired",
+        run_id=run_id,
+        version=getattr(active, "model", "unknown"),
+    )
+    return hook
 
 
 # =====================================================================================
@@ -1435,6 +1575,17 @@ def reconcile(
     by_type: dict[str, int] = {}
     escalated = 0
     evidence_only = 0
+    # R18's rows for this run, built in the loop and written in ONE statement
+    # after it. See `recon.logging.insert_audit_rows`: a round trip per proposal
+    # is not merely N round trips, it is N round trips each of which lands
+    # between two slices of this loop's own Python work, so the backend idles
+    # and the next statement pays a wake-up. Same rows, same order, same
+    # transaction, same chokepoint -- only the number of statements changes.
+    audit_rows: list[dict[str, Any]] = []
+    # A mutable set, not a rebound frozenset. `open_fingerprints | {fp}` copied
+    # the whole set once per proposal -- O(n^2) over 3,050 of them for a
+    # membership test that `.add()` maintains in place.
+    open_fingerprints = set(open_fingerprints)
 
     for conflict in conflicts:
         oscillating, source = oscillation_state(
@@ -1475,7 +1626,9 @@ def reconcile(
 
         text_rationale = _rationale(rationale, packet)
         proposal_id = _insert_proposal(conn, packet, rationale=text_rationale)
-        _audit_proposal(conn, packet, proposal_id=proposal_id, rationale=text_rationale)
+        audit_rows.append(
+            _proposal_audit_row(packet, proposal_id=proposal_id, rationale=text_rationale)
+        )
 
         by_type[conflict.type] = by_type.get(conflict.type, 0) + 1
         if packet.classification.evidence_only:
@@ -1483,7 +1636,7 @@ def reconcile(
         # Keep the in-process view of "already proposed" in step with the table,
         # so a duplicate fingerprint inside ONE run is caught by the control and
         # not only by the unique index.
-        open_fingerprints = open_fingerprints | {conflict.fingerprint}
+        open_fingerprints.add(conflict.fingerprint)
         prior_actions.setdefault(conflict.fingerprint, []).append(canonical_json(packet.fix.action))
         outcomes.append(
             ProposalOutcome(
@@ -1497,6 +1650,13 @@ def reconcile(
                 rationale_attached=text_rationale is not None,
             )
         )
+
+    # One statement for every proposal.created row, in the order the loop built
+    # them -- so `audit_log` ids still follow the conflict order and the FIRST
+    # proposal.created row is still the first proposal. It lands before the
+    # run-summary row below and inside the caller's transaction, exactly as the
+    # per-proposal writes did.
+    insert_audit_rows(conn, audit_rows)
 
     report = ReconcileReport(
         run_id=resolved_run_id,
@@ -1624,14 +1784,22 @@ def _insert_proposal(conn: Connection, packet: EvidencePacket, *, rationale: str
     return int(row.id)
 
 
-def _audit_proposal(
-    conn: Connection, packet: EvidencePacket, *, proposal_id: int, rationale: str | None
-) -> None:
-    """R18: the proposal, its confidence, and the reviewer-facing facts.
+def _proposal_audit_row(
+    packet: EvidencePacket, *, proposal_id: int, rationale: str | None
+) -> dict[str, Any]:
+    """R18's row for one proposal, as keywords -- built, not yet written.
 
-    Routed through ``recon.logging.insert_audit_row``, the redacting chokepoint,
-    so ``actor``/``action``/``subject`` and the body all pass the committed
-    redactor -- and so SQLSTATE ``KS003`` sees a ``^system:`` actor.
+    Split out from :func:`_audit_proposal` so :func:`reconcile` can build 3,050
+    of these inside its loop and hand the whole sequence to
+    :func:`recon.logging.insert_audit_rows` **once**, instead of paying a
+    client/server round trip per proposal. Nothing about the row changes: same
+    actor, same action, same subject, same body, same chokepoint, same order.
+    See :func:`recon.logging.insert_audit_rows` for the measurement that made
+    the split worth making.
+
+    It deliberately does no redaction and touches no connection -- redaction is
+    :func:`recon.logging.audit_row`'s job at the moment of writing, and keeping
+    it there is what stops this from becoming a second, unrouted sink.
 
     **Every key below is on ``recon.privacy.SAFE_KEYS``, and that is not a
     coincidence -- it is the constraint.** The redactor is default-deny at all
@@ -1662,12 +1830,11 @@ def _audit_proposal(
     terms = " ".join(
         f"{term.name}={term.value}*{term.weight}" for term in score.terms if term.contribution != 0
     )
-    insert_audit_row(
-        conn,
-        actor=AUDIT_ACTOR,
-        action="proposal.created",
-        subject=packet.conflict.fingerprint,
-        body={
+    return {
+        "actor": AUDIT_ACTOR,
+        "action": "proposal.created",
+        "subject": packet.conflict.fingerprint,
+        "body": {
             "proposal_id": proposal_id,
             "conflict_id": packet.conflict.id,
             "fingerprint": packet.conflict.fingerprint,
@@ -1689,6 +1856,26 @@ def _audit_proposal(
             "created_run": packet.run_id,
             "outcome": "rationale_attached" if rationale is not None else "rationale_null",
         },
+    }
+
+
+def _audit_proposal(
+    conn: Connection, packet: EvidencePacket, *, proposal_id: int, rationale: str | None
+) -> None:
+    """Write one proposal's R18 audit row immediately.
+
+    :func:`_proposal_audit_row` builds it and
+    ``recon.logging.insert_audit_row`` -- the redacting chokepoint -- writes it,
+    so ``actor``/``action``/``subject`` and the body all pass the committed
+    redactor and SQLSTATE ``KS003`` sees a ``^system:`` actor.
+
+    :func:`reconcile` no longer calls this: it batches the same rows through
+    ``recon.logging.insert_audit_rows``, which is the same statement and the
+    same builder. This one-row form stays because a caller that has a single
+    proposal to record should not have to build a list to record it.
+    """
+    insert_audit_row(
+        conn, **_proposal_audit_row(packet, proposal_id=proposal_id, rationale=rationale)
     )
 
 
@@ -1708,25 +1895,31 @@ def _derive_run_id(conflicts: Sequence[ConflictRow]) -> str:
 def reconcile_job(run_id: str) -> dict[str, Any]:
     """``JobHandler`` for ``POST /internal/reconcile`` (R13's scheduled trigger, R19).
 
-    **Provided because the endpoint currently runs nothing.**
-    ``recon.app.create_app`` registers a handler for ``JOB_SYNC`` and no other, so
-    a correctly authenticated ``POST /internal/reconcile`` claims (consumes) the
-    run id, logs ``internal.handler_unbound`` and returns HTTP 200
-    ``{"status": "started", "handler": "unbound"}`` -- a scheduled trigger
-    reporting success for work it did not do, and a retry with the same run id
-    then returns ``"replayed"``. Nothing in the deployed service calls the
-    reconciler at all; only ``recon.suite.mirror`` does.
-
-    ``recon/app.py`` and ``recon/api/`` belong to another ticket, so the binding
-    is not made here. This function is the whole of what that ticket needs::
-
-        from recon.reconciler import reconcile_job
-        register_job_handler(JOB_RECONCILE, reconcile_job, app=app)
+    **Bound now.** ``recon.app.create_app`` registers this for ``JOB_RECONCILE``
+    alongside ``sync_job``. It used to register a handler for ``JOB_SYNC`` and no
+    other, so a correctly authenticated ``POST /internal/reconcile`` claimed
+    (consumed) the run id, logged ``internal.handler_unbound`` and returned HTTP
+    200 ``{"status": "started", "handler": "unbound"}`` -- a scheduled trigger
+    reporting success for work it did not do, with a real hourly cron
+    (``infra/render.yaml``) pointed at it, and a retry under the same run id then
+    answering ``"replayed"``. Nothing in the deployed service called the
+    reconciler at all; only ``recon.suite.mirror`` did.
 
     It takes the trigger's ``run_id`` and threads it into the run, so the audit
-    trail ties the proposals to the trigger claim rather than to a derived id.
+    trail ties the proposals to the trigger claim rather than to a derived id --
+    and so the ``run:<run_id>`` budget scope the trigger provisioned
+    (``recon.api.internal._trigger``) is the scope any rationale reserves
+    against. That is the second half of the wiring: :func:`rationale_hook_for`
+    returns :func:`no_rationale` under the default ``LLM_PROVIDER=mock``, so the
+    graded behaviour is unchanged, and returns a real
+    ``recon.llm.generate_rationale`` hook when the environment names a live
+    provider -- which is the only way that reserve/call/settle chain is ever
+    reached outside a test.
+
+    :func:`run_once` deliberately does **not** ask for a hook: it is
+    ``recon.suite``'s entrypoint and the graded pass makes no model call.
     """
-    return dict(reconcile(run_id=run_id).as_dict())
+    return dict(reconcile(run_id=run_id, rationale=rationale_hook_for(run_id)).as_dict())
 
 
 def run_once() -> ReconcileReport:

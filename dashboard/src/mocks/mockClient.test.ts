@@ -9,6 +9,8 @@ import { buildMockDataset, createMockClient, fixTarget, mockClient } from './moc
 import goldenSummary from './seed/golden-summary.json'
 import provenance from './seed/provenance.json'
 import { CONFLICT_TYPES, SENSITIVE_FIELDS } from '../lib/contract'
+import { ApiError } from '../lib/api'
+import { rollbackReceipt } from '../lib/proposal'
 import {
   gradeConflict,
   makeClient,
@@ -304,4 +306,106 @@ describe('the full golden seed', () => {
       expect(page.total, `${type} count`).toBe(card.conflicts.by_type[type])
     }
   }, 30_000)
+})
+
+/**
+ * The mock's fidelity to the SERVICE on the two R24 write paths.
+ *
+ * These exist because a divergence here is invisible: the mock's apply already
+ * returned 200 and the dashboard already re-rendered, so a mock that ignored
+ * `?auto` or dropped the reversal receipt looked exactly like a working one. Both
+ * defects were real. The first was designed out (`mockGate`); the second shipped
+ * and was caught by `e2e/apply.spec.ts`, which is later and more expensive than
+ * here.
+ */
+describe('mock client — the two apply paths and the reversal (R24)', () => {
+  const approvedGrade = async () => {
+    const client = makeClient(Array.from({ length: 24 }, (_, i) => gradeConflict(i)))
+    const page = await client.listProposals({ status: 'pending', page_size: 1 })
+    const approved = await client.approveProposal(page.items[0].id)
+    return { client, approved }
+  }
+
+  it('runs a gate on ?auto and refuses with the 409 the service sends', async () => {
+    const { client, approved } = await approvedGrade()
+    const verdict = (await client.getProposal(approved.id)).auto_apply
+    expect(verdict, 'the detail read must carry R24 verdict, as get_proposal does')
+      .toBeDefined()
+
+    if (verdict!.allowed) {
+      // The gate passed, so the write must land — and via the auto actor.
+      const applied = await client.applyProposal(approved.id, 'auto')
+      expect(applied.status).toBe('applied')
+      expect(applied.events?.at(-1)?.actor).toBe('system:auto-apply')
+    } else {
+      const error = await client
+        .applyProposal(approved.id, 'auto')
+        .catch((e: unknown) => e)
+      expect(error).toBeInstanceOf(ApiError)
+      const problem = (error as ApiError).problem
+      expect(problem.status).toBe(409)
+      // `review.py::apply_endpoint` attaches the whole decision to the problem
+      // document; without it the dashboard has no reason to show.
+      expect(problem.auto_apply?.reason).toBe(verdict!.reason)
+      expect(problem.auto_apply?.checks.some((check) => !check.passed)).toBe(true)
+      expect(problem.detail).toContain("R24's gate refused")
+      // NOTHING was written: a refusal is not a quiet manual apply.
+      expect((await client.getProposal(approved.id)).status).toBe('approved')
+    }
+  })
+
+  it('records WHICH authority took the write in the ledger actor', async () => {
+    const { client, approved } = await approvedGrade()
+    const applied = await client.applyProposal(approved.id, 'manual')
+    expect(applied.status).toBe('applied')
+    expect(applied.events?.at(-1)?.actor).toBe('system:apply')
+    expect(applied.events?.at(-1)?.event).toBe('applied')
+  })
+
+  it('serves the reversal receipt on the rollback 200, as the service does', async () => {
+    const { client, approved } = await approvedGrade()
+    await client.applyProposal(approved.id, 'manual')
+    const body = await client.rollbackProposal!(approved.id)
+
+    // `RollbackResult.as_dict` rides on the 200 — it is the ONLY place
+    // `byte_identical` is stated, and the dashboard's receipt reads it.
+    const receipt = rollbackReceipt(body)
+    expect(receipt, 'the rollback 200 must carry a `rollback` member').not.toBeNull()
+    expect(receipt!.byte_identical).toBe(true)
+    expect(receipt!.restored_digest).toBe(receipt!.applied_before_digest)
+
+    // Append-only: the reversal is a SECOND row, and the apply is not erased.
+    const after = await client.getProposal(approved.id)
+    expect(after.status).toBe('rolled_back')
+    expect(after.events?.map((event) => event.event)).toEqual([
+      'applied',
+      'rolled_back',
+    ])
+  })
+
+  it('refuses a rollback from any status but applied (KS004)', async () => {
+    const { client, approved } = await approvedGrade()
+    const error = await client
+      .rollbackProposal!(approved.id)
+      .catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(ApiError)
+    expect((error as ApiError).status).toBe(409)
+    expect((error as ApiError).problem.detail).toContain('KS004')
+  })
+
+  it('every ledger row is in `_event_row`s shape, digests and not documents', async () => {
+    const { client, approved } = await approvedGrade()
+    const applied = await client.applyProposal(approved.id, 'manual')
+    const event = applied.events!.at(-1)!
+    // `bigint` columns arrive as STRINGS: a JSON number is an IEEE double.
+    expect(typeof event.event_id).toBe('string')
+    expect(typeof event.txid).toBe('string')
+    // The canonical documents are never sent — two digests and the paths are.
+    expect(typeof event.before_digest).toBe('string')
+    expect(typeof event.after_digest).toBe('string')
+    // `keystone_differing_paths` RETURNS text, comma-joined — not a list.
+    expect(Array.isArray(event.differing_paths)).toBe(false)
+    expect(event).not.toHaveProperty('before')
+    expect(event).not.toHaveProperty('after')
+  })
 })

@@ -117,7 +117,8 @@ from __future__ import annotations
 
 import hashlib
 import os
-from collections.abc import Iterator
+import sys
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from functools import lru_cache
 
@@ -129,20 +130,24 @@ from recon.config import get_settings
 
 __all__ = [
     "API_KEY_SALT",
+    "PRINCIPAL_ENV_VARS",
     "ROLE_APPLY_WRITER",
     "ROLE_RECON_WRITER",
     "ROLE_REVIEW_WRITER",
     "WRITER_ROLES",
     "DatabaseNotConfigured",
     "api_key_hash",
+    "connected_to",
     "database_url",
     "engine_for_role",
     "get_engine",
     "get_sessionmaker",
+    "restore_principal",
     "role_connection",
     "role_password",
     "role_url",
     "session_scope",
+    "switch_principal",
 ]
 
 #: PROPOSES. Detection path (ingest, staging, ER, invariants, reconciler):
@@ -313,7 +318,100 @@ def api_key_hash(key: str) -> str:
 
 
 def reset_engine_cache() -> None:
-    """Drop cached engines. Only for tests that change ``DATABASE_URL``."""
+    """Drop cached engines. Only for a process that changes a DSN variable.
+
+    Three of the four caches live here. The fourth is
+    ``recon.budget._ops_engine_for``, which holds an engine per explicit
+    ``OPS_DATABASE_URL`` -- the DSN ``recon.budget.ops_engine`` *prefers*. While
+    that one was not cleared, "drop cached engines" was simply untrue of a
+    quarter of them.
+
+    **What that did not cost is a stale identity**, and this docstring used to
+    claim it did. ``_ops_engine_for`` is an ``lru_cache`` keyed by the DSN
+    string and ``ops_engine`` re-reads the environment on every call, so a
+    switch to a different principal always got a different cache key and a fresh
+    engine; no caller ever transacted as the identity a switch had left behind.
+    What it cost is the engines a switch **orphans** -- up to four of them, each
+    holding a live pool against a database the process has walked away from and,
+    for the scratch-database helpers, is about to ``DROP ... WITH (FORCE)`` --
+    and the plain truth of this function's name, which
+    ``tests/budget/test_ledger.py::test_reset_engine_cache_drops_the_ops_engine_too``
+    pins by asking for two engines on one DSN across a reset.
+
+    It is reached through :data:`sys.modules` rather than imported, because
+    ``recon.budget`` imports *this* module: there is nothing to clear if it was
+    never loaded, and nothing to clear yet if it is still being loaded.
+    """
     get_engine.cache_clear()
     engine_for_role.cache_clear()
     get_sessionmaker.cache_clear()
+    ops_engine_cache = getattr(sys.modules.get("recon.budget"), "_ops_engine_for", None)
+    if ops_engine_cache is not None:
+        ops_engine_cache.cache_clear()
+
+
+#: Every environment variable that can name a database principal for this
+#: process. ``DATABASE_URL`` is what the process serves as; ``OPS_DATABASE_URL``
+#: is the one ``recon.budget.ops_engine`` and
+#: ``recon.api.internal._invariant_dsn`` *prefer* whenever it is set, falling
+#: back to the first only when it is not.
+#:
+#: **Both have to move together or a switch is not a switch.** Repointing
+#: ``DATABASE_URL`` alone at a scratch database leaves every ops call -- a
+#: provisioned ledger scope, a lease sweep, the entire invariant pass --
+#: transacting against whatever ``OPS_DATABASE_URL`` names, which on the
+#: deployed service (``infra/render.yaml``) is the production owner DSN.
+#: Measured, before this was one helper: a single run of
+#: ``tests/integration/test_sync_pipeline.py`` put 752,000 ``invariant_results``
+#: rows and three ``budget_ledger`` scopes into that database.
+#:
+#: Spelled here rather than imported from :mod:`recon.budget`, which imports
+#: *this* module; ``tests/budget/test_principal_switch.py`` pins the two equal.
+PRINCIPAL_ENV_VARS = ("DATABASE_URL", "OPS_DATABASE_URL")
+
+
+def switch_principal(dsn: str) -> dict[str, str | None]:
+    """Point every variable in :data:`PRINCIPAL_ENV_VARS` at ``dsn``.
+
+    Returns the environment it replaced -- one entry per variable, ``None``
+    where the variable was unset -- for :func:`restore_principal` to put back.
+    Both ``lru_cache``s keyed on those variables are dropped, so a module that
+    took an engine before the switch cannot go on using it.
+    """
+    previous: dict[str, str | None] = {name: os.environ.get(name) for name in PRINCIPAL_ENV_VARS}
+    for name in PRINCIPAL_ENV_VARS:
+        os.environ[name] = dsn
+    get_settings.cache_clear()
+    reset_engine_cache()
+    return previous
+
+
+def restore_principal(previous: Mapping[str, str | None]) -> None:
+    """Put back exactly what :func:`switch_principal` returned.
+
+    A variable that was unset is **popped**, not blanked: "restored" has to mean
+    restored.
+    """
+    for name, value in previous.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    get_settings.cache_clear()
+    reset_engine_cache()
+
+
+@contextmanager
+def connected_to(dsn: str) -> Iterator[str]:
+    """:func:`switch_principal` for the duration of the block, then restored.
+
+    The one helper behind every principal switch in this repository: the spend
+    burst's ``_connected_as`` and both scratch-database fixtures
+    (``tests/er/scratchdb``, ``tests/invariants/scratchdb``). They were three
+    copies, and two of them had drifted to ``DATABASE_URL`` alone.
+    """
+    previous = switch_principal(dsn)
+    try:
+        yield dsn
+    finally:
+        restore_principal(previous)

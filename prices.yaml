@@ -25,20 +25,31 @@
 # turned on, this table must gain the rate BEFORE the code does, because the
 # reservation is computed from this file.
 #
-# Rates are Anthropic first-party API list prices. Where a model has a
-# promotional/introductory rate (Sonnet 5 is $2/$10 through 2026-08-31) the
-# LIST rate is committed, not the promo rate: the reservation must bound the
+# The completion rates are Anthropic first-party API list prices. Where a model
+# has a promotional/introductory rate (Sonnet 5 is $2/$10 through 2026-08-31)
+# the LIST rate is committed, not the promo rate: the reservation must bound the
 # worst case, and a promo expiring must never turn a reservation into an
-# under-estimate.
+# under-estimate. The same reading picks the standard rate over a Batch-API rate
+# for the embedding models below.
+#
+# The table is NOT single-vendor. `recon.incidents` (R25) prices its embedding
+# calls here too, on Voyage's and OpenAI's list rates; each block below carries
+# its own vendor, rate and capture date, because "one `source:` line for the
+# whole file" stopped being true the moment a second vendor was priced.
 #
 # `version` is bumped on every rate change. It is stamped into the audit row of
 # every priced call, so a cost recorded last week can be re-derived from the
 # table that actually produced it.
+#
+#   version 1 (2026-06-24)  the eight Anthropic models + `mock-rationale-v1`
+#   version 2 (2026-08-24)  + the three embedding models R25 reserves against,
+#                           seeded into `budget_model_prices` by migration
+#                           `0016_price_embedding_models`
 # ---------------------------------------------------------------------------
-version: 1
+version: 2
 units: microusd_per_token
-source: Anthropic first-party API list pricing
-captured: "2026-06-24"
+source: per-model — see the vendor comment above each block
+captured: "2026-08-24"
 
 models:
   claude-fable-5:
@@ -99,3 +110,61 @@ models:
     output: "25"
     cache_read: "0.5"
     cache_write: "6.25"
+
+  # -------------------------------------------------------------------------
+  # Embedding models — `recon.incidents` (R25, stretch #8).
+  #
+  # An embeddings endpoint has ONE rate. It emits no output tokens and it has no
+  # prompt cache, so `output`, `cache_read` and `cache_write` have no vendor
+  # meaning here. All four are therefore set to the single real per-token rate
+  # rather than to a token value, for three reasons that all point the same way:
+  #
+  #   * the schema and the suite both forbid a zero. `budget_model_prices`
+  #     CHECKs `input_rate > 0 AND output_rate > 0` (migration 0010) and
+  #     `tests/budget/test_prices.py::test_every_committed_model_is_priced_above_zero`
+  #     requires all four above zero, because a free rate is an uncapped model;
+  #   * `recon.budget.worst_case_microusd` prices the input side at the
+  #     **cache_write** rate. Setting cache_write to the real rate makes an
+  #     embedding reservation exactly `rate x tokens`; inflating it to 1.25x
+  #     would invent a prompt-cache surcharge that this endpoint cannot bill;
+  #   * `output` only ever multiplies `max_output_tokens`, which
+  #     `recon.incidents._reserve_batch` pins to 0. Its only effect is on a
+  #     future caller that reserves output tokens against an embedding model,
+  #     and there the real rate over-estimates rather than under-estimates.
+  #
+  # Vendor: Voyage AI list pricing, https://docs.voyageai.com/docs/pricing
+  # $0.06 / 1M tokens. Captured 2026-08-24.
+  voyage-3.5:
+    input: "0.06"
+    output: "0.06"
+    cache_read: "0.06"
+    cache_write: "0.06"
+
+  # Vendor: OpenAI list pricing (standard API, NOT the $0.01/1M Batch API rate —
+  # `recon.incidents.OpenAIEmbeddingProvider` calls `embeddings.create`, which is
+  # billed at the standard rate). $0.02 / 1M tokens. Captured 2026-08-24.
+  text-embedding-3-small:
+    input: "0.02"
+    output: "0.02"
+    cache_read: "0.02"
+    cache_write: "0.02"
+
+  # The offline embedding provider (`EMBEDDING_PROVIDER=mock`, the default and
+  # the graded one). Priced at a production rate rather than at zero for exactly
+  # the reason `mock-rationale-v1` is: the mock exists so the metered embedding
+  # path runs with no API key, and a free mock would make "the embedding path is
+  # metered" a claim about a no-op.
+  #
+  # WHICH production rate needs one extra sentence, because the analogy is not
+  # exact. `mock-rationale-v1` copies `claude-opus-5`, which is unambiguous —
+  # that is `LLM_MODEL`'s default, the one live model it stands in for. There is
+  # no single live embedding model: `EMBEDDING_PROVIDER` has two, at different
+  # rates. So the mock carries the HIGHER of the two (voyage-3.5's $0.06/1M),
+  # which bounds either substitution — the same worst-case reading this file
+  # already applies when it commits a list rate over a promotional one. It is a
+  # policy number, not a vendor quote: no vendor sells `mock-embedding-v1`.
+  mock-embedding-v1:
+    input: "0.06"
+    output: "0.06"
+    cache_read: "0.06"
+    cache_write: "0.06"

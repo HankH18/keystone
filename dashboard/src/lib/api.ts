@@ -14,12 +14,34 @@
  * cancellation depends on recognising it.
  */
 
+import type { AutoApplyVerdict, RollbackReceipt } from './contract'
+
 /** RFC7807-style problem document returned by the service on error. */
 export interface ProblemDetail {
   type: string
   title: string
   status: number
   detail?: string
+  /**
+   * R24's verdict, attached by `review.py::apply_endpoint` to the 409 it answers
+   * a refused `?auto=true` with (`body["auto_apply"] = refused.decision.as_dict()`).
+   *
+   * It is on the PROBLEM document, not on a success body, because the refusal is
+   * the interesting outcome: it names the condition that did not hold. Optional,
+   * because every other error in the API carries no such member — and
+   * `toProblem()` spreads whatever the service sent, so this survives without a
+   * second parse.
+   */
+  auto_apply?: AutoApplyVerdict
+  /**
+   * The reversal's evidence, attached by `review.py::_stale_reversal` to the
+   * `rollback-not-on-top` 409: the canonical row no longer holds what this
+   * proposal's apply left, so a later apply is on top and reversing this one out
+   * of order would silently discard an approved, applied, unreversed write.
+   *
+   * Same member name as the 200 receipt, same type — see `RollbackReceipt`.
+   */
+  rollback?: RollbackReceipt
 }
 
 /** Base class of every error this module raises. */

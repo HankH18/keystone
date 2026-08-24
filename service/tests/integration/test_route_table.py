@@ -56,10 +56,25 @@ DESIGN_ENDPOINTS: dict[tuple[str, str], str] = {
 #: that would own it. **This is a statement about the repository, not a waiver**:
 #: `test_the_unbuilt_endpoints_are_still_unbuilt` fails the moment one appears.
 NOT_BUILT_YET: dict[tuple[str, str], str] = {
-    ("GET", "/api/incidents"): "no incidents router exists in recon/api/",
     # `/api/scorecard` was here until T-14 built `recon.api.scorecard` and mounted
     # it; this file's own rule is that the line goes when the endpoint arrives, so
     # that the list cannot become a graveyard excusing a missing mount.
+    #
+    # `/api/incidents` was here until `recon.api.incidents` was mounted in
+    # `create_app`. It went the way this module's docstring says it must: the
+    # router was built (R25, stretch #8), `test_the_unbuilt_endpoints_are_still_
+    # unbuilt` went red, and the line was deleted rather than the mount being
+    # left dangling -- so `test_every_built_design_endpoint_is_mounted` guards it
+    # from now on, and `test_the_incidents_router_is_served_by_the_factory` binds
+    # it to the router object itself.
+    #
+    # The dict is now EMPTY, which is the end state this file was written for:
+    # every endpoint DESIGN §HTTP API pins is built and mounted. An empty
+    # parametrize makes `test_the_unbuilt_endpoints_are_still_unbuilt` a single
+    # skip, and nothing is weakened by that -- the endpoints it used to exempt
+    # are all being asserted by the other direction now. A future DESIGN endpoint
+    # that is pinned but not built goes here, with its reason, on the day it is
+    # pinned.
 }
 
 #: Mounted, and not in DESIGN's list because DESIGN describes the client API:
@@ -74,6 +89,14 @@ ALSO_EXPECTED: dict[tuple[str, str], str] = {
     # proposal-detail pages on it, so T-11 serves them.
     ("GET", "/api/conflicts/{conflict_id}"): "contract.ts A2 -- conflict detail",
     ("GET", "/api/proposals/{proposal_id}"): "contract.ts A2 -- proposal detail",
+    # DESIGN §HTTP API lists approve/reject/apply and pins `proposal_events` as
+    # "the rollback path" under §Data models, but never spells the reversal as an
+    # endpoint -- so `recon.apply.rollback_proposal` was reachable only from an
+    # interpreter holding the `apply_writer` credentials. R24 requires a *recorded
+    # rollback path* and the rubric requires the automation to be reversible; a
+    # reversal a reviewer cannot invoke is neither. Classified here rather than in
+    # DESIGN_ENDPOINTS because DESIGN's own list does not name it.
+    ("POST", "/api/proposals/{proposal_id}/rollback"): "R24 -- the reversal leg, over HTTP",
 }
 
 
@@ -205,3 +228,30 @@ def test_the_two_previously_unmounted_routers_are_the_ones_this_guards() -> None
             f"recon.api.{name} declares {sorted(declared - served)} which the real "
             f"application does not serve: the router is built and not mounted"
         )
+
+
+def test_the_incidents_router_is_served_by_the_factory() -> None:
+    """The third instance of the same defect, pinned the same way.
+
+    `recon.api.incidents` was built for R25 (stretch #8) and its only mount was
+    `tests/incidents/conftest.py`, so `GET /api/incidents` 404'd in the running
+    service while that package was green -- exactly the shape of the two routers
+    above. Asserted against the freshly imported router object rather than
+    against the literal in :data:`DESIGN_ENDPOINTS`, so renaming the path in that
+    module cannot make this pass by accident.
+    """
+    from recon.api.incidents import router as incidents_router
+
+    declared = {
+        (method, route.path)
+        for route in incidents_router.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+        if method not in {"HEAD", "OPTIONS"}
+    }
+    assert declared, "recon.api.incidents declares no routes at all"
+    served = route_table(create_app())
+    assert declared <= served, (
+        f"recon.api.incidents declares {sorted(declared - served)} which the real "
+        f"application does not serve: the router is built and not mounted"
+    )

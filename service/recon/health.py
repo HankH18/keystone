@@ -23,6 +23,20 @@ latency rather than being waited on. The whole handler is therefore bounded by
 `timeout` regardless of how badly a source misbehaves -- including a source that
 never returns at all.
 
+The bound is **configuration**, not a constant. It was
+``HEALTH_PROBE_TIMEOUT_SECONDS = 2.0`` at module scope with no override, and
+2.0s is shorter than a cold start of a scale-to-zero Postgres -- so the first
+probe after an idle period times out, `/health` answers 503, and a platform that
+gates a deploy on `/health` (`infra/render.yaml` sets `healthCheckPath`, and
+Render's blueprint spec offers no health-check timeout of its own) never routes
+traffic at all. `Settings.health_probe_timeout_seconds`, i.e. the environment
+variable ``HEALTH_PROBE_TIMEOUT_SECONDS``, is that override; :func:`health_probe_timeout`
+resolves it. The default is unchanged, so nothing moves locally.
+
+It is resolved **per call**, not captured in a default argument: a default
+argument is evaluated once at import, which would have made the variable
+readable and inert -- a knob that cannot fail is the same defect one layer up.
+
 Status vocabulary, smallest that carries the distinction:
 ``ok`` | ``degraded`` (answering, but not fully) | ``down`` | ``timeout`` |
 ``unconfigured`` (nothing to reach: no `DATABASE_URL`).
@@ -42,11 +56,12 @@ from sqlalchemy import text
 
 from recon import __version__
 from recon.adapters import AdapterError, ReadOnlyAdapter, build_adapters, read_bounded
+from recon.config import get_settings
 from recon.db import DatabaseNotConfigured, get_engine
 
 __all__ = [
-    "HEALTH_PROBE_TIMEOUT_SECONDS",
     "SERVICE_NAME",
+    "health_probe_timeout",
     "health_report",
     "probe_database",
     "probe_source",
@@ -56,10 +71,6 @@ __all__ = [
 log = structlog.get_logger("recon.health")
 
 SERVICE_NAME = "keystone"
-
-#: Per-probe wall-clock bound. Deliberately far below the adapter's 10s read
-#: bound: a health check that takes ten seconds has already failed its purpose.
-HEALTH_PROBE_TIMEOUT_SECONDS: float = 2.0
 
 _OK = "ok"
 _DEGRADED = "degraded"
@@ -78,6 +89,23 @@ _SEVERITY: dict[str, int] = {
 
 #: Anything at or above this severity means the service cannot do its job.
 _FATAL = _SEVERITY[_TIMEOUT]
+
+
+def health_probe_timeout() -> float:
+    """The per-probe wall-clock bound, in seconds, from the environment.
+
+    ``HEALTH_PROBE_TIMEOUT_SECONDS`` (`Settings.health_probe_timeout_seconds`),
+    defaulting to `recon.config.DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS` -- the 2.0
+    this module used to hardcode. Deliberately far below the adapter's 10s read
+    bound by default: a health check that takes ten seconds has already failed
+    its purpose. A deployment in front of a scale-to-zero Postgres raises it,
+    because a cold start it cannot control otherwise reads as `down`.
+
+    Called at probe time rather than bound to a default argument, so the
+    variable is honoured by the process that reads it and not by whichever
+    process happened to import this module first.
+    """
+    return get_settings().health_probe_timeout_seconds
 
 
 def _bounded(probe: Callable[[], dict[str, Any]], timeout: float) -> dict[str, Any]:
@@ -113,8 +141,10 @@ def _bounded(probe: Callable[[], dict[str, Any]], timeout: float) -> dict[str, A
     return result
 
 
-def probe_database(timeout: float = HEALTH_PROBE_TIMEOUT_SECONDS) -> dict[str, Any]:
-    """Open a connection and run `SELECT 1`. Bounded."""
+def probe_database(timeout: float | None = None) -> dict[str, Any]:
+    """Open a connection and run `SELECT 1`. Bounded by :func:`health_probe_timeout`."""
+    if timeout is None:
+        timeout = health_probe_timeout()
 
     def check() -> dict[str, Any]:
         try:
@@ -128,20 +158,24 @@ def probe_database(timeout: float = HEALTH_PROBE_TIMEOUT_SECONDS) -> dict[str, A
     return _bounded(check, timeout)
 
 
-def _probe_via_port(adapter: ReadOnlyAdapter) -> dict[str, Any]:
+def _probe_via_port(adapter: ReadOnlyAdapter, stall_timeout: float) -> dict[str, Any]:
     """Fallback probe for any adapter: list generations, read one record.
 
     Used when an adapter offers no cheaper `probe()` of its own. It exercises the
     same three members the pipeline uses, so it cannot pass while the real read
     path is broken.
+
+    `stall_timeout` is the caller's own bound, threaded through rather than read
+    from the module: this ran under the hardcoded 2.0s while the surrounding
+    `_bounded` call ran under whatever the caller asked for, so raising the bound
+    would have widened the outer watchdog and left the inner read exactly as
+    tight -- an override that appears to work and does not.
     """
     generations = list(adapter.generations())
     if not generations:
         return {"status": _DOWN, "detail": "source reports no generations"}
     latest = max(generations)
-    stream = read_bounded(
-        adapter, latest, stall_timeout=HEALTH_PROBE_TIMEOUT_SECONDS, deadline_seconds=None
-    )
+    stream = read_bounded(adapter, latest, stall_timeout=stall_timeout, deadline_seconds=None)
     try:
         first = next(stream, None)
     finally:
@@ -161,15 +195,17 @@ def _probe_via_port(adapter: ReadOnlyAdapter) -> dict[str, Any]:
     }
 
 
-def probe_source(
-    adapter: ReadOnlyAdapter, timeout: float = HEALTH_PROBE_TIMEOUT_SECONDS
-) -> dict[str, Any]:
+def probe_source(adapter: ReadOnlyAdapter, timeout: float | None = None) -> dict[str, Any]:
     """Reachability of one source, through the adapter port. Bounded."""
+    # Resolved once, into a local the closure captures, so the inner adapter read
+    # and the outer watchdog are provably the same number rather than two reads
+    # that could disagree.
+    bound = health_probe_timeout() if timeout is None else timeout
 
     def check() -> dict[str, Any]:
         own_probe = getattr(adapter, "probe", None)
         try:
-            return own_probe() if callable(own_probe) else _probe_via_port(adapter)
+            return own_probe() if callable(own_probe) else _probe_via_port(adapter, bound)
         except AdapterError as error:
             return {
                 "status": _TIMEOUT if error.kind == "source_timeout" else _DOWN,
@@ -179,16 +215,18 @@ def probe_source(
                 "problem_status": error.status,
             }
 
-    result = _bounded(check, timeout)
+    result = _bounded(check, bound)
     return {key: value for key, value in result.items() if value is not None}
 
 
 def health_report(
     adapters: Mapping[str, ReadOnlyAdapter] | None = None,
     *,
-    timeout: float = HEALTH_PROBE_TIMEOUT_SECONDS,
+    timeout: float | None = None,
 ) -> dict[str, Any]:
     """The full `/health` document: service, DB, and every source."""
+    if timeout is None:
+        timeout = health_probe_timeout()
     if adapters is None:
         try:
             adapters = build_adapters()

@@ -43,7 +43,16 @@ CONCURRENCY = 4
 #: derived, so a migration that exits 0 without running -- the way this test could
 #: lie -- is caught by a literal that does not move on its own.
 #: `test_the_pinned_head_is_alembics_head` keeps the literal honest.
-EXPECTED_HEAD = "0014_write_set_from_the_value"
+#:
+#: Bumped from `0015_escalation_reason_grant` when
+#: `0016_price_embedding_models` landed -- the migration that seeds
+#: `budget_model_prices` with the three embedding models `recon.incidents`
+#: reserves against, without which `build_embedding_provider` refuses even the
+#: offline default. That is exactly the event this literal exists to make loud:
+#: `test_the_pinned_head_is_alembics_head` went red on the commit that added the
+#: migration and the literal was moved deliberately, in the same commit, rather
+#: than being derived so that it could never disagree.
+EXPECTED_HEAD = "0016_price_embedding_models"
 
 
 def _admin_dsn() -> str:

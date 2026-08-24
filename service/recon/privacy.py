@@ -424,6 +424,10 @@ SAFE_KEYS: Final[frozenset[str]] = frozenset(
         "attempts",
         "auto",
         "before_digest",
+        # `RollbackResult.byte_identical`: a bool saying the reversal restored the
+        # digest the apply captured. A claim about two hashes, never a value --
+        # the digests themselves are already here as `before_digest`/`after_digest`.
+        "byte_identical",
         "complete",
         "confidence",
         "conflict_type",

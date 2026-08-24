@@ -36,7 +36,8 @@ from recon.reference import CONFLICT_TYPES, OBSERVED_VALUE_KEYS
 #: byte-identical to v1's -- so this bump records a change to WHERE the clamp is
 #: applied, which R14's "partial/conflicting evidence lowers it" clause required:
 #: under v1 a penalty on a saturated conflict moved the stored number by zero
-#: (191 of the graded 3,050 proposals). See `confidence.yaml`'s version note.
+#: (181 of the graded 3,050 proposals; 191 were saturated AND penalised, of which 10
+#: saw part of the penalty). See `confidence.yaml`'s version note.
 COMMITTED_VERSION = 2
 
 #: The committed formula, verbatim. Pinned as a string because the shape of the
@@ -52,7 +53,13 @@ COMMITTED_FORMULA = "clamp01(clamp01(base[conflict_type] + sum(positive)) + sum(
 #: To update after a DELIBERATE model change, from the repository root:
 #:     python3 -c "import hashlib,pathlib as p; \
 #:       print(hashlib.sha256(p.Path('confidence.yaml').read_bytes()).hexdigest())"
-COMMITTED_SHA256 = "48295047a1f3854228600d7f2b9e9e536450cc14a968702b8d9275779ea83bbf"
+#: Bumped 2026-08-24 for a COMMENT-ONLY correction to the version note (three conflated
+#: quantities separated: 1,057 positive-saturated / 1,047 stored 1.0000 under v1 / 181
+#: arithmetically invisible). The digest covers comments BY DESIGN -- it names the bytes a
+#: reviewer would open -- so a documentation fix legitimately moves it. Proven inert before
+#: the bump: parsed YAML identical, every base/weight/order/precision field identical, and
+#: 4,480 scored signal combinations produced byte-identical values and flags.
+COMMITTED_SHA256 = "63656f445883c335fd1664140496df4f2eb737a26df26ae330baa0c017672127"
 
 COMMITTED_BASES = {
     "C1": "0.50",

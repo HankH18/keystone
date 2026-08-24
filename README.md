@@ -1,137 +1,650 @@
-# Keystone
+# Keystone — the reconciliation trust layer
 
-**STATUS: scaffold.** This is the T-0 skeleton. Sections below are stubs and get filled in as
-tickets land; **T-15 owns the final README** (architecture, results, deployed URL, demo script).
-Commands marked _(not yet)_ are the documented entry points — they land with the ticket named.
+Keystone mirrors three **read-only** upstream sources, resolves them into one identity layer,
+detects cross-source conflicts against **versioned, committed SQL invariants**, and files each one
+as a **proposal a human approves before anything is written**. An LLM writes rationale text and
+nothing else: it never detects a conflict, never computes a confidence score, and never writes.
 
-Keystone reconciles records across three read-only upstream sources, detects cross-source
-conflicts against versioned invariants, and files them as proposals a human approves before
-anything is written back.
+Everything runs offline on synthetic data with **no API keys**. The dataset, the golden set and the
+scorecard are all reproducible from one committed seed.
+
+**Status: complete.** The last committed grading-harness run — `2026-08-23T21:04:57Z`, in
+[`docs/scorecard.txt`](docs/scorecard.txt) — reports **16/16 PASS**. See [Results](#results),
+including what has moved in the tree since that run.
+
+```mermaid
+flowchart LR
+  CRM["CRM<br/>contact, deal"] --> ADP
+  APP["App DB<br/>student, enrollment"] --> ADP
+  PAY["Payments<br/>payment"] --> ADP
+  ADP["Read-only adapters<br/>landing mirror"] --> NORM["normalize.py<br/>one shared spec"]
+  NORM --> ER["Identity resolution<br/>entities, links, field_lineage"]
+  NORM --> INV["Invariant engine<br/>rules/NNN_name.vX.sql"]
+  INV --> REC["Reconciler<br/>confidence.yaml"]
+  ER -. read-only evidence .-> REC
+  REC --> PQ["Proposal queue<br/>pending / sensitive_hold"]
+  PQ --> REV["Reviewer<br/>dashboard"]
+  REV --> APL["Guarded apply<br/>cited, single-use, reversible"]
+  REC -. rationale text only .-> LLM["LLM<br/>mock by default"]
+```
+
+**No rule reads `entities`, `entity_links` or `field_lineage`.** The invariant engine reads the
+normalized `stg_*` layer plus the session-scoped TEMP `er_*` tables it rebuilds from it; the
+persisted canonical layer is read-only evidence for the reconciler and the query API.
+
+Full rationale and the two required diagrams: **[ARCHITECTURE.md](ARCHITECTURE.md)**.
+AI tooling disclosure: **[AI_USAGE.md](AI_USAGE.md)**.
+
+---
+
+## Deployed application
+
+> **⚠️ PLACEHOLDER — TO BE FILLED IN BEFORE SUBMISSION. Not yet deployed.**
+>
+> - **Service:** `<service URL here>`
+> - **Dashboard:** `<dashboard URL here>`
+
+The blueprint is committed at [`infra/render.yaml`](infra/render.yaml): a Python web service, a
+static dashboard, and three cron jobs. Two of them — sync and reconcile — trigger over HTTPS with a
+per-job shared-secret header; the third, the budget sweeper, runs `python -m recon.budget sweep`
+directly as the ops principal and carries no trigger secret. The database is **Neon**, named
+explicitly — the blueprint declares no Render Postgres. Migrations run as `preDeployCommand`. Until
+the URLs above are filled in, the local quick start below is the runnable build.
+
+---
+
+## Three ways in, by time budget
+
+| Budget | What you get | Command |
+|---|---|---|
+| **~1 min** *(plus the one-time `pnpm install`)* | Dashboard rendering the **committed golden set** in an in-browser mock. No Docker, no Python, no database. | `pnpm --dir dashboard install && pnpm --dir dashboard run dev:mock` → http://localhost:5173 |
+| **~10 min** | The **real system**: Postgres, migrated schema, seeded dataset, live API, conflicts *and* proposals, dashboard against it. | [Quick start](#quick-start) steps 1–10 |
+| **+~25 min** | The **graded scorecard**, all 16 rows. Runs *on top of* the ~10-minute path — it grades an already-loaded database. | [The graded gate](#the-graded-gate) |
+
+On the ~10-minute path most of the clock is one-time dependency installation (`uv sync`, `pnpm
+install`); of the steps that touch data, `make sync` is the slowest (below). The graded gate adds at least
+another ~25 minutes, dominated by one row (`coverage`, a real pytest run measured at **23 m 33 s**),
+so a clean clone to a full scorecard is **≈35 minutes**. Both slow steps are called out where they
+occur — nothing here silently blocks for half an hour.
 
 ---
 
 ## Requirements
 
-| Tool | Version | Notes |
+| Tool | Version | Used for |
 |---|---|---|
-| Docker | with Compose v2 | Postgres 16 + pgvector |
-| uv | latest | manages Python 3.12 for `service/` |
+| Docker + Compose v2 | any current | Postgres 16 + pgvector |
+| uv | latest | pins and manages Python 3.12 for `service/` |
 | Node + pnpm | Node 22, pnpm 9 | `dashboard/` |
-| make | any | documented entry points |
+| make | any | the documented entry points |
 
 ---
 
 ## Quick start
 
+Every command runs **from the repository root**. `make help` lists the targets.
+
 ```bash
-# 1. Clone
+# 1 ── clone
 git clone <repo-url> keystone && cd keystone
 
-# 2. Configure. Defaults run fully offline on mock providers — no API keys needed.
+# 2 ── configure. The defaults run the whole system offline on mock providers.
+#      No API key is needed for anything on this page.
 cp .env.example .env
 
-# 3. Database: Postgres 16 + pgvector on host port 55432 (not 5432, to avoid collisions).
+#      Sanity check at any time — prints the configuration the service will
+#      ACTUALLY load, secrets redacted. Run this first whenever something looks
+#      unconfigured; it is faster than guessing.
+make env
+
+# 3 ── database: Postgres 16 + pgvector on host port 55432 (not 5432, to avoid
+#      colliding with a system Postgres). Waits for healthy.
 make up
-make db-shell    # optional sanity check: \dx lists the vector + pgcrypto extensions
 
-# 4. Python deps (Python 3.12, pinned by uv)
+# 4 ── dependencies. uv pins and fetches Python 3.12 for the service; the
+#      dashboard needs its own node_modules before `make dash` in step 10 will
+#      start — `make dash` runs Vite, it does not install for you.
 cd service && uv sync && cd ..
+pnpm --dir dashboard install
 
-# 5. Dashboard deps
-cd dashboard && pnpm install && cd ..
+# 5 ── MIGRATIONS. Creates the schema, the three least-privilege writer roles,
+#      the two demo API-key hashes and the budget-ledger scopes. Nothing here
+#      needs to be created by hand, and no manual role setup exists.
+make migrate
 
-# 6. Generate the graded 120k-record dataset + committed golden/ exports  (T-2)
-#    `make seed` is `--profile full --seed 20260822` (the canonical committed seed):
-#    it rewrites fixtures/ and golden/ byte-identically. `make seed-dev` is the
-#    ~6k-record inner-loop profile and writes to .scratch/, never to the repo tree.
+# 6 ── dataset + committed golden/ exports.  ~30 seconds.
+#      Writes fixtures/ (gitignored) and rewrites golden/ byte-identically.
 make seed
 
-# 7. Run the API on :8000                                        (T-4+, not yet)
+# 7 ── the API on :8000                                            [terminal 1]
 make serve
 
-# 8. Run the dashboard dev server (separate terminal)             (T-10, not yet)
-make dash
+# 8 ── LOAD the database, and DETECT.                              [terminal 2]
+#      *** THIS IS THE SLOWEST STEP: ~1 min warm, minutes under I/O pressure. ***
+#      It ingests three generations, materializes entities, links and
+#      field_lineage, then runs the committed invariant rule set over it.
+#      Leave it running; it prints what it is doing.
+#      Ends with `conflicts` populated and `proposals` still EMPTY.
+make sync
 
-# 9. Run the grading harness and print the scorecard             (T-14, not yet)
-make suite
+# 9 ── PROPOSE. ~11 s.                                             [terminal 2]
+#      Scores every conflict step 8 detected and writes one held proposal each
+#      (pending / sensitive_hold). Nothing is applied. WITHOUT THIS STEP the
+#      dashboard shows conflicts and zero proposals.
+make reconcile
+
+# 10 ─ the dashboard on :5173                                      [terminal 3]
+make dash
 ```
 
+Open **http://localhost:5173**. The Overview reconciles against `GET /api/scorecard`; Conflicts and
+Proposals read the live database.
+
 Stop the database with `make down` (the data volume is kept).
+
+### Why step 8 is the slow one, and what it actually measures
+
+`recon.resolve.materialize` validates ~1.28 M `field_lineage` rows through deferred provenance
+triggers at COMMIT, so the step is I/O-bound rather than CPU-bound and its wall clock tracks how
+hard the Postgres volume is working. Measured end to end over HTTP on a warm local container
+(2026-08-24, `--profile full`, 360,400 records, run `doc-path-001`): **59.6 s total — ingest 21.9 s,
+materialize 23.1 s, invariants 14.5 s**, with 3,050 conflicts detected and 25 marked oscillating.
+An earlier record in this repo put the same step at ~6 minutes and this run did not reproduce it;
+the likeliest difference is the state of the Postgres volume — a run during the same session died
+outright with `DiskFull` at 95% used. So treat ~1 minute as the floor rather than a promise, and read
+the per-stage clock the response body prints instead of trusting either figure.
+
+It is a one-time load, not a per-run cost — the detect-and-reconcile pass over those same 360,400
+records is measured at **22.94 s** in `bench:invariant-pass` (invariants 12.94 s + persist 2.72 s +
+reconcile 7.29 s).
+
+`make sync` and `make reconcile` are both idempotent per run id, and the claim is keyed on the job as
+well as the id, so one `RUN_ID` covers both: firing either twice under the default id answers
+`"status":"replayed"` and does not re-run. To run again deliberately, give it a fresh id:
+`make sync RUN_ID=grader-002`, `make reconcile RUN_ID=grader-002`.
+
+### Why step 9 is separate
+
+`POST /internal/sync` ends at detection — its three stages are ingest, materialize, invariants
+(`recon.api.internal.SYNC_STAGES`) — and `POST /internal/reconcile` is the guarded-automation half:
+it scores each conflict, writes one **held** proposal per conflict, escalates the oscillating ones,
+and applies nothing. They are separate endpoints because `infra/render.yaml` schedules them
+separately (R19), and the reconcile pass is seconds against the load's minute-plus, so re-running
+detection to re-propose would be paying the whole load for seconds of work.
+
+Measured on the same run as step 8 above: **3,050 conflicts → 3,050 proposals in 11.2 s** —
+2,670 `pending`, 380 `sensitive_hold`, 1,950 evidence-only, 25 escalated for oscillation, nothing
+applied. Firing it again over the unchanged database proposes **0** and skips all 3,050 on
+fingerprint, which is R16 de-duplication rather than a failure; `make reconcile` says so when it
+sees a zero.
+
+### The graded gate
+
+```bash
+make suite          # ~25 minutes; writes docs/scorecard.{txt,json}
+```
+
+`make suite` grades an already-loaded database (step 8 is its precondition — a half-loaded database
+fails every row rather than producing a small green). The rows in `docs/scorecard.txt` that report a
+time sum to **~25 minutes**, of which **23 m 33 s** is the `coverage` row shelling out to a real
+pytest run. Treat that as a floor, not a wall clock: several rows report no time of their own.
+
+The `coverage` row's pytest child points at `DATABASE_URL` unless you give it a second database, so
+by default it runs against the database the other fifteen rows are grading. `make suite` warns about
+this. To isolate it:
+
+```bash
+createdb -h localhost -p 55432 -U keystone ks_coverage
+# then set KEYSTONE_COVERAGE_DATABASE_URL in .env (the recipe is in .env.example)
+```
+
+**Fast subset** — the correctness rows without the 23-minute coverage row (~1 minute).
+`--no-write` matters: without it a partial run overwrites the committed `docs/scorecard.txt`. Any
+row that grades the pass also truncates and regenerates the graded layer — `conflicts`,
+`invariant_results`, `proposals`, `proposal_events`, **`incidents`**, `conflict_incidents`. The
+contents come back identical; the row ids do not, and none of it is a read-only operation on the
+database. `incidents` is on that list because step 9 of the pass re-clusters it (R25) — it is
+truncated and rebuilt, not retained, and that pass charges 56,487 microusd to a ledger row the
+harness provisions for itself, never to the shared `daily` one. The three rows that grade something
+other than the pass — `manifest`, `coverage`, `spend-cap-burst` — build no pipeline and truncate
+nothing.
+
+```bash
+cd service && uv run python -m recon.suite \
+  --only golden-diff --only clean-sample --only join-check --no-write
+```
+
+`python -m recon.suite --list` prints all 16 registered row names.
+
+### Tests and lint
+
+```bash
+make test    # service pytest + dashboard vitest
+make lint    # ruff check + ruff format --check + eslint
+```
+
+`make test` defaults `KEYSTONE_REQUIRE_DB=1`, which turns a missing database into a hard error rather
+than a mass skip — an unset `DATABASE_URL` once let 76 of 81 tests skip while the run reported
+success. The dashboard accessibility gate is separate and needs a browser:
+
+```bash
+pnpm --dir dashboard exec playwright install --with-deps chromium
+pnpm --dir dashboard run test:a11y     # axe-core + keyboard walkthrough + computed contrast
+```
+
+---
+
+## Demo credentials
+
+Two plaintext demo keys are **committed on purpose**, in [`.env.example`](.env.example):
+
+| Variable | Value | Scope |
+|---|---|---|
+| `DEMO_CLIENT_API_KEY` | `keystone-demo-client-3f7a19c4e2b84d05` | `client` — tenant-scoped; exists to demonstrate isolation |
+| `DEMO_ADMIN_API_KEY` | `keystone-demo-admin-8c25e0b71a94f36d` | `admin` — org-wide; used by the dashboard and by the suite's HTTP probe |
+
+Sent as the `X-Api-Key` header:
+
+```bash
+curl -sS http://localhost:8000/api/conflicts?page_size=1 \
+  -H "X-Api-Key: keystone-demo-admin-8c25e0b71a94f36d"
+```
+
+**Why committing these is safe and deliberate.** They authenticate against a wholly synthetic
+dataset and grant nothing anywhere else. The database never stores a key: migration
+`0003_seed_api_clients` stores only `sha256("keystone-api-key-salt-v1:<key>")` in hex. And they
+cannot drift from the documentation — `service/tests/schema/test_env_example_demo_keys.py` parses the
+plaintext **out of `.env.example` itself**, hashes it with the application's own helper, and matches
+the result against the seeded row. There is no third copy to go stale. Rotating them means writing a
+new migration, not editing that line.
+
+The dashboard needs the **admin** key because reviewer actions require org-wide scope. `make dash`
+exports the repo-root `.env` into Vite, so it is already configured. Running Vite directly instead
+(`pnpm --dir dashboard dev`) reads `dashboard/.env.local`: `cp dashboard/.env.example
+dashboard/.env.local` — it ships the same working values.
+
+The two job triggers (`POST /internal/sync`, `POST /internal/reconcile`) use a **per-job** shared
+secret in the `X-Trigger-Secret` header, one each, so they rotate apart. An unset secret **fails
+closed with 401** — it is not an off switch. `.env.example` ships placeholders; generate real ones
+with `openssl rand -hex 32`. `make sync` sends the same value from the same file `make serve`
+loaded, so the two agree by construction.
+
+Real secrets are never committed and never logged. `.env` is gitignored; `LOG_MODE=safe` (the
+default) stores a hash plus a short preview instead of raw bodies — see
+[`docs/retention-policy.md`](docs/retention-policy.md).
+
+---
+
+## Determinism and the canonical seed
+
+**Canonical seed: `20260822`** — the seed every committed artifact and every benchmark on this page
+was produced from. It is the default in `recon.config.Settings`, and `SEED` in `.env.example` passes
+it through to `python -m recon.seed --seed`, so it is a real control rather than documentation.
+
+Same seed ⇒ **byte-identical dataset, byte-identical conflict set, byte-identical confidence
+vector**. The suite's `determinism` row proves it by regenerating the full profile twice into scratch
+directories and comparing digests:
+
+- dataset `642d160a46bfdf75 == 642d160a46bfdf75` over 21 files
+- conflict set 3,050 fingerprints, payload `77cf192e9e79b5cb == 77cf192e9e79b5cb`
+- confidence vector 3,050 entries, `7ccd8926684645cc` across dry-a / dry-b / committed
+
+How it is held: `python -m recon.seed` sets and asserts `PYTHONHASHSEED=0` (re-`exec`ing once if the
+caller set anything else); the generator threads one `random.Random(seed)` instance and never touches
+module-level `random`, `uuid4()` or `datetime.now()`; all JSON is emitted with
+`sort_keys=True, ensure_ascii=True, separators=(",",":")`; all money arithmetic is `decimal.Decimal`,
+never float. Changing the seed invalidates `golden/` and requires a regeneration —
+`service/tests/seed/test_committed_golden.py` fails on a stale committed golden set rather than
+letting it become a silent grading hazard.
+
+---
+
+## Method
+
+Everything the brief asks to be recorded here: the source fixtures, the invariant rule versions, the
+model and provider, and the price table.
+
+### Source fixtures
+
+Generated by `python -m recon.seed` (`make seed`) from the canonical seed. `fixtures/` is
+**gitignored and never hand-edited**; `golden/` is **committed** and rewritten byte-identically by
+every seed run. Three read-only sources, three generations each, JSONL snapshots behind one
+`ReadOnlyAdapter` Protocol that exposes **no write method**.
+
+| Source | Entity types | Files | gen1 | gen2 | gen3 |
+|---|---|---|---|---|---|
+| `crm` | `contact`, `deal` | `fixtures/crm/gen{1,2,3}/{contact,deal}.jsonl` | 40,075 + 15,050 | 40,075 + 15,050 | 40,000 + 15,000 |
+| `appdb` | `student`, `enrollment` | `fixtures/appdb/gen{1,2,3}/{student,enrollment}.jsonl` | 25,000 + 22,000 | 25,000 + 22,000 | 25,000 + 22,000 |
+| `payments` | `payment` | `fixtures/payments/gen{1,2,3}/payment.jsonl` | 18,075 | 18,075 | 18,000 |
+| **per generation** | | | **120,200** | **120,200** | **120,000** |
+
+**360,400 landed records** across three generations, resolving to **43,375 entities**. Alongside
+them, `fixtures/malformed/cases.jsonl` carries **24 adversarial cases** — malformed and oversized
+payloads whose documented rejection behaviour the committed test run exercises.
+
+Point the adapters elsewhere with `KEYSTONE_FIXTURES_DIR` (use an absolute path — the value is taken
+as given and is not resolved against the repository root). The inner-loop
+profile is `make seed-dev` (~6k records into `.scratch/`, never the committed tree).
+
+The committed grading contract in [`golden/`](golden/):
+
+| File | Contents |
+|---|---|
+| `golden/conflicts.json` | 3,050 expected conflicts — the 1:1 grading contract |
+| `golden/clean-sample.json` | 1,000 sampled entities asserted conflict-free |
+| `golden/expected-views.json` | 25 hand-checked unified cross-source views |
+| `golden/manifest-summary.json` | volumes, per-type counts, self-check results |
+
+### Invariant rule versions
+
+Versioned SQL, one file per rule, `rules/NNN_name.vX.sql`. Every file carries `@rule_id`,
+`@rule_version`, `@conflict` and `@scope` headers. **All 15 rules are at `v1`.** The semantics are
+pinned in [`docs/invariant-contract.md`](docs/invariant-contract.md); override the directory with
+`KEYSTONE_RULES_DIR`.
+
+| Rule | Version | Conflict | File |
+|---|---|---|---|
+| R-000 | v1 | *(none)* — stamps `verdict='unchecked'` on any row in scope of **zero** rules, so "never looked at" is never read as "checked and clean" | `rules/000_no_rule_in_scope.v1.sql` |
+| R-001 | v1 | C1 paid but no deal | `rules/001_paid_but_no_deal.v1.sql` |
+| R-002 | v1 | C2 payment with no person | `rules/002_payment_with_no_person.v1.sql` |
+| R-003 | v1 | C3 duplicate by email | `rules/003_duplicate_by_email.v1.sql` |
+| R-004 | v1 | C4 same person, different emails | `rules/004_same_person_different_emails.v1.sql` |
+| R-005 | v1 | C5 record in one source only | `rules/005_record_in_one_source_only.v1.sql` |
+| R-006 | v1 | C6 field disagreement | `rules/006_field_disagreement.v1.sql` |
+| R-007 | v1 | C7 enrolled but unpaid | `rules/007_enrolled_but_unpaid.v1.sql` |
+| R-008 | v1 | C8 dropped sibling | `rules/008_dropped_sibling.v1.sql` |
+| R-009 | v1 | C9 stale pointer | `rules/009_stale_pointer.v1.sql` |
+| R-010 | v1 | C10 merge-collapsed record | `rules/010_merge_collapsed_record.v1.sql` |
+| R-011 | v1 | C11 duplicate payment | `rules/011_duplicate_payment.v1.sql` |
+| R-012 | v1 | C12 wrong-amount payment | `rules/012_wrong_amount_payment.v1.sql` |
+| R-013 | v1 | C13 refund not reflected | `rules/013_refund_not_reflected.v1.sql` |
+| R-014 | v1 | C14 sensitive-field-only disagreement | `rules/014_sensitive_field_only.v1.sql` |
+
+Confidence is **not** in the rules and **not** in code: the committed model is
+[`confidence.yaml`](confidence.yaml) (currently `version: 2`), which `recon/confidence.py` evaluates
+and holds no number of its own. Each score's signals, weights and contributions are persisted on the
+proposal under `evidence.confidence`, so a reviewer reads the arithmetic rather than trusting it.
+
+### Model and provider
+
+| Setting | What it is |
+|---|---|
+| **Graded / default provider** | `LLM_PROVIDER=mock` — model id **`mock-rationale-v1`**. Offline, deterministic, **no API key**. This is the path every number on this page was produced on. |
+| **Live provider** | `LLM_PROVIDER=anthropic` with `LLM_MODEL=claude-opus-5` and `ANTHROPIC_API_KEY` set. Selecting `anthropic` without a key **raises**; it never silently falls back to the mock. |
+| **What the model does** | Rationale text on a proposal, and nothing else. `recon/confidence.py` imports nothing from `recon/llm.py`; the rationale is attached *after* the score exists and is never an input to it. |
+| **Where to set it** | `.env` (`LLM_PROVIDER`, `LLM_MODEL`, `ANTHROPIC_API_KEY`) — see [`.env.example`](.env.example). |
+
+The mock is priced at production rates rather than at zero on purpose: the graded spend-cap burst
+drives the **real** ledger arithmetic with no API key, and a free mock would have made that a
+simulation of a cap instead of a test of one.
+
+### Price table
+
+[`prices.yaml`](prices.yaml) is the **only** place a token price exists — `recon.budget` refuses to
+price an unlisted model (`UnknownModelError`) rather than defaulting to zero, because a zero-cost
+default is an unbounded spend path, not a conservative fallback. Units are **microUSD per token**,
+parsed as `decimal.Decimal` and rounded **up** to whole microUSD, so rounding can only over-charge
+the ledger. `version: 1`, captured 2026-06-24, Anthropic first-party API **list** prices (list, not
+promotional — a reservation must bound the worst case).
+
+| Model | input | output | cache_read | cache_write |
+|---|---|---|---|---|
+| `claude-fable-5` | 10 | 50 | 1 | 12.5 |
+| `claude-opus-5` | 5 | 25 | 0.5 | 6.25 |
+| `claude-opus-4-8` | 5 | 25 | 0.5 | 6.25 |
+| `claude-opus-4-7` | 5 | 25 | 0.5 | 6.25 |
+| `claude-opus-4-6` | 5 | 25 | 0.5 | 6.25 |
+| `claude-sonnet-5` | 3 | 15 | 0.3 | 3.75 |
+| `claude-sonnet-4-6` | 3 | 15 | 0.3 | 3.75 |
+| `claude-haiku-4-5` | 1 | 5 | 0.1 | 1.25 |
+| `mock-rationale-v1` | 5 | 25 | 0.5 | 6.25 |
+
+Caps are environment-set and enforced in-app by `recon.budget`, not by a gateway:
+`DAILY_CAP_USD=5.00` (per UTC day) and `PER_RUN_CAP_USD=1.00` (per reconcile run), reserved
+worst-case up front and settled against provider-reported usage. `budget_ledger.spent_microusd` has
+no writable path: `recon_writer` holds **no INSERT and no UPDATE on `budget_ledger` at all**, and the
+column moves only through triggers on `budget_reservations`, where the capped party may insert a
+reservation and settle it (`actual_microusd`, `state`, `settled_at`) and do nothing else. Zeroing the
+ledger is structurally impossible rather than merely forbidden.
+
+---
+
+## Results
+
+From [`docs/scorecard.txt`](docs/scorecard.txt) (machine-readable twin:
+[`docs/scorecard.json`](docs/scorecard.json)), generated `2026-08-23T21:04:57Z` over **360,400
+landed records / 43,375 entities**. Regenerate it yourself with `make suite`.
+
+**This is the last committed harness run, not a run against the current tree**, and two of its
+figures will move when it is regenerated. The `coverage` row's **3,966 passed, 1 skipped** predates
+127 tests added since (`service/tests/config/`, `service/tests/incidents/`, and the reconcile and
+rationale wiring tests); the suite collects **4,184** today. And the `oscillation-dedup` row's note
+that `conflicts.escalation_reason` is not writable by `recon_writer` is superseded by migration
+`0015_escalation_reason_grant`, which grants exactly that column — confirmed against a freshly
+migrated database. The scorecard is a generated artifact and is never hand-edited; `make suite` is
+the only way to refresh it.
+
+### **16 / 16 PASS**
+
+| Check | Result |
+|---|---|
+| `coverage` | **92.5 %** combined over the 7 core modules (floor 80 %) — adapters 92.0, budget 87.6, confidence 89.2, er 93.2, invariants 94.2, normalize 100.0, reconciler 96.1. **3,966 passed, 1 skipped** in 1,413.58 s. |
+| `golden-diff` | **FN = 0, FP = 0**, field-mismatches 0, matched **3,050 / 3,050** across all 14 conflict types. |
+| `clean-sample` | 1,000 asserted-clean entities, **0 flagged**. |
+| `join-check` | **25 / 25** unified views from `GET /api/entities/{key}` match `golden/expected-views.json` across 14 view fields. |
+| `proposal-safety` | 3,050 conflicts → 3,050 proposals — status pending 2,670 + `sensitive_hold` 380. Cutting the same 3,050 a second way, 1,950 are **evidence-only** (no field-write target: the fix is a note for a human, not a value). C14 held **50/50**; every sensitive target held **380/380**. Source mirror byte-unchanged. |
+| `oscillation-dedup` | Second pass proposed **0** (3,050/3,050 fingerprints skipped); 25/25 oscillating fields escalated. |
+| `mirror-unchanged` | 7 landing/staging tables, 720,809 rows, **byte-unchanged** after a full run. |
+| `determinism` | Dataset, conflict set and confidence vector all byte-identical across two regenerations — digests in [Determinism](#determinism-and-the-canonical-seed). |
+| `manifest` | **47 / 47** generator self-checks green; Appendix A.4 conflict minimums **14 / 14**; A.5 compound ratio 0.2295. |
+| `spend-cap-burst` | 120 contenders → **6 granted, 114 refused** (`KS006`); reserved-while-open 81,600 µUSD == cap; **0 ledger violations**; 124 `cap_hit` audit rows, 124 alerts; 10 retries, 0 granted. |
+| `bench:cross-source-query-p95` | p50 5.6 ms, **p95 6.3 ms** (threshold < 1 s), n=20. |
+| `bench:invariant-pass` | **22.94 s** total over 360,400 records (threshold < 30 s). |
+| `bench:ingestion-rps` | **13,961 rec/s** sustained over 240,200 records (threshold ≥ 500). |
+| `bench:conflict-accuracy` | **precision 1.000000, recall 1.000000** on 3,050 golden entries (threshold: EXACT). |
+| `bench:spend-cap-exact` | 6/6 of 120 granted, settled spend == 1,797 × 6, over-admitted **False** (threshold: EXACT). |
+| `bench:dashboard-load-p95` | **p95 75.2 ms** (threshold < 1 s) — **service-side only**: in-process ASGI, no network, no browser. A floor on a page load, not a page load. |
+
+**Scope, stated with the numbers.** Every row except `manifest` and `determinism`'s dataset half
+grades the loaded database. **Not covered:** browser-side dashboard timing, a live Anthropic provider
+(the graded path is the offline mock), any source other than the three committed JSONL adapters, the
+deployed environment, and the auto-apply/rollback path (covered by `service/tests/apply/`, not by a
+scorecard row). The full note block is printed under every scorecard, green or red.
+
+### Safety properties, and where they are enforced
+
+- **Read-only sources.** No adapter exposes a write method — the `ReadOnlyAdapter` Protocol has none.
+  `mirror-unchanged` re-hashes 7 tables / 720,809 rows either side of the graded run.
+- **Holds before writes.** Proposals are born `pending`, or `sensitive_hold` when the target field is
+  sensitive. The hold is a status-transition trigger plus three least-privilege Postgres roles —
+  `recon_writer` proposes, `review_writer` decides, `apply_writer` applies — not a code comment.
+- **Auto-apply is separate, gated and reversible.** It fires only at confidence **≥ 0.95**, only on a
+  non-sensitive target, only against a cited proposal, and every citation is **single-use** (partial
+  unique indexes) with a recorded reversal path. Policy: [`docs/proposal-policy.md`](docs/proposal-policy.md).
+- **Spend cap.** No writable spend column; refusals carry SQLSTATE `KS006`; every halt writes a
+  `cap_hit` audit row and fires an alert. There is no bypass path.
 
 ---
 
 ## Make targets
 
-| Target | Does |
-|---|---|
-| `make up` | Start Postgres 16 + pgvector, wait for healthy |
-| `make down` | Stop the stack, keep the data volume |
-| `make db-shell` | `psql` into the running container |
-| `make seed` | Graded 120k dataset + `golden/` exports, `--profile full` _(T-2)_ |
-| `make seed-dev` | ~6k inner-loop dataset into `.scratch/` (never the repo tree) |
-| `make serve` | FastAPI service on `:8000` _(T-4+)_ |
-| `make dash` | Dashboard dev server _(T-10)_ |
-| `make suite` | Grading harness + scorecard _(T-14)_ |
-| `make test` | `pytest` + `vitest` |
-| `make lint` | `ruff check` + `ruff format --check` + `pnpm lint` |
-| `make fmt` | Auto-format both packages |
+`make help` prints this list. Every target that needs configuration — `env`, `migrate`, `db-ready`,
+`seed`, `seed-dev`, `serve`, `sync`, `reconcile`, `dash`, `suite`, and the pytest half of `test` — loads the
+repo-root `.env` and exports it into the recipe's environment, including the variables read straight
+from `os.environ` (`DAILY_CAP_USD`, `PER_RUN_CAP_USD`, `OPS_DATABASE_URL`, the `*_WRITER_PASSWORD`
+trio, every `KEYSTONE_*` override) and the `VITE_*` values Vite inlines. `up`, `down`, `db-shell`,
+`lint` and `fmt` need none of it and load none of it. **Your shell wins over the file**, so
+`DATABASE_URL=… make migrate` overrides it exactly as it reads.
+
+| Target | Does | Time |
+|---|---|---|
+| `make env` | Print the configuration the service will **actually** load, secrets redacted | instant |
+| `make up` / `make down` | Start / stop Postgres 16 + pgvector on host port 55432 (volume kept) | seconds |
+| `make db-shell` | `psql` into the running container | — |
+| `make migrate` | Schema, three writer roles, demo API-key hashes, budget scopes | seconds |
+| `make db-ready` | Fail loudly unless `DATABASE_URL` names a database migrated to head | instant |
+| `make seed` | Graded full-profile dataset + committed `golden/` exports | ~30 s |
+| `make seed-dev` | Inner-loop dataset (~6k records) into `.scratch/`, never the committed tree | seconds |
+| `make serve` | FastAPI on `:8000` with reload (refuses to start unmigrated) | — |
+| `make sync` | **Load + detect**: `POST /internal/sync` — ingest, materialize, invariants | **~1 min+** |
+| `make reconcile` | **Propose**: `POST /internal/reconcile` — conflicts → held proposals | ~11 s |
+| `make dash` | Dashboard dev server on `:5173` | — |
+| `make suite` | The committed grading harness; writes `docs/scorecard.{txt,json}` | **~25 min** |
+| `make test` | `pytest` + `vitest`, with `KEYSTONE_REQUIRE_DB=1` | minutes |
+| `make lint` / `make fmt` | `ruff` + `eslint`, check / autofix | seconds |
+
+---
+
+## HTTP API
+
+16 endpoints — count it off `app.openapi()['paths']` on the running service, not off this table.
+Contract and rationale: [`docs/DESIGN.md`](docs/DESIGN.md); interactive schema at
+`/docs` on the running service.
+
+| Method | Path | Auth |
+|---|---|---|
+| `GET` | `/health` | none — service + each source + DB reachability, all bounded |
+| `POST` | `/internal/ingest/records` | `X-Trigger-Secret` (the **sync** job's secret — it is the sync job that drives it) |
+| `POST` | `/internal/sync` | `X-Trigger-Secret` (`TRIGGER_SECRET_SYNC`) |
+| `POST` | `/internal/reconcile` | `X-Trigger-Secret` (`TRIGGER_SECRET_RECONCILE`) |
+| `GET` | `/api/entities` | `X-Api-Key` (**admin scope** — the org-wide index; a `client` key gets 403) |
+| `GET` | `/api/entities/{key}` | `X-Api-Key` — per-row scope filter (out-of-scope rows answer 404, not 403) |
+| `GET` | `/api/conflicts`, `/api/conflicts/{id}` | `X-Api-Key` |
+| `GET` | `/api/proposals`, `/api/proposals/{id}` | `X-Api-Key` |
+| `POST` | `/api/proposals/{id}/approve`, `/reject`, `/apply`, `/rollback` | `X-Api-Key` (admin scope) |
+| `GET` | `/api/incidents` | `X-Api-Key` (**admin scope**) — R25 clustered incidents (stretch #8) |
+| `GET` | `/api/scorecard` | `X-Api-Key` (**admin scope**) — the latest `make suite` results |
+
+Malformed or oversized payloads are rejected with a structured RFC 7807 4xx that does **not** echo
+the rejected object back — the rejected record is the one thing a validation error must not repeat
+into a response body. A source that stalls is cut off at a bounded stall timeout and surfaces as a
+structured error, not as an unhandled 500 or a hung sync.
+
+**What `GET /api/incidents` does and does not do.** It is mounted in `recon/app.py` and served by the
+real factory (`service/tests/integration/test_route_table.py` asserts that against `create_app()`,
+not against a fixture), and **something in the running service now writes the rows it reads** — see
+the next paragraph, because until 2026-08-24 nothing did.
+
+What it serves is narrower than "semantic clustering", and the numbers below were re-measured against
+a real database on 2026-08-24. On the committed golden set the leader clusterer splits 3,050
+conflicts into **38 incidents**, sizes 500 … 1 (mean 80.3, median 41, five singletons), every one of
+them single-type. The sharpest statement of what that adds: the widest grouping over the columns a
+`conflicts` row already carries that the clustering genuinely **refines** is `GROUP BY (type,
+rule_id, sources, disagreeing_fields, the KEY SET of observed_values)` — **19 groups**. The clustering
+gives 38, so **19 splits come from the observed values**: C9 by `deal_present_gen3` (50/50), C11 by
+`deposit` vs `tuition` (17/33), C12 by amount magnitude (7.5e4/1.2e6/3.0e5), C3 by whether
+`dob_norm_b` is null (96/204), C6's 500 conflicts into 13. Grouping on the values instead is not an
+alternative: `GROUP BY` the raw `observed_values` jsonb gives 2,306 groups over 3,050 conflicts.
+
+Two caveats stated because they cut the other way. C8's two incidents (75/75) also differ in
+`sources`, so a plain `GROUP BY (type, sources)` separates those two as well — they are not evidence
+for the clusterer. And adding `oscillating` to the key above gives 21 groups which the clustering
+does **not** refine: two C6 incidents (n=10, n=110) each mix oscillating `true` and `false` members
+that agree on everything else, because one token out of a few dozen does not move two unit vectors
+0.10 apart. Every number here is asserted, without a database, by
+`service/tests/incidents/test_golden_counts.py` — that second caveat is there because writing this
+paragraph as "21 → 38, a refinement" turned that test red.
+
+It **never merges two conflict types**, because `recon.reference.OBSERVED_VALUE_KEYS` pins a distinct
+`observed_values` key set per type (measured: deleting the `type` line from the descriptor gives 49
+incidents, still none of them multi-type). The default and graded embedding is a **lexical** hashing
+trick, not a learned model; real semantics need `EMBEDDING_PROVIDER=voyage`/`openai`, a key and
+money. So the honest one-liner is: **`GROUP BY type` refined by the shape of the disagreeing values,
+19 column-wise groups becoming 38 incidents** — more than a re-spelling of a `GROUP BY`, and not
+cross-type semantic grouping.
+
+**How the rows get there, and what is still missing.** Two callers write them, both real:
+`make incidents` (i.e. `python -m recon.incidents`, the operator entry point — provisions the run's
+ledger scope, clusters, prints the run as JSON on stdout; `--run-id`, `--threshold`, `--status`,
+`--batch-size`, `--charge-daily-cap`), and step 9 of the graded pass in `recon/suite/pipeline.py`,
+which regenerates the incidents that same pass truncates. Every embedding call is metered on the
+real ledger — reserve before, settle after, both scopes — including the offline mock, which
+`prices.yaml` v2 prices at Voyage's rate and migration `0016_price_embedding_models` seeds into
+`budget_model_prices`; the golden set costs 56,487 microusd per pass.
+
+**Which budget that comes out of, because it is not obvious.** R17's mandated daily cap cannot be
+dropped by any caller, but *which ledger row* carries it is configuration. Both writers of
+`incidents` point it at their own ops-provisioned, ops-capped row — the graded pass at a harness row,
+the CLI at the `run:<run-id>` scope it just provisioned — and the JSON reports which one on
+`daily_cap_scope`. So neither spends the shared `daily` row. That is deliberate and measured: nothing
+in the schema rolls `daily` at midnight, one pass is 56,487 microusd of its seeded 5 USD (~88 passes
+and every metered call in the service starts being refused), and reservation rows left on it turn
+`tests/budget/test_ledger.py::test_a_test_process_cannot_touch_the_real_daily_scope` red on that
+database permanently — all three of which a bare `python -m recon.incidents` did before 2026-08-24.
+A deployment whose `daily` row is genuinely managed and rolled opts back in with
+`--charge-daily-cap`; `service/tests/incidents/test_reachability.py` pins both directions. **There is no dashboard panel for it**: `docs/TASKS.md`'s acceptance for this stretch lists
+one, and nothing under `dashboard/src` mentions incidents. The UI half of stretch #8 is not built, and
+no scorecard *row* covers any of it — the pass reports the stage's outcome as a scorecard **note**
+instead, in both directions, so "38 incidents written" and "the stage refused, here is why" are never
+the same silence.
 
 ---
 
 ## Configuration
 
-Every setting is an environment variable; `.env.example` documents all of them and is the
-authoritative list. Two that matter immediately:
+[`.env.example`](.env.example) is the authoritative list and documents every variable the code reads,
+with the reason it exists. `service/tests/config/test_env_example_contract.py` fails if the file and
+the code drift apart **in either direction**.
 
-- **`DATABASE_URL`** drives everything. No DSN is hardcoded anywhere in the code.
-- **`LLM_PROVIDER` / `EMBEDDING_PROVIDER`** default to `mock`, so the whole system — including
-  CI and the graded suite — runs offline and deterministically with no API keys.
+Two that matter immediately:
 
-Never commit `.env`; it is gitignored.
+- **`DATABASE_URL`** drives everything. No DSN is hardcoded anywhere.
+- **`LLM_PROVIDER` / `EMBEDDING_PROVIDER`** both default to `mock`, so the whole system — CI and the
+  graded suite included — runs offline and deterministically with **no API keys**.
+
+`.env` is gitignored; never commit one. `recon.config.Settings` reads `<repo>/.env` and
+`<repo>/service/.env` **by absolute path**, so `cd service && uv run …` is configured too, and a real
+environment variable outranks both files. When anything looks unconfigured, run `make env` — it
+prints which files were found and what each value resolved to.
 
 ---
 
 ## Layout
 
 ```
-service/      Python 3.12, uv, package `recon`  (API, adapters, reconciler, seed, suite)
-dashboard/    Vite + React + TS, pnpm           (reviewer UI)
-rules/        versioned invariant SQL           rules/NNN_name.vX.sql
-golden/       COMMITTED grading contract        rewritten byte-identically by every seed run
-fixtures/     GENERATED by `recon.seed`         gitignored, never hand-edited
-infra/        docker-compose, Dockerfiles, render.yaml
-docs/         SPEC / DESIGN / TASKS / EXECUTION + policy docs + scorecard
+service/      Python 3.12, uv, package `recon`   API, adapters, ER, invariants,
+                                                 reconciler, budget, apply, seed, suite, bench
+  migrations/ alembic — schema, three writer roles, demo keys, budget scopes
+dashboard/    Vite + React + TS, pnpm            reviewer UI, vitest, Playwright a11y
+rules/        versioned invariant SQL            rules/NNN_name.vX.sql — all v1
+golden/       COMMITTED grading contract         rewritten byte-identically by every seed run
+fixtures/     GENERATED by `recon.seed`          gitignored, never hand-edited
+infra/        docker-compose.yml, initdb/, render.yaml
+docs/         SPEC / DESIGN + contract and policy docs + the scorecard
 ```
-
----
-
-## Determinism
-
-The dataset is graded on reproducibility: the same `SEED` must produce a byte-identical dataset,
-conflict set, and confidence vector. The canonical committed seed is **20260822** (also in
-`.env.example` as `SEED`); changing it invalidates `golden/` and requires a regeneration.
-
-- `python -m recon.seed` sets and asserts `PYTHONHASHSEED=0` (re-`exec`ing once if the caller
-  set anything else), so hash randomization can never move a byte.
-- Only `--profile full` may write the repository's `fixtures/` and `golden/`; `--profile dev`
-  refuses unless an explicit `--out` is given.
-- `tests/seed/test_committed_golden.py` regenerates the full profile at the canonical seed and
-  asserts every committed `golden/*.json` matches sha256 — a stale committed golden set is a
-  test failure, not a silent grading hazard. _(Details: T-2.)_
 
 ---
 
 ## CI
 
-`.github/workflows/ci.yml` runs on every push and pull request: `ruff check`, `ruff format
---check`, and `pytest` for `service/` against a pgvector service container; `pnpm lint`,
-`pnpm test`, and `pnpm build` for `dashboard/`.
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs on every push and pull request:
+
+- **service** — `ruff check`, `ruff format --check`, `alembic upgrade head` against a
+  `pgvector/pgvector:pg16` service container, then `pytest` with `KEYSTONE_REQUIRE_DB=1` so a
+  database-less run is red instead of a mass skip.
+- **dashboard** — `pnpm lint`, `pnpm test`, `pnpm build`, then `pnpm test:a11y` (axe-core, keyboard
+  walkthrough, computed contrast) against a real Chromium, with the Playwright report uploaded as an
+  artifact. A missing browser is a **failure, not a skip**.
+
+CI does not run `make suite`; the scorecard is generated deliberately and committed.
 
 ---
 
-## Docs
+## Documentation
 
-- `docs/SPEC.md` — requirements R1–R26
-- `docs/DESIGN.md` — pinned interfaces and decision rationale
-- `docs/TASKS.md` — the ticket graph
-- `.claude/CLAUDE.md` — build conventions and non-negotiables
+| Document | What it covers |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | System design, the two required diagrams, decisions and rationale |
+| [AI_USAGE.md](AI_USAGE.md) | AI tooling disclosure — tools, provider/model, price table, shaping prompts |
+| [docs/demo-script.md](docs/demo-script.md) | The video-demo walkthrough — every beat, its command, and the output it produced |
+| [docs/SPEC.md](docs/SPEC.md) | Requirements R1–R26 |
+| [docs/DESIGN.md](docs/DESIGN.md) | Pinned interfaces, the endpoint contract, decisions and rationale |
+| [docs/invariant-contract.md](docs/invariant-contract.md) | Invariant semantics — the contract the SQL rules implement |
+| [docs/proposal-policy.md](docs/proposal-policy.md) | Proposal gating, sensitive-field holds, auto-apply and rollback |
+| [docs/retention-policy.md](docs/retention-policy.md) | Privacy-safe logging modes and data retention |
+| [docs/scorecard.txt](docs/scorecard.txt) · [docs/scorecard.json](docs/scorecard.json) | The committed grading harness output |
+| [dashboard/README.md](dashboard/README.md) | Dashboard configuration, mock mode, accessibility |
+| [.claude/CLAUDE.md](.claude/CLAUDE.md) | Build conventions and non-negotiables |
+
+**No PII anywhere.** Every name, email, amount and date in this repository is synthetic, generated by
+`recon.seed` from the canonical seed.

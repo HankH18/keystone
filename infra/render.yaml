@@ -1,5 +1,11 @@
 # ---------------------------------------------------------------------------
-# Keystone — Render blueprint: the service plus the three scheduled jobs (R19).
+# Keystone — Render blueprint: the service, the dashboard, and the three
+# scheduled jobs (R19).
+#
+# The database is **Neon**, not Render Postgres. This file used to declare a
+# `databases:` block and bind five env vars to it with `fromDatabase`, which
+# meant deploying this blueprint provisioned a SECOND Postgres and never touched
+# Neon at all. The block is gone and every value below names Neon explicitly.
 #
 # DESIGN pins the scheduling decision: **Render cron -> HTTPS + shared-secret
 # header**. pg_cron cannot carry the mandated trigger header and an in-process
@@ -8,13 +14,10 @@
 #
 # WHICH PRINCIPAL EACH PROCESS CONNECTS AS, AND WHY
 # --------------------------------------------------
-# Migrations 0002–0010 build a three-role write boundary and enforce it with
+# Migrations 0002-0010 build a three-role write boundary and enforce it with
 # grants and `current_user`/`session_user`-keyed triggers. **A trigger keyed on
 # the connected role binds nothing at all if the process connects as the
-# database owner**, and until now this file gave the web service
-# `DATABASE_URL: fromDatabase … connectionString` — the owner — while its own
-# comment claimed it held "the capped party's credentials". Six red-team rounds
-# of boundary went out of the window on that one line.
+# database owner**, so the serving process connects as `recon_writer`.
 #
 #   process                     connects as        why
 #   --------------------------  -----------------  --------------------------
@@ -27,19 +30,52 @@
 #                                                  the same host/database.
 #     └ apply / rollback        apply_writer       APPLIES, under the cited-
 #                                                  proposal triggers.
-#     └ run-scope provisioning  ops                One narrow call. See the
-#         and `alembic upgrade`                    OPS_DATABASE_URL note below.
-#   keystone-budget-sweeper     ops                Closes somebody else's
+#     └ run-scope provisioning  the schema OWNER   One narrow call. There is no
+#         and `alembic upgrade`  (`neondb_owner`)  role named `ops`; the "ops
+#                                                  principal" IS the owner, and
+#                                                  it is named by
+#                                                  OPS_DATABASE_URL.
+#   keystone-budget-sweeper     the schema OWNER   Closes somebody else's
 #                                                  reservation; refuses to run
 #                                                  as the capped party.
 #   keystone-sync / -reconcile  (no database)      They are `curl`; the work
 #                                                  happens in the web service.
+#   keystone-dashboard          (no database)      Static bundle in a browser;
+#                                                  talks to the API over HTTPS.
 #
 # `recon.db.role_connection` derives every role DSN from `DATABASE_URL` by
 # swapping the username and password, so pointing `DATABASE_URL` at
 # `recon_writer` gives the reviewer and apply paths their own principals for
-# free — and gives the *default* path the restricted one, which is the part that
-# was wrong.
+# free — and gives the *default* path the restricted one.
+#
+# WHY THE PASSWORD IS NOT IN THE DSN  (this is a correctness fix, not style)
+# --------------------------------------------------------------------------
+# This file used to compose
+#     DATABASE_URL="postgresql://recon_writer:$RECON_WRITER_PASSWORD@$HOST/..."
+# which pastes a raw secret into the userinfo component of a URL. `recon.db`
+# parses it with `make_url`, so a password containing `@` silently retargets the
+# host, and one containing `%` or `/` throws or truncates. Render's
+# `generateValue` emits a **base64** 256-bit value whose alphabet includes `+`,
+# `/` and `=` — i.e. exactly the characters that break a hand-built DSN. The two
+# are not compatible, so the fix is structural rather than an escaping rule
+# nobody will remember:
+#
+#   `DATABASE_URL` carries NO password. `PGPASSWORD` carries it.
+#
+# libpq reads `PGPASSWORD` whenever the connection info omits a password, and
+# SQLAlchemy's psycopg dialect omits the key entirely when the URL has none
+# (verified against this repo's own pinned SQLAlchemy: `create_connect_args` on
+# `postgresql+psycopg://recon_writer@host/neondb` yields no `password` key).
+# Nothing has to be percent-encoded, because nothing is ever parsed as a URL.
+#
+# The other two roles were already safe and stay as they are: `role_url()` uses
+# `URL.set(password=...)`, which hands psycopg the raw string as a keyword
+# argument and never round-trips it through URL syntax. An explicit password
+# also takes precedence over `PGPASSWORD`, so `review_writer`, `apply_writer`
+# and the owner DSN are unaffected by the variable being set.
+#
+# Bonus property worth keeping: `DATABASE_URL` is now safe to print. Any handler
+# that dumps the environment leaks a hostname instead of a credential.
 #
 # THE ONE OWNER-GRADE CREDENTIAL THE WEB SERVICE STILL HOLDS
 # -----------------------------------------------------------
@@ -56,39 +92,83 @@
 # stays. **The residual gap is therefore real and is stated rather than hidden:
 # a web dyno that is fully compromised can reach an owner credential through its
 # own environment.** Closing it means moving run-scope provisioning off the
-# request path — an ops job, or a pre-provisioned pool of run scopes — which is
-# a change to `recon/api/internal.py` and not to this file.
-#
-# `alembic upgrade head` needs the owner too, and Render has no separate
-# migration job: `preDeployCommand` runs in the web service's environment. It is
-# spelled `DATABASE_URL="$OPS_DATABASE_URL" …` so that the *variable the
-# application reads* is never the owner's, even for that command's duration.
+# request path — a change to `recon/api/internal.py`, not to this file.
 #
 # NO SECRET VALUE APPEARS IN THIS FILE.
-# Every credential is declared with `sync: false`, which tells Render "this
-# variable exists, ask for its value in the dashboard and never read one from
-# the repository". A blueprint is committed; a committed secret is a leaked
-# secret the moment the repo is cloned. Generate the two trigger secrets with
-#     openssl rand -hex 32
-# and set them on BOTH the web service and the cron job that uses them — they
-# are per-job on purpose (R19/DESIGN), so `keystone-sync` never learns the
-# reconcile secret and rotating one does not rotate the other.
+# Hostnames, ports, database names and the committed demo API key are not
+# secrets — Neon refuses every one of those without a password, and the demo key
+# is a synthetic constant compiled into migration 0003. Everything that IS a
+# secret is either `generateValue: true` (Render mints it; it never exists
+# outside Render, and no human ever pastes it) or `sync: false` (Render prompts
+# for it in the dashboard). A blueprint is committed; a committed secret is a
+# leaked secret the moment the repo is cloned.
 #
-# The three role passwords must match the ones the roles were created with (see
-# `migrations/versions/0002_roles_and_grants.py` and `0005_three_role_boundary.py`,
-# which read `RECON_WRITER_PASSWORD`, `REVIEW_WRITER_PASSWORD` and
-# `APPLY_WRITER_PASSWORD` at migration time). Set them on the web service AND on
-# whatever runs the migration, or the roles are created with one password and
-# connected to with another.
+# The three role passwords and the two trigger secrets are all `generateValue`.
+# That is safe *because the migration re-applies them on every deploy*:
+# `0002_roles_and_grants.py` reads `<ROLE>_PASSWORD` from the environment and
+# runs `ALTER ROLE ... PASSWORD %L` when the role already exists, so the value
+# Render generated once is re-asserted at every `alembic upgrade head`. The
+# crons do not generate their own — they copy the web service's with
+# `fromService: envVarKey`, which is the only way to make two services agree on
+# a generated value. They remain per-job (R19/DESIGN): `keystone-sync` never
+# learns the reconcile secret, and rotating one does not rotate the other.
+#
+# NEON: WHICH ENDPOINT, AND WHY IT MATTERS
+# -----------------------------------------
+# Neon publishes two hostnames for the same compute. They are not
+# interchangeable:
+#
+#   DIRECT  ep-young-shape-ayr8cqc1.c-5.us-east-2.aws.neon.tech
+#           Used for `alembic upgrade head` (OPS_DATABASE_URL). Migration 0002
+#           takes `pg_advisory_xact_lock` and stashes the role password in a
+#           transaction-local GUC via `set_config(..., true)`. Both are
+#           transaction-scoped and would survive transaction pooling, but the
+#           migration principal is also the one doing CREATE ROLE / GRANT, and
+#           there is no reason to put a PgBouncer between a once-per-deploy
+#           command and the catalog.
+#
+#   POOLED  ep-young-shape-ayr8cqc1-pooler.c-5.us-east-2.aws.neon.tech
+#           Used at runtime. Checked before choosing it: Neon's pooler is
+#           PgBouncer in transaction mode, which supports protocol-level
+#           prepared statements (1.22+), so psycopg3's automatic prepare is
+#           fine; and the only `SET` on a serving path is `SET LOCAL
+#           lock_timeout` in `recon/invariants/context.py`, which is
+#           transaction-scoped. No session-level advisory lock, LISTEN/NOTIFY,
+#           or SQL-level PREPARE exists on a runtime path.
+#
+# Neon is PostgreSQL **18.6**; local development is `pgvector/pgvector:pg16`.
+# Two major versions apart — stated, not implied away.
+#
+# NEON SCALE-TO-ZERO — the one risk this file can only half-fix
+# -------------------------------------------------------------
+# Compute `ep-young-shape-ayr8cqc1` has `suspend_timeout_seconds: 0`, which in
+# Neon's API means "use the default" (~5 minutes idle), not "never suspend".
+# `/health` opens a real connection under a hard 2.0s bound
+# (`HEALTH_PROBE_TIMEOUT_SECONDS` in `recon/health.py`) and a cold Neon start
+# exceeds that; the probe then reports `timeout`, severity 3 >= _FATAL, so
+# `/health` answers **503** and Render pulls the instance out of rotation.
+#
+# What this file does about it: `preDeployCommand` runs `alembic upgrade head`
+# against the DIRECT endpoint immediately before the deploy goes live, and the
+# direct and pooled hostnames front the SAME compute — so the compute is awake
+# when Render's first health check lands. That covers the deploy, not steady
+# state.
+#
+# What this file CANNOT do about it: `HEALTH_PROBE_TIMEOUT_SECONDS` is a module
+# constant with no environment override, and Render exposes no health-check
+# interval or timeout in the blueprint spec. **Set the Neon compute to never
+# suspend before relying on this deployment:**
+#     neon compute update ep-young-shape-ayr8cqc1 --suspend-timeout -1
+# (or PATCH the endpoint with `suspend_timeout_seconds: -1`). Until that is
+# done, the service can 503 after five idle minutes.
 #
 # TLS (R20) is not optional and not configured here: Render terminates TLS on
 # every `onrender.com` host, and each cron below pins `--proto '=https'` so the
 # request fails rather than silently downgrading if the host variable is ever
 # edited to an http:// origin; `property: host` yields a bare hostname, so the
 # scheme is written literally in the command rather than inherited from a URL.
-# The composed `DATABASE_URL` pins `sslmode=require` for the same reason: it is
-# assembled here rather than handed over by `connectionString`, so the transport
-# setting has to be written down rather than inherited.
+# `sslmode=require` is pinned on the composed DSN for the same reason — Neon
+# requires TLS regardless, but the setting is written down rather than assumed.
 # ---------------------------------------------------------------------------
 services:
   - type: web
@@ -98,65 +178,135 @@ services:
     region: oregon
     rootDir: service
     healthCheckPath: /health
-    autoDeploy: false
-    buildCommand: pip install --upgrade uv && uv sync --frozen --no-dev
+    # `autoDeploy` is deprecated in favour of `autoDeployTrigger`. It is set on
+    # EVERY service here: it used to be on the web service alone, so a push
+    # moved the three crons while the web service stayed pinned.
+    autoDeployTrigger: "off"
+    # THE SEED IS PART OF THE BUILD, and without it the deploy can never go
+    # green. `fixtures/` is gitignored (`git ls-files fixtures/` -> just
+    # `.gitkeep`), so on a fresh checkout all three source adapters report
+    # "down", `/health` rolls that up to 503, and Render never routes traffic —
+    # with a perfectly healthy database.
+    #
+    # `--profile full` is the GRADED dataset and it is what runs here. The cost
+    # was measured, not guessed: `docs/scorecard.txt` records the determinism
+    # row regenerating this exact profile twice at **27.3s and 27.0s**, for
+    # ~123MB of fixtures. That is a rounding error in a build, so there is no
+    # reason to ship the deployment a `--profile dev` dataset that is not the
+    # one the golden files, the scorecard and the Appendix-A minimums describe.
+    # (If the build ever does time out, `--profile dev` is the fallback and the
+    # tradeoff is explicit: ~6k records, all 14 conflict classes still present
+    # at scaled-down minimums, but NOT the graded dataset — the deployed numbers
+    # would then disagree with `golden/` and with every number in the README.)
+    #
+    # `--seed "$SEED"` is what makes the SEED variable below real. It used to be
+    # inert config: nothing in the service reads it, so setting it in Render
+    # changed nothing. Now it is the control it claims to be.
+    #
+    # The last step is a GATE, not a log line. `recon.seed` writes to the repo
+    # root regardless of `rootDir`, and whether that directory survives from the
+    # build into the runtime filesystem is the one thing here I cannot test
+    # without deploying. So the build asks the SAME function `/health` uses
+    # (`recon.adapters.jsonl.default_fixtures_root`) whether it can see all
+    # three sources, and fails the build if it cannot — turning a silent 503 at
+    # runtime into a loud red build.
+    buildCommand: >-
+      pip install --upgrade uv &&
+      uv sync --frozen --no-dev &&
+      uv run python -m recon.seed --profile full --seed "$SEED" &&
+      uv run python -c "import sys; from recon.adapters.jsonl import default_fixtures_root as R, SOURCE_ADAPTERS as S; r = R(); missing = [s for s in S if not (r / s).is_dir()]; print('fixtures root:', r, '| missing:', missing); sys.exit(1 if missing else 0)"
     # Migrations run on release, not at import time: a web dyno that migrates on
-    # boot races itself the moment the service scales past one instance. They run
-    # as the OWNER, and the owner's DSN is passed to this one command rather than
-    # left in the variable the application reads.
+    # boot races itself the moment the service scales past one instance. They
+    # run as the OWNER, against the DIRECT Neon endpoint (see the header), and
+    # the owner's DSN is passed to this one command rather than left in the
+    # variable the application reads.
     preDeployCommand: DATABASE_URL="$OPS_DATABASE_URL" uv run alembic upgrade head
-    # THE CAPPED PARTY'S CREDENTIALS, for real this time. `DATABASE_URL` is
-    # assembled from the database's own host/port/name plus the recon_writer
-    # password, so the serving process authenticates as `recon_writer` and every
-    # grant and every role-keyed trigger in migrations 0002-0010 actually binds
-    # it. `recon.db.role_connection` swaps in review_writer / apply_writer on the
-    # same host for the paths that need them.
+    # THE CAPPED PARTY'S CREDENTIALS. `DATABASE_URL` names the pooled Neon
+    # endpoint and the `recon_writer` user and carries NO password; `PGPASSWORD`
+    # supplies it out of band so no secret is ever parsed as URL syntax (see
+    # the header). `recon.db.role_connection` swaps in review_writer /
+    # apply_writer on the same host for the paths that need them.
+    #
+    # Nothing else is composed here. `KEYSTONE_CORS_ORIGINS` -- the one other
+    # value that could have been, since the dashboard's origin needs a scheme
+    # and `property: host` yields a bare hostname -- is a plain literal in
+    # `envVars` below instead, with the scheme written out. This comment used to
+    # claim it was composed in this command; it never was, and the value would
+    # then have come from `DEFAULT_CORS_ORIGINS` (localhost:5173) and refused
+    # every request the deployed dashboard makes.
     startCommand: >-
-      DATABASE_URL="postgresql://recon_writer:$RECON_WRITER_PASSWORD@$KEYSTONE_DB_HOST:$KEYSTONE_DB_PORT/$KEYSTONE_DB_NAME?sslmode=require"
+      DATABASE_URL="postgresql://recon_writer@$KEYSTONE_DB_HOST:$KEYSTONE_DB_PORT/$KEYSTONE_DB_NAME?sslmode=require"
+      PGPASSWORD="$RECON_WRITER_PASSWORD"
       uv run uvicorn recon.app:create_app --factory --host 0.0.0.0 --port $PORT
     envVars:
-      # The pieces `DATABASE_URL` is assembled from. Non-secret on their own.
+      # ---- Neon coordinates. Not secrets: Neon refuses all of them without a
+      # password, so committing them costs nothing and pins the endpoint choice
+      # in code review rather than in somebody's clipboard.
       - key: KEYSTONE_DB_HOST
-        fromDatabase:
-          name: keystone-db
-          property: host
+        value: ep-young-shape-ayr8cqc1-pooler.c-5.us-east-2.aws.neon.tech
       - key: KEYSTONE_DB_PORT
-        fromDatabase:
-          name: keystone-db
-          property: port
+        value: "5432"
       - key: KEYSTONE_DB_NAME
-        fromDatabase:
-          name: keystone-db
-          property: database
-      # The OWNER, for the pre-deploy migration and for the four ops-only
-      # operations in `recon.budget.ops_engine()` -- never for serving a request.
-      # See the header for the residual gap this represents and how to close it.
+        value: neondb
+      # ---- The OWNER, for the pre-deploy migration and for the four ops-only
+      # operations in `recon.budget.ops_engine()` -- never for serving a
+      # request. See the header for the residual gap this represents.
+      #
+      # PASTE THE **DIRECT** (non `-pooler`) NEON DSN HERE, exactly as the Neon
+      # console prints it:
+      #   postgresql://neondb_owner:<pw>@ep-young-shape-ayr8cqc1.c-5.us-east-2.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+      # Pasted whole and never composed, so its password is already correctly
+      # encoded by whoever generated it, and an explicit password in the DSN
+      # takes precedence over PGPASSWORD.
       - key: OPS_DATABASE_URL
-        fromDatabase:
-          name: keystone-db
-          property: connectionString
-      # Per-job trigger secrets (R19). Values live only in the Render dashboard.
+        sync: false
+      # ---- Per-job trigger secrets (R19). Render mints them; no human ever
+      # sees or pastes them. The crons copy these two by `envVarKey` below,
+      # which is what guarantees both ends hold the same value. Base64 is a
+      # legal HTTP header value, and `recon.api.auth` compares with
+      # `hmac.compare_digest`.
       - key: TRIGGER_SECRET_SYNC
-        sync: false
+        generateValue: true
       - key: TRIGGER_SECRET_RECONCILE
-        sync: false
-      # Role passwords for the three-role write boundary (migration 0005).
-      # RECON_WRITER_PASSWORD is now load-bearing at RUNTIME as well as at
-      # migration time: the composed DATABASE_URL above authenticates with it.
+        generateValue: true
+      # ---- Role passwords for the three-role write boundary (0002 / 0005).
+      # Generated, not prompted: the migration re-applies each one with
+      # `ALTER ROLE ... PASSWORD` on every deploy, so Render's value is always
+      # the value the role actually has. RECON_WRITER_PASSWORD is load-bearing
+      # at RUNTIME as well as at migration time -- it is what PGPASSWORD carries.
       - key: RECON_WRITER_PASSWORD
-        sync: false
+        generateValue: true
       - key: REVIEW_WRITER_PASSWORD
-        sync: false
+        generateValue: true
       - key: APPLY_WRITER_PASSWORD
-        sync: false
-      # Spend caps (R17). Read at migration time to provision the ledger rows
-      # and by `recon.budget` to provision each run's scope.
+        generateValue: true
+      # ---- The dashboard's origin, for CORS. `recon.app.allowed_origins` reads
+      # this as a comma-separated list and falls back to the Vite dev-server
+      # origins when it is blank, which would refuse every request the deployed
+      # dashboard makes.
+      #
+      # This is a literal rather than a `fromService` reference ON PURPOSE. The
+      # dashboard already references this service (it needs the API host baked
+      # into its bundle at build time); adding the reverse reference would make
+      # the two services mutually dependent. The service->dashboard direction is
+      # the one that can be a literal, because it is read at RUNTIME.
+      #
+      # !! Render appends a random suffix if `keystone-dashboard` is taken in
+      # the workspace. After the first apply, check the static site's real
+      # onrender.com host and correct this value if it differs. A mismatch shows
+      # up as every dashboard request failing with an opaque CORS error and
+      # NOTHING in the service log.
+      - key: KEYSTONE_CORS_ORIGINS
+        value: https://keystone-dashboard.onrender.com
+      # ---- Spend caps (R17). Read at migration time to provision the ledger
+      # rows and by `recon.budget` to provision each run's scope.
       - key: DAILY_CAP_USD
         value: "5.00"
       - key: PER_RUN_CAP_USD
         value: "1.00"
       # `mock` needs no key and no network; flipping to `anthropic` requires
       # ANTHROPIC_API_KEY, which fails loudly if absent rather than falling back.
+      # Leave the key blank at the prompt while the provider is `mock`.
       - key: LLM_PROVIDER
         value: mock
       - key: LLM_MODEL
@@ -166,17 +316,106 @@ services:
       # `safe` redacts personal data out of stored logs (R21). Never `full` here.
       - key: LOG_MODE
         value: safe
+      # Consumed by `buildCommand` above as `--seed "$SEED"`. Determinism is
+      # graded, so this is pinned, not random.
       - key: SEED
         value: "20260822"
 
   # -------------------------------------------------------------------------
-  # Scheduled jobs. Each carries ONLY its own secret.
+  # The dashboard (brief, Submission Requirements: "Deployed application URL
+  # (service + dashboard)"). There was no dashboard in this blueprint at all.
+  #
+  # A Render static site is `type: web` + `runtime: static` + a
+  # `staticPublishPath` -- there is no `type: static` in the blueprint spec.
+  # `region` "does not apply to static sites" per the spec, so it is omitted
+  # rather than set to oregon; so is `plan` (static sites have no instance
+  # type), and `healthCheckPath` is web-services-only.
+  #
+  # BUILD ORDER IS THE WHOLE PROBLEM HERE. Vite substitutes `import.meta.env.*`
+  # at BUILD time (`dashboard/src/lib/api.ts` reads VITE_API_BASE_URL and
+  # VITE_API_KEY), so the API origin is frozen into the bundle and cannot be
+  # configured afterwards. Render resolves `fromService` before the build runs,
+  # so `KEYSTONE_API_HOST` is available to `buildCommand` -- but `property:
+  # host` yields a BARE HOSTNAME, and a `VITE_` variable cannot prepend a
+  # scheme. Hence the scheme is prepended in the build command itself, which
+  # Vite picks up because it reads prefixed variables from the process
+  # environment, not only from `.env` files.
+  #
+  # The bundle is a client-side-routed SPA (`dashboard/src/lib/router.tsx` uses
+  # `history.pushState` and reads `window.location.pathname`), so a deep link
+  # like /proposals is a real path to a static host and would 404. The rewrite
+  # below is required, not decoration.
+  # -------------------------------------------------------------------------
+  - type: web
+    name: keystone-dashboard
+    runtime: static
+    rootDir: dashboard
+    autoDeployTrigger: "off"
+    # pnpm is installed explicitly rather than through corepack: `package.json`
+    # declares no `packageManager` field, and corepack's behaviour without one
+    # depends on its download-prompt setting. The lockfile is `lockfileVersion:
+    # '9.0'`, which pnpm 10 reads natively.
+    #
+    # `--prod=false` is deliberate: `pnpm build` runs `tsc -b && vite build`,
+    # and typescript and vite are devDependencies. If anything ever sets
+    # NODE_ENV=production in the build environment, a default install would
+    # skip them and the build would fail on a missing `tsc`.
+    #
+    # THE FIRST CLAUSE IS A GATE, NOT A NICETY. It is UNVERIFIED that
+    # `fromService` resolves into a STATIC SITE's build environment (it is
+    # documented for services; static-site builds are the untested case). If it
+    # resolves to nothing, `VITE_API_BASE_URL` bakes as the literal string
+    # "https://" -- a green build, a green deploy, and every dashboard request
+    # failing in the browser with NOTHING in any server log. So an empty
+    # KEYSTONE_API_HOST fails the build loudly instead of shipping that bundle.
+    buildCommand: >-
+      test -n "$KEYSTONE_API_HOST" || { echo "FATAL: KEYSTONE_API_HOST is empty - fromService did not resolve into the static-site build env; VITE_API_BASE_URL would bake as 'https://'. Failing the build." >&2; exit 1; } &&
+      npm install -g pnpm@10 &&
+      pnpm install --frozen-lockfile --prod=false &&
+      VITE_API_BASE_URL="https://$KEYSTONE_API_HOST" pnpm build
+    staticPublishPath: ./dist
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    envVars:
+      - key: KEYSTONE_API_HOST
+        fromService:
+          type: web
+          name: keystone-service
+          property: host
+      # The committed demo ADMIN key, sent as `X-Api-Key`. This is not a secret
+      # and is not treated as one: it is a synthetic constant compiled into
+      # migration `0003_seed_api_clients.py` (stored only as
+      # `sha256(f"{API_KEY_SALT}:{key}")`) and documented in `.env.example`, so
+      # that the hub, dashboard and benchmarks are gradeable from a clean
+      # checkout. Admin scope is required because reviewer actions need the
+      # org-wide scope (DESIGN, Dashboard <-> API).
+      - key: VITE_API_KEY
+        value: keystone-demo-admin-8c25e0b71a94f36d
+      # Pinned so a Render default bump cannot break a Vite 8 / TypeScript 6
+      # build without a commit.
+      - key: NODE_VERSION
+        value: "22"
+      # VITE_USE_MOCK_API is deliberately ABSENT. Unset means the real HTTP
+      # client (`dashboard/src/lib/apiClient.ts`); setting it to 1 would ship a
+      # dashboard that talks to an in-browser fake and never touches the API.
+
+  # -------------------------------------------------------------------------
+  # Scheduled jobs. Each carries ONLY its own secret, copied from the web
+  # service by `envVarKey` so the two ends cannot drift.
   #
   # `--fail-with-body` makes a 401 a non-zero exit (so a broken secret shows up
   # as a failed cron rather than a green one), `--proto '=https'` refuses a
   # plaintext downgrade, and the run id is minted from the firing time so a
   # Render retry of the same firing replays the same id and the endpoint
   # answers `"status": "replayed"` instead of running the job twice.
+  #
+  # The header name is `X-Trigger-Secret` (`recon.api.auth.TRIGGER_SECRET_
+  # HEADER`) and the secrets are per job: `recon.api.auth` maps sync ->
+  # (trigger_secret_sync, trigger_secret) and reconcile ->
+  # (trigger_secret_reconcile,) only, so the reconcile job deliberately does not
+  # accept the deprecated shared secret.
   # -------------------------------------------------------------------------
   - type: cron
     name: keystone-sync
@@ -185,6 +424,7 @@ services:
     region: oregon
     rootDir: service
     schedule: "0 * * * *"
+    autoDeployTrigger: "off"
     buildCommand: "true"
     startCommand: >-
       curl --fail-with-body --show-error --silent --location
@@ -200,7 +440,10 @@ services:
           name: keystone-service
           property: host
       - key: TRIGGER_SECRET_SYNC
-        sync: false
+        fromService:
+          type: web
+          name: keystone-service
+          envVarKey: TRIGGER_SECRET_SYNC
 
   - type: cron
     name: keystone-reconcile
@@ -209,6 +452,7 @@ services:
     region: oregon
     rootDir: service
     schedule: "20 * * * *"
+    autoDeployTrigger: "off"
     buildCommand: "true"
     startCommand: >-
       curl --fail-with-body --show-error --silent --location
@@ -224,10 +468,13 @@ services:
           name: keystone-service
           property: host
       - key: TRIGGER_SECRET_RECONCILE
-        sync: false
+        fromService:
+          type: web
+          name: keystone-service
+          envVarKey: TRIGGER_SECRET_RECONCILE
 
   # -------------------------------------------------------------------------
-  # The budget-ledger sweeper (R17, DESIGN §Budget ledger: "TTL sweeper reclaims
+  # The budget-ledger sweeper (R17, DESIGN, Budget ledger: "TTL sweeper reclaims
   # dead reservations"). DESIGN pinned it and, until this job existed, NOTHING
   # CALLED IT: a process that died between reserving and settling held its
   # worst-case reservation against the cap for ever.
@@ -252,13 +499,12 @@ services:
   # deliberately no flag meaning "release anyway".
   #
   # It is NOT an HTTPS trigger like the two above, and that is the point. It must
-  # run as the OPS principal: the web service connects as `recon_writer` (see the
-  # header -- it really does now), and a capped party able to close somebody
-  # else's reservation has re-invented "zero the spend". `recon.budget.main`
-  # refuses to sweep as `recon_writer` before it touches a row, so a
-  # misconfigured DATABASE_URL fails the cron loudly instead of quietly doing the
-  # wrong thing -- and `recon.suite`'s `spend-cap-burst` row now proves that
-  # refusal by misconfiguring one on purpose and watching it fire.
+  # run as the OWNER: the web service connects as `recon_writer`, and a capped
+  # party able to close somebody else's reservation has re-invented "zero the
+  # spend". `recon.budget.main` refuses to sweep as `recon_writer` before it
+  # touches a row, so a misconfigured DATABASE_URL fails the cron loudly instead
+  # of quietly doing the wrong thing -- and `recon.suite`'s `spend-cap-burst` row
+  # proves that refusal by misconfiguring one on purpose and watching it fire.
   #
   # `--sweep-unleased` is deliberately absent: a reservation with no lease
   # duration in its key cannot be told apart from a call still in flight, and it
@@ -271,29 +517,32 @@ services:
     region: oregon
     rootDir: service
     schedule: "*/10 * * * *"
+    autoDeployTrigger: "off"
     buildCommand: pip install --upgrade uv && uv sync --frozen --no-dev
     startCommand: uv run python -m recon.budget sweep
     envVars:
-      # The OPS principal, not the capped party: `fromDatabase` yields the
-      # database's own connection string, which is the whole reason this job
-      # exists as a job rather than as an endpoint on the web service. Here
-      # DATABASE_URL *is* the owner, deliberately, and no OPS_DATABASE_URL is
-      # set -- `recon.budget.ops_engine()` falls back to DATABASE_URL, which is
-      # already the right principal for this process.
+      # The OPS principal, not the capped party. This copies the web service's
+      # OPS_DATABASE_URL rather than prompting for the owner DSN a second time:
+      # one paste, and the two can never drift apart. Here DATABASE_URL *is* the
+      # owner, deliberately, and no OPS_DATABASE_URL is set --
+      # `recon.budget.ops_engine()` falls back to DATABASE_URL, which is already
+      # the right principal for this process.
       #
       # The same principal runs `python -m recon.budget resume --scope <s>
       # --reason <r>`, the ONLY way to lift the durable halt a scope enters when
       # a settlement reports more than its reservation could hold. The capped
       # party can stop itself; only ops can start it again, after reconciling.
       - key: DATABASE_URL
-        fromDatabase:
-          name: keystone-db
-          property: connectionString
+        fromService:
+          type: web
+          name: keystone-service
+          envVarKey: OPS_DATABASE_URL
       - key: LOG_MODE
         value: safe
 
-databases:
-  - name: keystone-db
-    plan: basic-256mb
-    region: oregon
-    postgresMajorVersion: "16"
+# There is deliberately NO `databases:` block. The database is Neon (project
+# green-wave-67653806, branch production, PostgreSQL 18.6). Migrations 0001-0014
+# were applied there by hand and verified; `0015_escalation_reason_grant` landed
+# afterwards and is applied by the `preDeployCommand` above like any other.
+# Re-adding a Render Postgres here would provision a second, empty database and
+# every `fromDatabase` reference would quietly point the service at it.

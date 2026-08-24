@@ -10,6 +10,8 @@
  *   POST /api/proposals/{id}/approve
  *   POST /api/proposals/{id}/reject
  *   POST /api/proposals/{id}/apply     (approved only; auto path per R24)
+ *                                      `?auto=true` selects R24's gated write;
+ *                                      the default is the reviewer's own.
  *   GET  /api/scorecard                (latest suite results, for reconciliation)
  *   Auth: header `X-Api-Key`, the committed ADMIN demo key.
  *   Errors: RFC7807-style {type, title, status, detail}.
@@ -17,10 +19,16 @@
  *   proposals.status ∈ pending|approved|rejected|applied|rolled_back|sensitive_hold
  *
  * ============================================================================
- * ASSUMED — NOT promised by DESIGN.md. The service does not exist yet (T-5/T-7/
- * T-8 build it). Each of these is a shape this dashboard had to choose; every
- * one of them is isolated to this file plus src/lib/httpClient.ts, so the change
- * when the real API lands is local. They are also listed in dashboard/README.md.
+ * ASSUMED — NOT promised by DESIGN.md. Each of these is a shape this dashboard
+ * had to choose while the service was still being built (T-5/T-7/T-8); every one
+ * of them is isolated to this file plus src/lib/httpClient.ts, so the change when
+ * the real API landed was local. They are also listed in dashboard/README.md.
+ *
+ * THE SERVICE NOW EXISTS, and the list is kept as the RECORD of what was assumed
+ * and how each one was answered — including the two that were answered by being
+ * proved wrong (A9, A10). `service/tests/api/test_contract_assumptions.py` reads
+ * this list as data and requires a verdict for every id in it, so the entries
+ * below are load-bearing and are not history to be tidied away.
  * ============================================================================
  *   A1  Pagination envelope `{items, page, page_size, total}`, request params
  *       `page` (1-based) and `page_size`.
@@ -39,24 +47,34 @@
  *       rather than crashing, so a wider real vocabulary degrades gracefully.
  *   A7  `conflicts.sources` is a string array of source ids. DESIGN pins the
  *       jsonb column; contract §8 pins the value set.
- *   A8  `/api/proposals` accepts `source` and `type` filters. This is the ONE
- *       assumption here with a SILENT failure mode, and it is the reason
- *       `CONTRACT_ASSUMPTIONS` below exists as data rather than prose: the
- *       `proposals` table pinned in DESIGN §Data models has NO source and NO
- *       type column, so serving these two filters requires a JOIN to
- *       `conflicts` that the service may never implement. A service that
- *       ignores an unknown query param returns 200 with the UNFILTERED page —
- *       wrong results on a reviewer surface, not an error. Nothing on a
- *       proposal row can prove the filter was applied either, so the client
- *       cannot verify it the way it verifies the others; it warns loudly
- *       instead (src/lib/filterGuard.ts).
- *   A9  `evidence.observed_values` — a map of field path → observed value
- *       inside `evidence jsonb`. DESIGN pins the column, not its interior. The
- *       conflict detail reads this key to show "CRM says X, App DB says Y";
- *       absent, the observed-values column degrades to "—".
- *   A10 `action.target_path` — a source-qualified field path inside
- *       `action jsonb`. Same status: read defensively by `targetPath()`, and a
- *       missing or non-string value renders "evidence only — no field write".
+ *   A8  `/api/proposals` accepts `source` and `type` filters. The `proposals`
+ *       table pinned in DESIGN §Data models has NO source and NO type column,
+ *       so serving these two filters requires a JOIN to `conflicts`, and a
+ *       service that ignores an unknown query param returns 200 with the
+ *       UNFILTERED page — wrong results on a reviewer surface, not an error.
+ *       ANSWERED: `recon/api/review.py` serves both through the JOIN, 422s an
+ *       unknown value, and puts `conflict_type` / `conflict_sources` on every
+ *       proposal row so the filter becomes VERIFIABLE from the row. filterGuard
+ *       verifies from those two members when they are present and falls back to
+ *       the `unverifiable` warning when they are not.
+ *   A9  observed values — a map of field path → observed value. NOT at
+ *       `evidence.observed_values`, which is where this dashboard used to look
+ *       and where nothing ever wrote one. The service puts it in two places:
+ *       TOP-LEVEL on the conflict row (`review.py::_conflict_row`) and nested
+ *       at `evidence.conflict.observed_values`
+ *       (`reconciler.py::EvidencePacket.as_dict`). The conflict detail prefers
+ *       the row's copy and falls back to the packet; absent both, the
+ *       observed-values column degrades to "—".
+ *   A10 the field a fix would write. NOT `action.target_path`: migration 0007's
+ *       `ck_proposals_action_vocabulary` is a VALIDATED CHECK requiring
+ *       `action - 'set' = '{}'::jsonb`, so `action` has EXACTLY ONE top-level
+ *       key, named `set`, and a `target_path` sibling is refused by the
+ *       database. The write set is read off `action.set` by `writePaths()` —
+ *       every key it names plus every member a nested assignment carries, since
+ *       `entities.current` nests one object (`survived`) whose members are
+ *       themselves contract paths. `{"set": {}}` is the evidence-only proposal;
+ *       an action with no object-valued `set` is reported UNREADABLE, loudly,
+ *       rather than being mistaken for one.
  *
  * The machine-readable copy of this list is `CONTRACT_ASSUMPTIONS` below. It is
  * what the service tickets (T-5/T-7/T-8) have to answer to; a prose list in a
@@ -65,6 +83,35 @@
  * Anything NOT in the lists above is derived locally from committed documents
  * (see RULE_ID_BY_TYPE / CONFLICT_TYPE_LABEL below) rather than read off a
  * response body, precisely so the UI cannot depend on an unpromised field.
+ *
+ * ============================================================================
+ * TWO SHAPES THAT ARE NOT IN THE ASSUMPTION LIST, AND WHY
+ * ============================================================================
+ * `proposals.events` (the `proposal_events` reversal ledger, {@link
+ * ProposalEvent}) and `POST /api/proposals/{id}/rollback` ({@link
+ * KeystoneApi.rollbackProposal}) are both DESIGN-unpinned additions, so by the
+ * rule above they belong in the numbered list. NEITHER IS ASSUMED ANY MORE —
+ * both are now in `recon/api/review.py` (`get_proposal` attaches
+ * `body["events"] = _read_events(...)`, and `rollback_endpoint` serves the
+ * reversal), and the member names and column names below are read off
+ * `_event_row` and `RollbackResult.as_dict` rather than chosen here. They are
+ * still deliberately NOT in the numbered list:
+ * the numbered list is parsed as data by
+ * `service/tests/api/test_contract_assumptions.py`, which requires every id it
+ * finds to be answered or excused IN THE SERVICE, and `src/lib/contract.test.ts`
+ * pins the enumeration to A1-A10 exactly. Adding an eleventh entry is therefore
+ * a coordinated service-and-client change, not a client-side one, and inventing
+ * it here would turn one honest gap into two red suites.
+ *
+ * So they are recorded here instead, with the same discipline:
+ *   - both stay OPTIONAL in the types below, and the UI renders nothing at all
+ *     when they are absent (`rollbackProposal` is an optional method; `events`
+ *     is an optional member with three distinct empty states in
+ *     `ProposalDetail.tsx` — absent, empty, and present-but-unreadable). A
+ *     dashboard deployed against an older service build must degrade, not crash.
+ *   - both fail LOUD, never silent: an absent ledger says the service did not
+ *     send one rather than showing an empty ledger as "no write happened", and
+ *     a rollback the service cannot serve renders the service's own 404/405.
  */
 
 // ---------------------------------------------------------------------------
@@ -177,27 +224,33 @@ export const CONTRACT_ASSUMPTIONS: readonly ContractAssumption[] = [
       'DESIGN says "(+ filters)" for proposals without listing them, and the `proposals` table has NO source and NO type column: serving these requires a JOIN to `conflicts`.',
     failure: 'silent',
     consequence:
-      'If the service ignores them it returns 200 with the UNFILTERED page — wrong rows on a reviewer surface, with no error. A proposal row carries neither field, so the client cannot verify the filter was applied: filterGuard.ts raises an `unverifiable` warning banner whenever either filter is in use. THIS IS THE ASSUMPTION THE SERVICE TICKETS MUST ANSWER FIRST.',
+      'If the service ignores them it returns 200 with the UNFILTERED page — wrong rows on a reviewer surface, with no error. ANSWERED: `recon/api/review.py` serves both through the JOIN and puts the joined `conflict_type` / `conflict_sources` on every proposal row, so filterGuard.ts now VERIFIES the filter from the row and warns `ignored` when a row contradicts it. A row without those two members still cannot prove anything, and gets the `unverifiable` warning banner as before.',
   },
   {
     id: 'A9',
+    // Kept as the assumption's stable label: it is the key path the dashboard
+    // ASSUMED, it is what `service/tests/api/test_contract_assumptions.py`
+    // cross-references by id, and the correction below is the point of the row.
     subject: 'proposals.evidence.observed_values',
     assumption:
-      '`evidence jsonb` contains an `observed_values` object keyed by source-qualified field path.',
-    pinned: 'DESIGN pins the `evidence jsonb` column, not its interior.',
+      'WRONG AS ASSUMED, AND NOW CORRECTED. `evidence.observed_values` does not exist. The service puts observed values TOP-LEVEL on the conflict row (`review.py::_conflict_row`) and nested at `evidence.conflict.observed_values` (`reconciler.py::EvidencePacket.as_dict`). The conflict detail reads the row first and the packet second.',
+    pinned:
+      'DESIGN pins the `evidence jsonb` column, not its interior — which is exactly how a plausible key path went unanswered until the service was read.',
     failure: 'loud',
     consequence:
-      'Read defensively: absent, the conflict detail shows "—" in the Observed values column. The rest of the packet is rendered generically, key by key, so no other key is assumed.',
+      'Read defensively from both places: absent from both, the conflict detail shows "—" in the Observed values column. While the key path was wrong it showed "—" on EVERY conflict, which is the loud-but-unnoticed failure this row now records.',
   },
   {
     id: 'A10',
+    // Same: the label is the assumption, not the truth. The truth is below.
     subject: 'proposals.action.target_path',
     assumption:
-      '`action jsonb` contains a `target_path` string naming the field a fix would write.',
-    pinned: 'DESIGN pins the `action jsonb` column, not its interior.',
+      'STRUCTURALLY IMPOSSIBLE AS ASSUMED, AND NOW CORRECTED. `action` cannot carry a `target_path`: migration 0007 `ck_proposals_action_vocabulary` is a VALIDATED CHECK requiring `action - \'set\' = \'{}\'::jsonb` — exactly one top-level key, named `set`. The write set is read off `action.set` by `writePaths()`, which names every key the action assigns plus every member a nested assignment carries (`entities.current` nests one object, `survived`).',
+    pinned:
+      'DESIGN pins the `action jsonb` column, not its interior; the database pins the interior, and it pins it to `{"set": {…}}` and nothing else.',
     failure: 'loud',
     consequence:
-      'Read defensively by `targetPath()`: absent or non-string renders "evidence only — no field write" rather than guessing a path.',
+      'While the key path was wrong, EVERY proposal rendered "evidence only — no field write" and the R24 apply control could never render for any row. Now: `{"set": {}}` is evidence-only, ≥1 assignment names every path it writes, and an action with no object-valued `set` renders an explicit "not in the committed shape" notice instead of being mistaken for evidence-only.',
   },
 ]
 
@@ -428,9 +481,162 @@ export interface Conflict {
   entity_refs: string[]
   sources: SourceId[]
   disagreeing_fields: string[]
+  /**
+   * A9. `observed_values jsonb`, TOP-LEVEL on the conflict row — this is the
+   * "CRM says X, App DB says Y" the brief asks for, and it is the FIRST place
+   * the conflict detail looks. Optional because a client may be talking to a
+   * service that does not project it; the detail then falls back to
+   * `evidence.conflict.observed_values` and finally to "—".
+   */
+  observed_values?: Record<string, unknown>
   status: ConflictStatus
   first_seen_run: string
   last_seen_run: string
+}
+
+/** One condition R24's gate evaluated — `recon.apply.GateCheck.as_dict`. */
+export interface AutoApplyCheck {
+  check: string
+  passed: boolean
+  detail: string
+}
+
+/**
+ * R24's verdict on one proposal — `recon.apply.AutoApplyDecision.as_dict`.
+ *
+ * The service attaches this to `GET /api/proposals/{id}` and to nothing else:
+ * it is a per-row read of the entity, the rollback path and the write set, so
+ * it does not belong on a list page. Every field is optional to the dashboard —
+ * a service that does not send it simply renders no gate panel.
+ */
+export interface AutoApplyVerdict {
+  proposal_id: number
+  allowed: boolean
+  reason: string
+  detail: string
+  checks: AutoApplyCheck[]
+}
+
+/**
+ * Which of the two writes behind `POST …/apply` the dashboard is asking for.
+ *
+ * `recon/api/review.py::apply_endpoint` is two code paths, not a flag inside
+ * one, and the difference is WHO AUTHORISED THE WRITE:
+ *
+ * `'auto'`   → `?auto=true`. **R24.** `recon.apply.auto_apply` runs the gate
+ *              first (sensitivity, approved case type, target on the allowlist,
+ *              write set equal to the committed fix target, confidence ≥ 0.95,
+ *              complete evidence, a recorded rollback path, appliable status)
+ *              and answers 409 naming the condition that did not hold. The
+ *              machine authorised it, or nothing happened.
+ * `'manual'` → no `auto` parameter, which is the endpoint's pinned default.
+ *              `recon.apply.apply_proposal`: a reviewer has approved and is
+ *              authorising the write themselves. The gate does NOT run.
+ *
+ * They are never substituted for one another in the UI. A refused auto-apply is
+ * rendered as a refusal, because falling back to the reviewer write would turn
+ * R24's safety property into a successful write.
+ */
+export type ApplyMode = 'auto' | 'manual'
+
+/**
+ * One row of the `proposal_events` reversal ledger, exactly as
+ * `review.py::_event_row` serves it.
+ *
+ * **`before` and `after` are not here, and that is the service's decision, not
+ * an omission.** Both columns hold whole canonical records — the personal data —
+ * so `_event_row` serves two sha256 digests and the field paths the write moved
+ * instead. That is strictly stronger than a truncated value: the digests can be
+ * compared against the apply response, the audit row and `entities.current::text`
+ * itself, and none of them puts a person's record on a reviewer's screen.
+ *
+ * `event_id`, `txid` and `canonical_id` arrive as STRINGS, deliberately: they are
+ * `bigint`/`bigint`/`uuid` columns and every JSON number in a browser is an IEEE
+ * double, so a `bigint` sent as a number can come back changed.
+ *
+ * Every member but `event` is optional, so an older or partial build renders "—"
+ * in a cell rather than throwing inside a table body.
+ */
+export interface ProposalEvent {
+  /** `proposal_events.id`, as a string. */
+  event_id?: string
+  /**
+   * `proposal_events.event`. Migration 0004's `CANONICAL_EVENTS` names the two
+   * values that authorise a canonical mutation — `applied` and `rolled_back`.
+   * Anything else renders as its raw token rather than being folded into one.
+   */
+  event: string
+  /** Who wrote it — e.g. `system:auto-apply` vs `system:apply`. */
+  actor?: string
+  /** ISO-8601, server-rendered. The `ts` DEFAULT means the clock is not forgeable. */
+  ts?: string
+  /**
+   * `pg_current_xact_id()` of the writing transaction. This is the property the
+   * ledger exists for: the event, the canonical UPDATE and the status move share
+   * one transaction id, which is what `KS011` checks and what makes "the write
+   * was authorised" checkable from outside the database.
+   */
+  txid?: string
+  /** The `entities` row this event authorises or reverses. */
+  canonical_id?: string | null
+  /**
+   * sha256 of the canonical row this event OVERWROTE.
+   *
+   * `null` is meaningful: `_PROPOSAL_EVENTS` computes it as
+   * `sha256(pe.before::text)`, and SQL propagates NULL, so a null digest means
+   * no before-image was captured — i.e. that write has nothing to restore from.
+   * That is the reversibility signal `reversibility()` reads.
+   */
+  before_digest?: string | null
+  /** sha256 of the canonical row this event LEFT behind. */
+  after_digest?: string | null
+  /**
+   * `keystone_differing_paths(before, after)` — which fields the write moved.
+   *
+   * A STRING, not a list: migration 0008 declares the function `RETURNS text`
+   * and builds it with `string_agg(k, ', ' ORDER BY k)`. It also returns a whole
+   * explanatory sentence in two degenerate cases ("(the whole value: one side is
+   * not a JSON object)"), so it is rendered verbatim and never parsed or split.
+   *
+   * It names paths and never their contents, on purpose: the same function feeds
+   * the `KS010`/`KS012` trigger messages, which are returned to clients and
+   * written to the server log.
+   */
+  differing_paths?: string | null
+}
+
+/**
+ * The `rollback` member — served on BOTH outcomes of `POST …/rollback`, which is
+ * why one type covers both.
+ *
+ * On 200 it is `recon.apply.RollbackResult.as_dict`: the digest the apply
+ * captured, the digest now in the row, and `byte_identical` — a claim asserted
+ * before the transaction ends and again by `KS012` at COMMIT, so a 200 *means*
+ * the bytes match.
+ *
+ * On the `rollback-not-on-top` 409 it is the refusal's evidence instead:
+ * `on_top: false`, the two digests that disagree, and the paths they differ at.
+ * A later apply is on top of this one, and reversing out of order would silently
+ * discard an approved, applied, unreversed write.
+ */
+export interface RollbackReceipt {
+  proposal_id?: number | string
+  canonical_id?: string
+  event_id?: number | string
+  applied_before_digest?: string
+  restored_digest?: string
+  byte_identical?: boolean
+  /** 409 only: `false` when the reversal is not on top of the stack. */
+  on_top?: boolean
+  /** 409 only. */
+  applied_after_digest?: string
+  /** 409 only. */
+  current_digest?: string
+  /**
+   * 409 only: where the stored value and the canonical row disagree. `text`, not
+   * a list — see `ProposalEvent.differing_paths`.
+   */
+  differing_paths?: string
 }
 
 /** PINNED column names — DESIGN §Data models `proposals`. */
@@ -438,10 +644,15 @@ export interface Proposal {
   id: string
   conflict_id: string
   fingerprint: string
-  /** `action jsonb` — DESIGN pins the column, not its interior. Rendered generically. */
+  /**
+   * `action jsonb`. DESIGN pins the column; the DATABASE pins the interior —
+   * migration 0007's `ck_proposals_action_vocabulary` admits `{"set": {…}}` and
+   * nothing else (A10). Read with `writePaths()` from src/lib/proposal.ts, and
+   * rendered generically as a record besides.
+   */
   action: Record<string, unknown>
   confidence: number
-  /** `evidence jsonb` — same: rendered generically, key by key. */
+  /** `evidence jsonb` — rendered generically, key by key. See A9 for its interior. */
   evidence: Record<string, unknown>
   rationale: string | null
   status: ProposalStatus
@@ -449,6 +660,34 @@ export interface Proposal {
   created_run: string
   decided_by: string | null
   decided_at: string | null
+  /**
+   * NOT columns of `proposals` — the JOINED conflict's `type` and `sources`,
+   * named so they cannot be mistaken for columns (`review.py::_proposal_row`).
+   * They exist so A8 becomes verifiable from the row: filterGuard checks the
+   * `source`/`type` filters against them instead of merely warning. Optional,
+   * because a service that serves the filters WITHOUT the JOIN sends neither —
+   * and that is precisely the case the `unverifiable` warning still covers.
+   */
+  conflict_type?: ConflictType
+  conflict_sources?: SourceId[]
+  /**
+   * R24's answer to "why is this one not applied automatically?", attached by
+   * `GET /api/proposals/{id}` only. Optional and rendered only when present.
+   */
+  auto_apply?: AutoApplyVerdict
+  /**
+   * The `proposal_events` reversal ledger for this proposal, oldest first —
+   * the record that proves the canonical write was authorised and can be
+   * undone. Attached by `GET /api/proposals/{id}` only, like `auto_apply`: it
+   * is a per-row read and does not belong on a list page.
+   *
+   * Optional, and its three absences are three different facts:
+   * `undefined` (this service build does not send the ledger), `[]` (it sends
+   * one and no canonical write has been authorised yet), and a non-array
+   * (a shape the dashboard will not guess at). `ProposalDetail.tsx` renders
+   * each of those distinctly rather than showing all three as "empty".
+   */
+  events?: ProposalEvent[]
 }
 
 /** ASSUMED (A4). */
@@ -495,6 +734,30 @@ export interface KeystoneApi {
   getProposal(id: string, signal?: AbortSignal): Promise<Proposal>
   approveProposal(id: string): Promise<Proposal>
   rejectProposal(id: string): Promise<Proposal>
-  applyProposal(id: string): Promise<Proposal>
+  /**
+   * `POST …/apply`. **`mode` is not decoration** — it selects which of the two
+   * writes the service performs (see {@link ApplyMode}). It is optional only so
+   * that a client written before R24's auto path existed still satisfies this
+   * interface; `src/lib/httpClient.ts` treats an omitted mode as `'manual'`,
+   * which is the endpoint's own default, so no caller can accidentally trigger
+   * the gated path.
+   */
+  applyProposal(id: string, mode?: ApplyMode): Promise<Proposal>
+  /**
+   * `POST /api/proposals/{id}/rollback` — R24's "recorded rollback path", as an
+   * endpoint. `review.py::rollback_endpoint` serves it as `apply_writer` and
+   * answers with the updated proposal plus `events` and `rollback`.
+   *
+   * OPTIONAL, and the optionality is not hedging: a client that cannot reverse a
+   * write is representable, and `useDecision` then refuses the action with a
+   * named error instead of firing a request at a route that may not be there.
+   *
+   * The response body is NOT depended on (the same reasoning as A5): the UI
+   * refetches the proposal and its ledger afterwards, and the refetched ledger
+   * — now carrying both legs — is the actual proof. `null` is returned when the
+   * body is not a proposal row, so a build answering with a bare
+   * `RollbackResult` or a 204 costs nothing.
+   */
+  rollbackProposal?(id: string): Promise<Proposal | null>
   getScorecard(signal?: AbortSignal): Promise<Scorecard>
 }

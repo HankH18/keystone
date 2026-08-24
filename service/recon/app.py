@@ -7,11 +7,13 @@ owns both its behaviour and its HTTP surface: `/health` lives in `recon.health`
 `/internal/reconcile` live in `recon.api.internal` (the R19 cron triggers),
 `/api/entities*` lives in `recon.api.entities` (R10's unified cross-source view
 and R20's per-row scope filter) and `/api/conflicts*` + `/api/proposals*` live
-in `recon.api.review` (R11's reviewer surface and R24's apply path) and
+in `recon.api.review` (R11's reviewer surface and R24's apply path),
 `/api/scorecard` lives in `recon.api.scorecard` (the latest `python -m
-recon.suite` results, which the dashboard's overview reconciles against).
+recon.suite` results, which the dashboard's overview reconciles against) and
+`/api/incidents` lives in `recon.api.incidents` (R25's clustered incidents,
+stretch #8).
 
-**A router that is not mounted here does not exist.** Two of them were built,
+**A router that is not mounted here does not exist.** Three of them were built,
 tested and left unreachable, because the tests that covered them imported the
 router object directly (or mounted it in a `conftest.py`) and so passed against
 a surface the running service never served. `tests/integration/test_route_table.py`
@@ -29,16 +31,19 @@ structure (loc, type, msg) and drops the echo. See `_validation_handler`.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from recon import __version__
 from recon.api.auth import install_problem_handler
 from recon.api.entities import router as entities_router
-from recon.api.internal import JOB_SYNC, register_job_handler, sync_job
+from recon.api.incidents import router as incidents_router
+from recon.api.internal import JOB_RECONCILE, JOB_SYNC, register_job_handler, sync_job
 from recon.api.internal import router as internal_router
 from recon.api.review import router as review_router
 from recon.api.scorecard import router as scorecard_router
@@ -47,13 +52,67 @@ from recon.health import router as health_router
 from recon.ingest import router as ingest_router
 from recon.logging import configure_logging_once, get_logger
 from recon.privacy import redact, scrub_text
+from recon.reconciler import reconcile_job
 
-__all__ = ["SERVICE_NAME", "VALIDATION_PROBLEM_TYPE", "create_app"]
+__all__ = [
+    "CORS_ORIGINS_ENV",
+    "DEFAULT_CORS_ORIGINS",
+    "SERVICE_NAME",
+    "VALIDATION_PROBLEM_TYPE",
+    "allowed_origins",
+    "create_app",
+]
 
 log = get_logger("recon.app")
 
 #: RFC7807 `type` for a rejected request envelope.
 VALIDATION_PROBLEM_TYPE = "https://keystone.invalid/problems/invalid_request"
+
+#: Environment variable holding the comma-separated browser origins the API
+#: answers cross-origin.
+#:
+#: Read from ``os.environ`` rather than from :class:`recon.config.Settings`, and
+#: that is this repository's pattern for a ``KEYSTONE_*`` override rather than a
+#: shortcut: ``KEYSTONE_DAILY_SCOPE`` (``recon.budget.DAILY_SCOPE_ENV``),
+#: ``KEYSTONE_RULES_DIR`` (``recon.invariants.rules.RULES_DIR_ENV``) and
+#: ``KEYSTONE_SCORECARD_DIR`` (``recon.suite.report.SCORECARD_DIR_ENV``) are all
+#: module-level constants read the same way, and ``recon/config.py``'s own
+#: docstring names "every ``KEYSTONE_*`` override" as a value taken from the
+#: process environment rather than through that object. ``Settings`` carries the
+#: credentials and the DSN; these carry deployment wiring.
+CORS_ORIGINS_ENV = "KEYSTONE_CORS_ORIGINS"
+
+#: The default when the variable is unset: the Vite dev server, on both spellings
+#: of loopback. Deliberately **not** ``*`` -- a deployed dashboard lives on a
+#: named origin and naming it is one environment variable, whereas a wildcard
+#: default is a permission nobody chose. `allowed_origins` honours ``*`` when it
+#: is set explicitly, and credentials are never enabled either way (see
+#: :func:`create_app`).
+DEFAULT_CORS_ORIGINS: tuple[str, ...] = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
+
+
+def allowed_origins(raw: str | None = None) -> list[str]:
+    """The browser origins this API answers, from ``KEYSTONE_CORS_ORIGINS``.
+
+    Comma-separated, whitespace-trimmed, order preserved, duplicates dropped. An
+    unset **or blank** value means :data:`DEFAULT_CORS_ORIGINS`: a deployment that
+    exports an empty string has misconfigured the variable, not asked for a
+    service no browser may call, and the failure mode of the latter reading is a
+    dashboard that fails every request with an opaque CORS error.
+    """
+    value = os.environ.get(CORS_ORIGINS_ENV) if raw is None else raw
+    parts = [origin.strip() for origin in (value or "").split(",")]
+    origins = [origin for origin in parts if origin]
+    if not origins:
+        return list(DEFAULT_CORS_ORIGINS)
+    seen: dict[str, None] = {}
+    for origin in origins:
+        seen.setdefault(origin, None)
+    return list(seen)
+
 
 #: The members of a pydantic error that are safe to return: where the error is,
 #: what kind it is, and what it says. **`input` and `ctx` are deliberately
@@ -144,6 +203,30 @@ def create_app() -> FastAPI:
     app = FastAPI(title="Keystone reconciliation service", version=__version__)
     install_problem_handler(app)
     app.add_exception_handler(RequestValidationError, _validation_handler)
+    # The dashboard is a **static site on a different origin** (`infra/render.yaml`
+    # deploys the service and the dashboard separately), so without this every
+    # request the browser makes is refused before it is sent -- and refused by the
+    # browser, which means the service's own logs show nothing at all.
+    #
+    # `allow_credentials` is False and stays False. The dashboard authenticates
+    # with an `X-Api-Key` header, never with a cookie, so credentialed CORS buys
+    # nothing -- and `allow_origins=["*"]` together with credentials is the
+    # combination that turns any page on the internet into an authenticated
+    # client. `*` is honoured when an operator sets it deliberately; it is not
+    # the default (see `DEFAULT_CORS_ORIGINS`), and it cannot pick up credentials
+    # by being set, because nothing here reads it to decide that.
+    origins = allowed_origins()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=False,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        # Named rather than `*`, so the preflight answer is a list of headers this
+        # API actually reads: the api key, and the content type of a POST body.
+        allow_headers=["X-Api-Key", "Content-Type"],
+        max_age=600,
+    )
+    log.info("app.cors_configured", count=len(origins), rule=CORS_ORIGINS_ENV)
     app.include_router(health_router)
     app.include_router(ingest_router)
     # `/internal/sync` and `/internal/reconcile` (R19). The router was defined
@@ -165,9 +248,36 @@ def create_app() -> FastAPI:
     # served 404 until this line existed, which `docs/proposal-policy.md` had
     # already recorded as a known gap rather than a hypothetical one.
     app.include_router(scorecard_router)
-    # The sync trigger's body: ingest every generation, then materialize the
-    # canonical layer (`recon.api.internal.sync_job`). Bound to *this app*, not
-    # to the module-global registry, so building an application never reaches
-    # into another one -- see `register_job_handler`.
+    # `GET /api/incidents` (R25, stretch #8). Third instance of the same defect
+    # and the last one this file will admit: `recon.api.incidents` was complete,
+    # covered by `tests/incidents/` -- which mounts the router in its own
+    # conftest -- and unreachable, and both `recon/incidents.py` and
+    # `recon/api/incidents.py` said so in their own docstrings rather than
+    # letting it read as done.
+    #
+    # What is mounted is narrower than "semantic clustering", and the module's
+    # docstring is where the measurement lives: on the committed golden set the
+    # leader clusterer splits 3,050 conflicts into 38 incidents that strictly
+    # REFINE `GROUP BY type` -- it separates C8 by `dropped_source`, C9 by
+    # `deal_present_gen3`, C11/C12 by target and amount magnitude -- and it never
+    # merges two conflict types, because `recon.reference.OBSERVED_VALUE_KEYS`
+    # pins a distinct key set per type. The default (graded) embedding is a
+    # lexical hashing trick, not a learned model. So it is more than a regroup by
+    # a column the row already carries, and it is less than cross-type semantics;
+    # both halves are in the docstring, and neither is claimed away here.
+    app.include_router(incidents_router)
+    # The sync trigger's body: ingest every generation, materialize the canonical
+    # layer, then run the committed invariant rule set over it
+    # (`recon.api.internal.sync_job`, `SYNC_STAGES`). Bound to *this app*, not to
+    # the module-global registry, so building an application never reaches into
+    # another one -- see `register_job_handler`.
     register_job_handler(JOB_SYNC, sync_job, app=app)
+    # The reconcile trigger's body (`recon.reconciler.reconcile_job`). Until this
+    # line existed `POST /internal/reconcile` authenticated, **consumed** the run
+    # id, provisioned its budget scope, logged `internal.handler_unbound` and
+    # answered HTTP 200 `{"status": "started", "handler": "unbound"}` -- and
+    # `infra/render.yaml` has an hourly cron pointed at it, so a scheduled job has
+    # been reporting green for work no code performed. `reconcile_job`'s own
+    # docstring has printed these two lines as the fix since it was written.
+    register_job_handler(JOB_RECONCILE, reconcile_job, app=app)
     return app

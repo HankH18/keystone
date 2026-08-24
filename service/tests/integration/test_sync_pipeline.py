@@ -33,13 +33,14 @@ def test_sync_runs_the_handler_and_reports_both_stages(synced: dict[str, Any]) -
         "sync trigger, or POST /internal/sync authenticates and then does nothing"
     )
     result = synced["result"]
-    assert result["stages"] == ["ingest", "materialize"], result
+    assert result["stages"] == ["ingest", "materialize", "invariants"], result
     assert result["ingest"]["generations"] == [1, 2, 3], (
         "R4 needs all three snapshots landed: field_lineage's A->B->A history is "
         "read across generations"
     )
     assert result["ingest"]["degraded"] is False
     assert result["materialize"]["persisted"] is True
+    assert result["invariants"]["status"] == "ok", result["invariants"]
 
 
 @pytest.mark.parametrize("table", CANONICAL_TABLES)
@@ -99,6 +100,91 @@ def test_every_link_names_a_record_this_sync_actually_landed(reader: Engine, syn
         assert int(conn.execute(orphans).scalar_one()) == 0
 
 
+# ======================================================================================
+# R5 -- a completed sync runs the committed rule set
+# ======================================================================================
+def test_the_invariant_results_table_is_populated_by_the_sync(
+    reader: Engine, synced: dict[str, Any]
+) -> None:
+    """R5, and the assertion the whole third stage exists for.
+
+    `SYNC_STAGES` read `("ingest", "materialize")`, so a grader who followed the
+    README -- migrate, `POST /internal/sync`, open the dashboard -- got a fully
+    loaded canonical layer, **zero** `invariant_results`, **zero** `conflicts`
+    and therefore zero proposals. The rule set ran only from
+    `python -m recon.invariants --persist` and from the offline grading harness,
+    neither of which is on the HTTP path.
+    """
+    stamped = table_count(reader, "invariant_results")
+    assert stamped > 0, (
+        "invariant_results is empty after a real POST /internal/sync. R5 requires a "
+        "completed sync to run the committed, versioned rule set and record "
+        "pass/fail per record in a queryable results table"
+    )
+    assert table_count(reader, "conflicts") > 0, (
+        "conflicts is empty after a real sync, so the reviewer surface, the "
+        "reconciler and the dashboard all have nothing to work from"
+    )
+
+
+def test_the_reported_invariant_summary_is_the_rows_that_are_actually_there(
+    reader: Engine, synced: dict[str, Any]
+) -> None:
+    """The summary is a claim; these counts are what make it a report.
+
+    Same discipline as the materialize stage above: every number the response
+    prints is compared against the table it describes, for **this run id**, so a
+    stage that reported plausible numbers without writing them would fail here.
+    """
+    reported = synced["result"]["invariants"]
+    run_id = reported["run_id"]
+
+    with reader.connect() as conn:
+        stamped = int(
+            conn.execute(
+                text("SELECT count(*) FROM invariant_results WHERE run_id = :run"),
+                {"run": run_id},
+            ).scalar_one()
+        )
+        rules = int(
+            conn.execute(
+                text("SELECT count(DISTINCT rule_id) FROM invariant_results WHERE run_id = :run"),
+                {"run": run_id},
+            ).scalar_one()
+        )
+        first_seen = int(
+            conn.execute(
+                text("SELECT count(*) FROM conflicts WHERE first_seen_run = :run"),
+                {"run": run_id},
+            ).scalar_one()
+        )
+
+    assert run_id == "t14-integration-sync", (
+        f"the invariant stage recorded run id {run_id!r}; it must be the trigger's "
+        "run id, so invariant_results ties back to the audit_log trigger claim"
+    )
+    assert stamped == reported["results"]
+    assert rules == reported["rules"]
+    assert first_seen == reported["conflicts"]
+    assert reported["oscillating"] > 0, (
+        "no conflict was flagged oscillating, so R16's A->B->A half is not being "
+        "exercised by the wired pipeline even though field_lineage covers 1-3"
+    )
+
+
+def test_every_stamped_record_carries_a_verdict_from_the_closed_set(
+    reader: Engine, synced: dict[str, Any]
+) -> None:
+    """SS5.8's vocabulary, at the `pass`/`fail`/`unchecked` DB spelling."""
+    with reader.connect() as conn:
+        verdicts = {
+            str(row[0])
+            for row in conn.execute(text("SELECT DISTINCT verdict::text FROM invariant_results"))
+        }
+    assert verdicts, "no verdicts at all were recorded"
+    assert verdicts <= {"pass", "fail", "unchecked"}, verdicts
+
+
 def test_lineage_covers_all_three_generations(reader: Engine, synced: dict[str, Any]) -> None:
     """R4/R16: the history table is the one thing that is not current-state only."""
     with reader.connect() as conn:
@@ -137,8 +223,15 @@ def test_re_firing_the_cron_lands_nothing_twice(
     that now has every value twice. The completeness ledger
     (`source_generations`, migration 0009) is what makes "already landed"
     answerable, and this is the test that it is actually consulted.
+
+    **Stage 3 still runs**, and that is deliberate rather than an oversight: R5 is
+    about a *completed* sync, and "nothing new to land" is one. Re-detection is
+    what advances `conflicts.last_seen_run`, so the conflict set is refreshed
+    without being duplicated -- `persist_run`'s
+    `ON CONFLICT (fingerprint) DO UPDATE` is what makes those two compatible.
     """
     before = {table: table_count(reader, table) for table in ("raw_records", "stg_crm_contact")}
+    conflicts_before = table_count(reader, "conflicts")
 
     body = _sync(service, "t14-integration-sync-second")
     assert body["status"] == "started", body
@@ -150,6 +243,23 @@ def test_re_firing_the_cron_lands_nothing_twice(
     )
     assert result["ingest"]["already_landed"] == [1, 2, 3], result
     assert result["materialize"] == {"already_current": True, "generation": 3}, result
+    assert result["invariants"]["run_id"] == "t14-integration-sync-second", result["invariants"]
+    assert result["invariants"]["conflicts"] == conflicts_before, (
+        "re-detection on an unchanged database must find the same conflict set"
+    )
+
+    with reader.connect() as conn:
+        last_seen = {
+            str(row[0])
+            for row in conn.execute(text("SELECT DISTINCT last_seen_run FROM conflicts"))
+        }
+    assert table_count(reader, "conflicts") == conflicts_before, (
+        "the second detection pass duplicated conflicts instead of advancing them"
+    )
+    assert last_seen == {"t14-integration-sync-second"}, (
+        f"conflicts carry last_seen_run {last_seen}; re-detection must advance every "
+        "row it re-detects, which is the whole reason the second pass is worth running"
+    )
 
     after = {table: table_count(reader, table) for table in ("raw_records", "stg_crm_contact")}
     assert after == before, f"a no-op sync still wrote rows: {before} -> {after}"

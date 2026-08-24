@@ -12,9 +12,18 @@
  *
  * So every list response is checked against the query that produced it:
  *   - a returned row that CONTRADICTS a filter   → `ignored` (proven wrong);
- *   - a filter the row shape cannot speak to     → `unverifiable` (A8).
- * Either way the reviewer sees a warning above the table instead of trusting a
- * filtered heading over unfiltered rows.
+ *   - a filter the row shape cannot speak to     → `unverifiable` (A8);
+ *   - a filter every row PROVES was applied      → nothing at all.
+ * The reviewer sees a warning above the table instead of trusting a filtered
+ * heading over unfiltered rows — and does NOT see one over rows the response
+ * proved are filtered.
+ *
+ * That third arm is new, and it is why this module no longer says "`source` and
+ * `type` can never be verified here". `recon/api/review.py::_proposal_row`
+ * attaches the joined `conflict_type` and `conflict_sources` for exactly this
+ * purpose ("so that A8 ... becomes verifiable from the row by any client that
+ * wants to check it"). A row that carries them is checked; a row that does not
+ * is still unprovable and still warns.
  *
  * The check is pure and idempotent, so it can run in the HTTP client (where the
  * real service's answer arrives) and again in the query hooks (which cover any
@@ -70,6 +79,55 @@ function unverifiable(
   }
 }
 
+/**
+ * The joined conflict members `review.py::_proposal_row` attaches, if present.
+ *
+ * A8's original wording — "nothing on a proposal row can prove the filter was
+ * applied" — was true of the pinned column list and is no longer true of the
+ * response: the service adds `conflict_type` and `conflict_sources` for exactly
+ * this purpose. Read defensively, one row at a time, because "the service sends
+ * them" is not something a client may assume: a row that lacks them is
+ * `unprovable`, which is a different verdict from `contradicts`.
+ */
+type Verdict = 'holds' | 'contradicts' | 'unprovable'
+
+function typeVerdict(row: Proposal, wanted: string): Verdict {
+  const value = (row as { conflict_type?: unknown }).conflict_type
+  if (typeof value !== 'string') return 'unprovable'
+  return value === wanted ? 'holds' : 'contradicts'
+}
+
+function sourceVerdict(row: Proposal, wanted: string): Verdict {
+  const value = (row as { conflict_sources?: unknown }).conflict_sources
+  if (!Array.isArray(value)) return 'unprovable'
+  return value.includes(wanted) ? 'holds' : 'contradicts'
+}
+
+/**
+ * One A8 filter, judged against whatever the rows can actually show.
+ *
+ * A single contradicting row proves the filter was ignored, and that outranks
+ * every other row. Otherwise, a single row that cannot speak to the filter
+ * leaves the page unproven — silence there would be the dashboard vouching for
+ * a filter on the strength of the rows that happened to carry the evidence.
+ */
+function checkJoinedFilter(
+  param: 'source' | 'type',
+  value: string,
+  items: readonly Proposal[],
+  verdictOf: (row: Proposal, wanted: string) => Verdict,
+): FilterWarning | null {
+  const verdicts = items.map((item) => verdictOf(item, value))
+  const offending = verdicts.filter((verdict) => verdict === 'contradicts').length
+  if (offending > 0) {
+    return ignored('/api/proposals', param, value, offending, items.length, 'A8')
+  }
+  if (verdicts.some((verdict) => verdict === 'unprovable') || items.length === 0) {
+    return unverifiable('/api/proposals', param, value, 'A8')
+  }
+  return null
+}
+
 /** Conflicts: every filter the dashboard sends is verifiable from the row. */
 export function checkConflictFilters(
   query: ConflictQuery,
@@ -105,8 +163,14 @@ export function checkConflictFilters(
 
 /**
  * Proposals: `status` and `conflict_id` are on the row and are verified.
- * `source` and `type` are NOT on the row (A8) and can never be verified here —
- * they get an `unverifiable` warning whenever they are used.
+ *
+ * `source` and `type` are not COLUMNS of `proposals` (A8), but the service
+ * attaches the joined `conflict_type` / `conflict_sources` precisely so a
+ * client can check them — so they are verified from those members when the row
+ * carries them, and fall back to the `unverifiable` warning when it does not.
+ * Crying `unverifiable` over a filter the response demonstrably honoured is not
+ * caution, it is a red alert box over correct data, and a reviewer who learns
+ * to ignore one banner ignores the next one too.
  */
 export function checkProposalFilters(
   query: ProposalQuery,
@@ -114,14 +178,16 @@ export function checkProposalFilters(
 ): FilterWarning[] {
   const warnings: FilterWarning[] = []
 
-  // Unverifiable warnings do NOT depend on the rows: an empty page is exactly
-  // as unprovable as a full one, and staying quiet on it would hide A8 on the
-  // one screen where a reviewer is most likely to trust an empty result.
+  // These two do NOT short-circuit on an empty page: an empty page proves
+  // nothing, and staying quiet on it would hide A8 on the one screen where a
+  // reviewer is most likely to trust an empty result.
   if (query.type) {
-    warnings.push(unverifiable('/api/proposals', 'type', query.type, 'A8'))
+    const warning = checkJoinedFilter('type', query.type, items, typeVerdict)
+    if (warning) warnings.push(warning)
   }
   if (query.source) {
-    warnings.push(unverifiable('/api/proposals', 'source', query.source, 'A8'))
+    const warning = checkJoinedFilter('source', query.source, items, sourceVerdict)
+    if (warning) warnings.push(warning)
   }
 
   const total = items.length

@@ -1,12 +1,13 @@
-"""The reviewer surface: conflicts, proposals, and the three decisions (R11, R24).
+"""The reviewer surface: conflicts, proposals, and the four decisions (R11, R24).
 
     GET  /api/conflicts        (+ source / type / status filters, paginated)
     GET  /api/conflicts/{id}
     GET  /api/proposals        (+ source / type / status / conflict_id, paginated)
-    GET  /api/proposals/{id}
+    GET  /api/proposals/{id}   (+ the R24 gate verdict and the reversal ledger)
     POST /api/proposals/{id}/approve      review_writer
     POST /api/proposals/{id}/reject       review_writer
     POST /api/proposals/{id}/apply        apply_writer  (+ ?auto=true -> R24)
+    POST /api/proposals/{id}/rollback     apply_writer  (R24's reversal leg)
 
 Every filter is applied in SQL, on the server
 ---------------------------------------------
@@ -40,7 +41,7 @@ apply require `admin` and answer a client key with 403.
 One role per duty, three connections
 -------------------------------------
 Reads use the ordinary application engine. **Approve and reject run as
-`review_writer`; apply runs as `apply_writer`** (`recon.db.role_connection`),
+`review_writer`; apply and rollback run as `apply_writer`** (`recon.db.role_connection`),
 because the separation of duties is the graded property and it is only real if
 the process actually connects as the restricted role -- a table owner bypasses
 its own grants. The database, not this module, is what refuses a self-approval:
@@ -48,9 +49,53 @@ its own grants. The database, not this module, is what refuses a self-approval:
 nothing else, `apply_writer` may move `approved -> applied` and
 `applied -> rolled_back` and nothing else, and both are SQLSTATE `KS004`.
 
-The canonical write itself is not here. It is `recon.apply`, which the apply
-endpoint calls -- so the HTTP layer owns request shape and error rendering, and
-the write boundary owns the transaction.
+The canonical write itself is not here. It is `recon.apply`, which the apply and
+rollback endpoints call -- so the HTTP layer owns request shape and error
+rendering, and the write boundary owns the transaction.
+
+The reversal leg is an endpoint, not a Python one-liner
+--------------------------------------------------------
+R24 requires "a recorded rollback path" and the rubric's guarded-automation line
+requires the automation to be "fully logged & reversible".
+`recon.apply.rollback_proposal` has always been the reversal, and it worked -- but
+until this endpoint existed the only way to *reach* it was an interpreter with the
+`apply_writer` credentials, which is not a reversal path a reviewer has. `POST
+/api/proposals/{id}/rollback` is the same function, same role, same transaction,
+reachable with the same admin key that approved and applied.
+
+Two refusals it renders as 409 rather than as a crash, both of them properties of
+the ledger rather than of this module:
+
+* **only an `applied` proposal has a write to reverse.** `KS004` admits exactly
+  one arc out of `applied`, and `rollback_proposal` refuses before touching the
+  row (`not_applied`);
+* **a reversal may only undo the write currently on top.** Apply P1 (X -> Y),
+  apply P2 (Y -> Z), then reverse P1 and the canonical row would go to X --
+  silently discarding an approved, applied, unreversed write. `KS012` refuses that
+  at COMMIT, which is the enforcement; `_REVERSAL_ON_TOP` asks the same question
+  first, under the same `FOR UPDATE` the reversal itself takes, so the reviewer
+  gets a 409 naming the field paths that moved instead of a 500 carrying a
+  SQLSTATE. The check can only refuse -- it never *permits* anything
+  `rollback_proposal` would refuse, so the gate is still `recon.apply`'s.
+
+`proposal_events` is the evidence, and it is served as digests
+--------------------------------------------------------------
+`proposal_events` is what makes an apply auditable: the before/after pair a
+reversal is computed from. No endpoint returned it, so the one artefact that
+proves a canonical write was authorised was visible only in `psql`.
+
+The per-proposal GET now carries it -- and carries **digests and field paths,
+never values**. `before` and `after` are whole canonical records: legal names,
+`crm.contact.email`, `dob`. `ApplyResult.as_dict()` already made this choice for
+the audit row ("Digests, never values") and migration 0008's MINOR 20 made it for
+the `KS010`/`KS012` diagnostics, which name the paths that differ and never their
+contents. So the values never leave the database at all: `sha256(x::text)` is
+computed in SQL (byte-for-byte the digest `recon.apply.entity_digest` computes, so
+a client can compare the two), and the paths come from the committed
+`keystone_differing_paths` function rather than from a second implementation of
+the same comparison. Structural non-exposure, not redaction after the fact -- a
+redactor that ever mis-classified a key would leak a name, and there is nothing
+here for it to mis-classify.
 """
 
 from __future__ import annotations
@@ -75,10 +120,12 @@ from recon.api.auth import (
 from recon.apply import (
     ApplyError,
     AutoApplyRefused,
+    RollbackResult,
     apply_proposal,
     auto_apply,
     evaluate_auto_apply,
     load_proposal,
+    rollback_proposal,
 )
 from recon.db import ROLE_APPLY_WRITER, ROLE_REVIEW_WRITER, get_engine, role_connection
 from recon.logging import get_logger, insert_audit_row
@@ -121,21 +168,32 @@ PROPOSAL_STATUSES: Final[tuple[str, ...]] = (
 #: is `open` and `escalated:oscillation`. The column is a Postgres enum
 #: `(open, escalated, resolved, dismissed)` and the reason lives in a separate
 #: `escalation_reason` column -- so the composite the dashboard wants is rendered
-#: here, from the row, **when the row carries the reason**.
+#: here, from the row.
 #:
-#: It frequently does not, and that is a real gap rather than a rendering choice:
-#: `recon_writer`'s UPDATE grant on `conflicts` is column-scoped to
-#: `(status, last_seen_run)` (migration 0004), so `recon.reconciler._escalate`
-#: escalates the row and writes the reason into the audit row only. Such a
-#: conflict is served as bare `escalated`, which A6 says renders as a labelled
-#: "unknown status" badge -- loud, not silent. Fixing it means widening a grant
-#: in a migration another ticket owns, so it is reported, not done here.
+#: **The gap this note used to report is closed.** It read "recon_writer cannot
+#: write escalation_reason (its UPDATE grant on conflicts is column-scoped to
+#: status and last_seen_run), so an escalated row whose reason is only in the
+#: audit log is served as bare 'escalated'" -- true of migration 0004's grant, and
+#: the reason every escalated conflict reached the dashboard through the
+#: `oscillating` fallback branch rather than through the reason itself. Migration
+#: **0015** adds `escalation_reason` to that column-scoped grant, so
+#: `recon.reconciler._escalate` now writes the reason to the column as well as to
+#: the `conflict.escalated` audit row and the first branch below is the one that
+#: fires.
+#:
+#: The two fallbacks stay, and they are not dead code: rows escalated **before**
+#: 0015 still carry NULL there, and `_escalate` still degrades to audit-row-only
+#: if the grant is ever narrowed again (it asks `has_column_privilege` per run).
+#: A row that reaches neither is served as bare `escalated`, which A6 renders as a
+#: labelled "unknown status" badge -- loud, not silent.
 CONFLICT_STATUS_NOTE: Final = (
     "conflicts.status is the Postgres enum (open, escalated, resolved, dismissed); "
     "'escalated:<reason>' is rendered when the row carries an escalation_reason or is "
-    "flagged oscillating. recon_writer cannot write escalation_reason (its UPDATE grant "
-    "on conflicts is column-scoped to status and last_seen_run), so an escalated row "
-    "whose reason is only in the audit log is served as bare 'escalated'."
+    "flagged oscillating. recon_writer holds a column-scoped UPDATE on "
+    "(status, last_seen_run, escalation_reason) since migration 0015, so a newly "
+    "escalated row carries its reason in the column; a row escalated before 0015, or "
+    "under a narrowed grant, has the reason in the audit log only and is served as "
+    "bare 'escalated'."
 )
 
 #: Rendered once, used by the select list AND the status filter, so a row can
@@ -282,6 +340,77 @@ _GET_PROPOSAL = text(
       JOIN conflicts c ON c.id = p.conflict_id
      WHERE p.id = :proposal_id
        AND {_PROPOSAL_SCOPE_CLAUSE}
+    """
+)
+
+#: The reversal ledger for one proposal, **as digests and field paths**.
+#:
+#: `before` and `after` are whole canonical records, so neither column is
+#: selected. What is selected instead:
+#:
+#: * `sha256(convert_to(x::text, 'UTF8'))` -- the same bytes
+#:   `recon.apply.entity_digest` hashes (jsonb's own text rendering, not a Python
+#:   re-serialization of a parse of it), so an event digest served here is
+#:   comparable to the `before_digest`/`after_digest` in an apply's audit row and
+#:   to `sha256` of `entities.current::text` taken in psql. `convert_to` rather
+#:   than `::bytea` because the encoding is then named rather than inherited;
+#: * `keystone_differing_paths` -- migration 0008's committed diagnostic, which
+#:   names the field paths at which two canonical values differ and never their
+#:   contents. Reused rather than reimplemented: it pins the comparison textually
+#:   as well as semantically (`'{"a": 1}'::jsonb = '{"a": 1.0}'::jsonb` is TRUE
+#:   and the two render differently), and a second copy of that rule here would be
+#:   a second copy to keep in step.
+#:
+#: `txid` is included because it is the property the ledger is *for*: the event,
+#: the canonical UPDATE and the status move share one transaction id, which is
+#: what `KS011` checks and what makes "the write was authorised" checkable from
+#: outside the database.
+_PROPOSAL_EVENTS = text(
+    """
+    SELECT pe.id,
+           pe.event,
+           pe.actor,
+           pe.ts,
+           pe.txid,
+           pe.canonical_id::text AS canonical_id,
+           encode(sha256(convert_to(pe.before::text, 'UTF8')), 'hex') AS before_digest,
+           encode(sha256(convert_to(pe.after::text, 'UTF8')), 'hex')  AS after_digest,
+           keystone_differing_paths(pe.before, pe.after) AS differing_paths
+      FROM proposal_events pe
+     WHERE pe.proposal_id = :proposal_id
+     ORDER BY pe.id
+    """
+)
+
+#: `KS012`'s question, asked before the reversal instead of at COMMIT: does the
+#: canonical row still hold what this proposal's apply left?
+#:
+#: Three things about this statement are deliberate:
+#:
+#: * `FOR UPDATE OF e` takes the **same row lock** `recon.apply.rollback_proposal`
+#:   takes a moment later, so the answer cannot go stale between the check and the
+#:   reversal -- a concurrent apply of another proposal to this entity blocks on
+#:   the lock rather than slipping in behind the check;
+#: * `p.status = 'applied'` keeps the check from answering the wrong question. An
+#:   already-reversed proposal still has its `applied` event, and its `after` no
+#:   longer matches the row -- so without this predicate a *second* rollback would
+#:   be refused as "not on top" when the true reason is that the reversal leg is
+#:   spent. No row comes back for any other status, and `rollback_proposal` then
+#:   raises the precise `not_applied`;
+#: * the equality is pinned textually as well as semantically, for the same reason
+#:   every jsonb comparison in the citation rule is (migration 0008, MINOR 18).
+_REVERSAL_ON_TOP = text(
+    """
+    SELECT (ap.after = e.current AND ap.after::text = e.current::text) AS on_top,
+           keystone_differing_paths(ap.after, e.current) AS differing_paths,
+           encode(sha256(convert_to(ap.after::text, 'UTF8')), 'hex')   AS applied_after_digest,
+           encode(sha256(convert_to(e.current::text, 'UTF8')), 'hex')  AS current_digest
+      FROM proposals p
+      JOIN entities e ON e.canonical_id = p.target_canonical_id
+      JOIN proposal_events ap ON ap.proposal_id = p.id AND ap.event = 'applied'
+     WHERE p.id = :proposal_id
+       AND p.status = 'applied'
+       FOR UPDATE OF e
     """
 )
 
@@ -444,6 +573,44 @@ def _read_proposal(conn: Connection, proposal_id: int, scope: str | None) -> dic
     return None if row is None else _proposal_row(row)
 
 
+def _event_row(row: Any) -> dict[str, Any]:
+    """One `proposal_events` row as evidence: who wrote, when, and to what effect.
+
+    There is no `before` and no `after` member and there is not meant to be one:
+    both columns are whole canonical records. What the reader gets instead is
+    strictly stronger than a truncated value would be -- two digests that can be
+    compared against the apply response, the audit row and `entities.current::text`
+    itself, plus the field paths the write moved.
+
+    `event_id`, `txid` and `canonical_id` are strings for the reason
+    `_conflict_row` gives: they are `bigint`/`bigint`/`uuid` columns, and JSON
+    numbers are IEEE doubles in every browser that will read this.
+    """
+    return {
+        "event_id": str(row.id),
+        "event": row.event,
+        "actor": row.actor,
+        "ts": row.ts.isoformat(),
+        "txid": str(row.txid),
+        "canonical_id": row.canonical_id,
+        "before_digest": row.before_digest,
+        "after_digest": row.after_digest,
+        "differing_paths": row.differing_paths,
+    }
+
+
+def _read_events(conn: Connection, proposal_id: int) -> list[dict[str, Any]]:
+    """This proposal's ledger, oldest first -- `[]` for a proposal never applied.
+
+    Not scope-filtered on its own: a `proposal_events` row is only ever read
+    through a proposal the caller has already been allowed to see
+    (`_PROPOSAL_SCOPE_CLAUSE`), which is the same rule the `auto_apply` verdict
+    on the detail response follows.
+    """
+    rows = conn.execute(_PROPOSAL_EVENTS, {"proposal_id": proposal_id}).fetchall()
+    return [_event_row(row) for row in rows]
+
+
 def _not_found(kind: str, identifier: int | str) -> JSONResponse:
     """404 for both "no such row" and "not visible to this key" (R20).
 
@@ -596,18 +763,21 @@ def get_proposal(
     proposal_id: int,
     principal: Annotated[Principal, Depends(require_api_key())],
 ) -> JSONResponse:
-    """A2's per-id GET, plus R24's verdict on this proposal.
+    """A2's per-id GET, plus R24's verdict on this proposal and its ledger.
 
     The `auto_apply` member is this repository's answer to "why is this one not
     applied automatically?" -- every condition R24 names, with the value that
-    decided it. It is an addition to the assumed shape, so a client that does not
-    know about it is unaffected.
+    decided it. `events` is the other half of the same account: what was
+    *actually* written, when, by which actor, in which transaction. Both are
+    additions to the assumed shape and every key the dashboard was built on is
+    untouched, so a client that does not know about either is unaffected.
     """
     with get_engine().connect() as conn:
         body = _read_proposal(conn, proposal_id, visible_scope(principal))
         if body is None:
             return _not_found("proposal", proposal_id)
         body["auto_apply"] = evaluate_auto_apply(conn, proposal_id).as_dict()
+        body["events"] = _read_events(conn, proposal_id)
     return JSONResponse(status_code=200, content=body)
 
 
@@ -778,6 +948,114 @@ def apply_endpoint(
     with get_engine().connect() as reader:
         body = _read_proposal(reader, proposal_id, scope)
     log.info("review.applied", proposal_id=proposal_id, auto=auto, status_code=200)
+    return JSONResponse(status_code=200, content=body)
+
+
+# ======================================================================================
+# POST /api/proposals/{id}/rollback  -- apply_writer
+# ======================================================================================
+
+
+def _stale_reversal(proposal_id: int, row: Any) -> JSONResponse:
+    """The 409 for a reversal that is not on top of the stack.
+
+    Named paths, never values (`keystone_differing_paths`), and the two digests so
+    an operator can see *which* stored value is which without being handed either.
+    """
+    log.info(
+        "review.rollback_refused",
+        proposal_id=proposal_id,
+        reason="not_on_top",
+        status_code=409,
+    )
+    body = problem_body(
+        "rollback-not-on-top",
+        "not_on_top",
+        409,
+        f"proposal {proposal_id} is applied, but the canonical row no longer holds the "
+        f"value its apply left: the two differ at {row.differing_paths}. A later apply is "
+        "on top, and reversing this one would silently discard an approved, applied, "
+        "unreversed write -- so it is refused here and by SQLSTATE KS012 at COMMIT. "
+        "Reverse the write on top first; the ledger is a stack.",
+    )
+    body["rollback"] = {
+        "proposal_id": proposal_id,
+        "on_top": False,
+        "applied_after_digest": row.applied_after_digest,
+        "current_digest": row.current_digest,
+        "differing_paths": row.differing_paths,
+    }
+    return JSONResponse(status_code=409, content=body, media_type="application/problem+json")
+
+
+@router.post("/proposals/{proposal_id}/rollback")
+def rollback_endpoint(
+    proposal_id: int,
+    principal: Annotated[Principal, Depends(require_api_key(SCOPE_ADMIN))],
+) -> JSONResponse:
+    """Reverse an applied proposal, as `apply_writer`. R24's "recorded rollback path".
+
+    The same shape as the apply endpoint in every respect that is a convention:
+    `X-Api-Key` plus org-wide scope, an invisible row answered 404 rather than 403,
+    RFC7807 bodies, `role_connection(ROLE_APPLY_WRITER)` for the write, and the
+    audit row written by `recon.apply` inside that one transaction rather than by
+    this module afterwards -- a reversal whose audit row could be committed
+    separately is a reversal whose audit row can be missing.
+
+    The response is the updated proposal (now `rolled_back`) plus two additions:
+
+    * `rollback` -- `RollbackResult.as_dict()`: the digest the apply captured, the
+      digest that is now in the row, and `byte_identical`. That claim is asserted
+      before the transaction ends and again by `KS012` at COMMIT, so a 200 here
+      *means* the bytes match;
+    * `events` -- the ledger, now two rows: the `applied` event and its reversal.
+      `LOG_MODE=safe` key-redacts `audit_log.detail`, so this response body is the
+      readable R24 ledger; the audit row is the durable one.
+    """
+    scope = visible_scope(principal)
+    with get_engine().connect() as reader:
+        if _read_proposal(reader, proposal_id, scope) is None:
+            return _not_found("proposal", proposal_id)
+
+    result: RollbackResult | None = None
+    refusal: JSONResponse | None = None
+    try:
+        with role_connection(ROLE_APPLY_WRITER) as conn:
+            # Refused inside the transaction so the `FOR UPDATE` this check takes is
+            # the one the reversal runs under -- and returned after it, so a refusal
+            # commits nothing. `None` means "no applied event under an `applied`
+            # status", which is `rollback_proposal`'s question to answer, not this
+            # one's: it raises the precise `not_applied` / `no_applied_event`.
+            on_top = conn.execute(_REVERSAL_ON_TOP, {"proposal_id": proposal_id}).fetchone()
+            if on_top is not None and not on_top.on_top:
+                refusal = _stale_reversal(proposal_id, on_top)
+            else:
+                result = rollback_proposal(proposal_id, conn=conn)
+    except ApplyError as error:
+        status = _APPLY_ERROR_STATUS.get(error.reason, 409)
+        log.info(
+            "review.rollback_refused",
+            proposal_id=proposal_id,
+            reason=error.reason,
+            status_code=status,
+        )
+        kind = "rollback-" + error.reason.replace("_", "-")
+        return problem(kind, error.reason, status, error.detail)
+    if refusal is not None:
+        return refusal
+    assert result is not None  # every other path either raised or assigned it
+
+    with get_engine().connect() as reader:
+        body = _read_proposal(reader, proposal_id, scope) or {}
+        body["events"] = _read_events(reader, proposal_id)
+    body["rollback"] = result.as_dict()
+    log.info(
+        "review.rolled_back",
+        proposal_id=proposal_id,
+        event_id=result.event_id,
+        byte_identical=result.byte_identical,
+        status_code=200,
+    )
     return JSONResponse(status_code=200, content=body)
 
 

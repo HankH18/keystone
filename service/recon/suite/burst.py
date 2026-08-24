@@ -259,29 +259,41 @@ def _daily(scope: str) -> Iterator[None]:
 
 @contextmanager
 def _connected_as(role: str) -> Iterator[None]:
-    """Run the ops entry points with ``DATABASE_URL`` pointed at ``role``.
+    """Run the ops entry points with **every** DSN variable pointed at ``role``.
 
     This is how the sweeper's ``_refuse_capped_principal`` guard is exercised
     through the real entry point rather than by calling the guard directly: a
-    misconfigured ``DATABASE_URL`` is precisely the failure it exists for, so
-    the check misconfigures one.
-    """
-    from recon.config import get_settings
-    from recon.db import reset_engine_cache
+    misconfigured ops DSN is precisely the failure it exists for, so the check
+    misconfigures one.
 
-    previous = os.environ.get("DATABASE_URL")
-    os.environ["DATABASE_URL"] = role_url(role).render_as_string(hide_password=False)
-    get_settings.cache_clear()
-    reset_engine_cache()
-    try:
+    It misconfigures *both* variables in :data:`recon.db.PRINCIPAL_ENV_VARS`,
+    and that is the whole point of this function. Overriding ``DATABASE_URL``
+    alone made the phase a check that could not **pass** wherever
+    ``OPS_DATABASE_URL`` is set -- which ``infra/render.yaml`` does for the
+    deployed web service, and which the invariant-sync stage now requires:
+    :func:`recon.budget.ops_engine` reads that variable first, so the sweeper
+    stayed connected as the **owner**, swept the reservation it was supposed to
+    refuse to touch, and the row came out
+    ``sweep_as_capped=refused:False/open:0``. Measured, both ways: a loud red
+    and exit 1 with the variable set, ``refused:True/open:1`` with it unset.
+    Nothing was ever silently green -- the row was simply *unobtainable* in one
+    of the two configurations this project runs in.
+
+    And neither configuration is the wrong one to be in. ``OPS_DATABASE_URL``
+    unset is not a degenerate local setup: it is what ``infra/render.yaml``
+    hands the deployed ``keystone-sweeper`` cron on purpose, because there
+    ``DATABASE_URL`` already names the owner. Set is the deployed *web
+    service*. The guard has to hold in both, so the check has to be runnable in
+    both, so the switch has to be complete.
+
+    The previous environment is restored exactly, including restoring a variable
+    that was **unset** to unset rather than to the empty string -- "restored" has
+    to mean restored (:func:`recon.db.restore_principal`).
+    """
+    from recon.db import connected_to
+
+    with connected_to(role_url(role).render_as_string(hide_password=False)):
         yield
-    finally:
-        if previous is None:
-            os.environ.pop("DATABASE_URL", None)
-        else:
-            os.environ["DATABASE_URL"] = previous
-        get_settings.cache_clear()
-        reset_engine_cache()
 
 
 def _reserve_one(scope: str, *, lease_seconds: int = 300, hint: str = "phase"):

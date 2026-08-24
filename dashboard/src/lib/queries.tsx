@@ -13,6 +13,7 @@ import {
   type UseQueryResult,
 } from '@tanstack/react-query'
 import { getApiClient } from './apiClient'
+import { ApiConfigError } from './api'
 import { guardConflictPage, guardProposalPage } from './filterGuard'
 import type {
   Conflict,
@@ -21,6 +22,7 @@ import type {
   Page,
   Proposal,
   ProposalQuery,
+  ProposalStatus,
   Scorecard,
 } from './contract'
 
@@ -96,41 +98,89 @@ export function useScorecard(): UseQueryResult<Scorecard> {
   })
 }
 
-export type DecisionKind = 'approve' | 'reject' | 'apply'
+/**
+ * The five things a reviewer can ask the service to do.
+ *
+ * `apply` and `auto-apply` hit the SAME endpoint and are NOT the same action:
+ * `auto-apply` sends `?auto=true` and R24's gate decides, `apply` is the
+ * reviewer's own authorised write with no gate. They are separate kinds here
+ * rather than a boolean on one kind precisely so that no call site can pass the
+ * wrong flag by accident, and so the UI can label them separately.
+ */
+export type DecisionKind =
+  | 'approve'
+  | 'reject'
+  | 'apply'
+  | 'auto-apply'
+  | 'rollback'
 
 /**
- * Approve / reject / apply.
+ * The status each decision moves the proposal to when the SERVICE agrees.
+ *
+ * Used for the optimistic write and for the announcement when a response body
+ * carries no row (the rollback endpoint's body is not pinned). Exported so a
+ * component can name the outcome without re-deriving it.
+ */
+export const DECISION_RESULT_STATUS: Record<DecisionKind, ProposalStatus> = {
+  approve: 'approved',
+  reject: 'rejected',
+  apply: 'applied',
+  'auto-apply': 'applied',
+  rollback: 'rolled_back',
+}
+
+/**
+ * Approve / reject / apply / auto-apply / roll back.
  *
  * Optimistic: the proposal's cached row flips immediately so the reviewer sees
  * the effect of their keystroke, and every proposal/scorecard query is
  * invalidated on settle so the screen ends up showing what the SERVICE says,
  * not what we hoped. On failure the optimistic write is rolled back and the
  * caller renders the error.
+ *
+ * **A refused auto-apply is a failure here, and deliberately not retried as a
+ * manual apply.** R24's refusal is the product working; converting it into the
+ * ungated write would be the dashboard laundering the gate.
  */
 export function useDecision() {
   const api = useApi()
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: async ({ id, kind }: { id: string; kind: DecisionKind }) => {
+    mutationFn: async ({
+      id,
+      kind,
+    }: {
+      id: string
+      kind: DecisionKind
+    }): Promise<Proposal | null> => {
       const client = await api
       if (kind === 'approve') return client.approveProposal(id)
       if (kind === 'reject') return client.rejectProposal(id)
-      return client.applyProposal(id)
+      // Both apply kinds name their mode explicitly. Relying on the default
+      // would leave the manual path indistinguishable from a caller that forgot
+      // to pass one — which is exactly how the auto path went missing.
+      if (kind === 'apply') return client.applyProposal(id, 'manual')
+      if (kind === 'auto-apply') return client.applyProposal(id, 'auto')
+      if (typeof client.rollbackProposal !== 'function') {
+        // Raised BEFORE any request, for the same reason `ApiConfigError` is:
+        // a rollback this client cannot make must not read to a reviewer as a
+        // rollback the SERVICE refused.
+        throw new ApiConfigError(
+          'This dashboard cannot roll back a write: the API client it is using ' +
+            'exposes no rollback call, so POST /api/proposals/{id}/rollback was ' +
+            'never sent and nothing was changed.',
+        )
+      }
+      return client.rollbackProposal(id)
     },
     onMutate: async ({ id, kind }) => {
       await queryClient.cancelQueries({ queryKey: ['proposal', id] })
       const previous = queryClient.getQueryData<Proposal>(['proposal', id])
       if (previous) {
-        const optimisticStatus =
-          kind === 'approve'
-            ? 'approved'
-            : kind === 'reject'
-              ? 'rejected'
-              : 'applied'
         queryClient.setQueryData<Proposal>(['proposal', id], {
           ...previous,
-          status: optimisticStatus,
+          status: DECISION_RESULT_STATUS[kind],
         })
       }
       return { previous }

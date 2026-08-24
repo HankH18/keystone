@@ -935,6 +935,26 @@ def test_recon_writer_may_advance_a_conflict_through_re_detection(role_txn: Role
 def test_the_conflicts_update_grant_is_exactly_the_advancing_columns(
     owner_engine: Engine,
 ) -> None:
+    """The grant names what it permits, and permits nothing else.
+
+    The expected set is a mirror of a migration constant, so it moves when a
+    migration deliberately moves that constant -- and only then. It read
+    ``{"status", "last_seen_run"}`` (migration 0004's ``CONFLICT_UPDATE_COLUMNS``)
+    until ``migrations/versions/0015_escalation_reason_grant.py`` added
+    ``escalation_reason``, which is the column R16's escalation is required to
+    record and which ``recon_writer`` could not write: the single statement
+    ``UPDATE conflicts SET status = 'escalated', escalation_reason = ...`` was
+    refused wholesale with SQLSTATE 42501, inside ``reconcile()``'s transaction,
+    rolling back every proposal of the run.
+
+    The assertion is still exact equality on the whole set, not a subset check,
+    so a fourth column appearing here is still a failure. What 0004 actually
+    established -- *re-detection advances a conflict, it does not redefine one* --
+    is asserted by ``test_recon_writer_cannot_rewrite_a_conflicts_identity``
+    above, which is parametrized over ``fingerprint``, ``type``, ``entity_refs``,
+    ``oscillating`` and ``first_seen_run`` and is unchanged and still red on any
+    of them.
+    """
     with owner_engine.connect() as conn:
         columns = set(
             conn.execute(
@@ -948,4 +968,4 @@ def test_the_conflicts_update_grant_is_exactly_the_advancing_columns(
             .scalars()
             .all()
         )
-    assert columns == {"status", "last_seen_run"}, columns
+    assert columns == {"status", "last_seen_run", "escalation_reason"}, columns

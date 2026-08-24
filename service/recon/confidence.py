@@ -46,11 +46,13 @@ Each clause is discharged by a mechanism, not by intent:
 
     **And they lower it even when the positive evidence saturates**, which is why
     the clamp is applied TWICE and not once. Model version 1 evaluated
-    ``clamp01(base + sum(all weights))``; on the graded store that erased the
-    penalty on 191 of 3,050 proposals (162 ``disagreeing_field``, 29
-    ``partial_evidence``) because their positive evidence had already carried the
-    raw total past 1.0, so subtracting 0.10 or 0.15 from 1.10 still stored
-    1.0000. A worked case: a C6 linked on all three key classes scored
+    ``clamp01(base + sum(all weights))``; on the graded 3,050-proposal store
+    1,057 proposals were **positive-saturated**, 191 of those also carried a
+    penalty (162 ``disagreeing_field``, 29 ``partial_evidence``), and on 181 of
+    those 191 the penalty was **arithmetically invisible** -- their positive
+    evidence had already carried the raw total past 1.0, so subtracting 0.10 or
+    0.15 from 1.10 still stored 1.0000. (:func:`score` breaks all four counts
+    down.) A worked case: a C6 linked on all three key classes scored
     ``0.40 + 0.35 + 0.25 + 0.20 = 1.20``, and its disagreement penalty was
     arithmetically invisible. R14 says partial and conflicting evidence LOWERS
     the score; a penalty that a strong-enough prior can buy immunity from does
@@ -595,13 +597,33 @@ def score(signals: Signals, *, model: ConfidenceModel | None = None) -> Score:
     **Why the clamp is applied twice.** R14 requires that partial and conflicting
     evidence LOWER the score. Version 1 evaluated ``clamp01(base + sum(all))``,
     which quietly granted immunity from every penalty to any conflict whose
-    positive evidence had already carried the raw total past ``clamp_max``:
-    measured on the graded 3,050-proposal store, 1,051 proposals were clamped and
-    191 of them carried a negative signal that changed the stored number by
-    nothing (162 ``disagreeing_field``, 29 ``partial_evidence``). Two proposals
-    with identical positive evidence, one of them additionally flagged as
-    resting on partial evidence, stored byte-identical confidences. That is not
-    "lowered by partial evidence".
+    positive evidence had already carried the raw total past ``clamp_max``.
+
+    Four DIFFERENT counts describe that region on the graded 3,050-proposal
+    store. They are not interchangeable, and each one is named here because
+    attaching a figure to the wrong claim is how this note was previously wrong:
+
+    * **positive-saturated -- 1,057.** ``base + sum(positive) > clamp_max``: the
+      population v1 was liable to flatten. This is what ``positive_clamped``
+      records, and v2 does not change it.
+    * **positive-saturated AND penalised -- 191.** Of those 1,057, the ones
+      carrying any negative signal at all: 162 ``disagreeing_field`` plus
+      29 ``partial_evidence``.
+    * **penalty arithmetically invisible under v1 -- 181.** Of those 191, the
+      ones where ``clamp01(base + sum(all))`` equalled
+      ``clamp01(base + sum(positive))``, so deleting the penalty outright would
+      not have moved one stored digit: 152 ``disagreeing_field`` plus
+      29 ``partial_evidence``. The other 10 are C6 rows whose
+      ``oscillation_observed`` penalty (-0.25, on top of a -0.10 disagreement)
+      was large enough to pull the total back under ``clamp_max``, so v1 did
+      show part of it.
+    * **v1's own clamp -- 1,041 fired, 1,047 stored 1.0000.** :func:`clamp` is
+      strict (``total > clamp_max``), so the six rows that landed on
+      ``clamp_max`` exactly stored ``1.0000`` without ever being clamped.
+
+    Two proposals with identical positive evidence, one of them additionally
+    flagged as resting on partial evidence, stored byte-identical confidences.
+    That is not "lowered by partial evidence".
 
     Clamping the positive half first and then subtracting fixes exactly that and
     nothing else: whenever ``base + sum(positive) <= clamp_max`` the two versions

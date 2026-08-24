@@ -1552,6 +1552,28 @@ def apply_proposal(
             "reads as real. A fix carries the whole map; it does not extend it",
             proposal_id=proposal_id,
         )
+    if {**before_value, **record.assignments} == before_value:
+        # The same rule `_require_appliable` applies to an empty action, applied to
+        # an action that is empty in EFFECT. Two proposals may legitimately write
+        # the same path the same way; whichever lands second changes nothing, and
+        # letting it through wrote an `applied` ledger event with `before == after`
+        # -- indistinguishable from a write that moved a value, and enough to invert
+        # the reversal stack: with a no-op event on top, `KS012`'s "not on top"
+        # refusal saw an identical digest and let the earlier proposal be reversed
+        # out from under it. Refused rather than skipped, because the citation is
+        # single-use and silently spending one is the same lie in the other direction.
+        #
+        # `before_value` and `assignments` are both decoded from jsonb, and the
+        # comparison is on the decoded values, so an action re-asserting the same
+        # number in a different spelling (`1` against `1.0`) is refused here too
+        # even though `current::text` would have changed.
+        raise ApplyError(
+            "no_op",
+            f"proposal {proposal_id}'s action merges to the value the canonical row "
+            "already holds, so applying it would spend the citation and write an "
+            "'applied' event whose before and after are the same bytes",
+            proposal_id=proposal_id,
+        )
 
     event = conn.execute(
         _INSERT_APPLIED_EVENT, {"proposal_id": proposal_id, "actor": actor}

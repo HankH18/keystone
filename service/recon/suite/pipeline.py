@@ -23,12 +23,12 @@ The order, and why it is that order
    ``fixtures/manifest.json`` -- rather than assumed. An empty or half-loaded
    database fails the suite; it never produces a small green.
 2. **reset the graded layer** -- ``conflicts``, ``invariant_results``,
-   ``proposals``, ``proposal_events``, ``conflict_incidents``. These are exactly
-   the tables this pass regenerates, so truncating them is what makes the suite
-   repeatable instead of order-dependent: a second run of the harness must see
-   the same "no proposals yet" starting state as the first, or ``proposal-safety``
-   would silently become ``oscillation-dedup``. Nothing in the mirror
-   (``raw_records``, ``ingest_runs``, ``stg_*``) and nothing in the identity
+   ``proposals``, ``proposal_events``, ``incidents``, ``conflict_incidents``.
+   These are exactly the tables this pass regenerates, so truncating them is what
+   makes the suite repeatable instead of order-dependent: a second run of the
+   harness must see the same "no proposals yet" starting state as the first, or
+   ``proposal-safety`` would silently become ``oscillation-dedup``. Nothing in the
+   mirror (``raw_records``, ``ingest_runs``, ``stg_*``) and nothing in the identity
    layer (``entities``, ``entity_links``, ``field_lineage``) is touched, and
    ``mirror-unchanged`` proves the second half of that claim with a hash.
 3. **invariant run A**, timed -- the golden diff, the clean sample, and the
@@ -48,6 +48,43 @@ The order, and why it is that order
    run R13's "the mirror is unchanged" claim is about.
 8. **``run_once()`` again** -- R16's dedup: with every fingerprint already open,
    the second pass must propose zero.
+9. **incident clustering** (:func:`_cluster_incidents`) -- R25, stretch #8. See
+   below; this is the one stage whose failure does not fail the pass.
+
+Why the clustering stage is here at all
+----------------------------------------
+Step 2 truncates ``conflict_incidents``, and for one commit *nothing*
+repopulated it: :func:`recon.incidents.cluster_conflicts` had no call site
+outside ``tests/incidents/``. The measured consequence on the documented path
+(``make sync`` -> ``make reconcile`` -> ``make suite``) was that
+``GET /api/incidents`` served ``{"items": [], "total": 0}`` for ever, with the
+router mounted, the module tested, and every test green.
+
+Removing the table from :data:`GRADED_TABLES` would not have fixed it.
+``conflict_incidents.conflict_id`` references ``conflicts``, so
+``TRUNCATE conflicts ... CASCADE`` takes the members with it whatever the list
+says -- and leaving ``incidents`` untruncated made it *worse*, because the
+previous pass's incident rows survived with every member gone and became the
+"latest batch" :func:`recon.incidents.latest_incidents` serves. The only
+resolution is for the pass that erases them to regenerate them, which is what
+step 9 does.
+
+Two deliberate choices in that stage:
+
+* **it charges a throwaway ledger scope, not the day's real budget.** Clustering
+  the 3,050-conflict golden set costs 56,487 microusd measured, and the seeded
+  ``daily`` cap is 5 USD -- so about 88 graded passes would exhaust the real
+  daily budget and start failing the suite for a reason that has nothing to do
+  with the code under test. :mod:`recon.suite.burst` already solves this the same
+  way and says why: pointing :data:`~recon.budget.DAILY_SCOPE_ENV` at a
+  harness-owned row does not *remove* a cap, it moves it onto a row this harness
+  owns, and every reservation still lands on both scopes with every trigger
+  firing.
+* **its failure is reported, not raised.** It runs last and its outcome is a
+  field on :class:`PipelineRun` plus a note, in both directions. A stretch
+  feature must not be able to turn fifteen unrelated graded rows red; and a
+  stage that failed quietly would be the exact defect this stage exists to fix,
+  so the note says which of the two happened every time.
 
 What is deliberately NOT here
 ------------------------------
@@ -74,7 +111,9 @@ import psycopg
 from sqlalchemy import Connection, text
 
 from recon.adapters.jsonl import default_fixtures_root
+from recon.budget import DAILY_SCOPE_ENV, provision_scope, run_scope
 from recon.db import ROLE_RECON_WRITER, database_url, get_engine, role_connection
+from recon.incidents import build_embedding_provider, cluster_conflicts
 from recon.invariants.runner import InvariantRun, persist_run, run_invariants
 from recon.logging import get_logger
 from recon.reconciler import ReconcileReport, reconcile, run_once
@@ -82,6 +121,8 @@ from recon.suite.mirror import MIRROR_TABLES, MirrorDigest, mirror_digest
 
 __all__ = [
     "GRADED_TABLES",
+    "INCIDENT_SCOPE_CAP_MICROUSD",
+    "IncidentStage",
     "PipelineRun",
     "PreconditionFailed",
     "ProposalRow",
@@ -99,10 +140,35 @@ log = get_logger("recon.suite.pipeline")
 GRADED_TABLES = (
     "proposal_events",
     "proposals",
+    # ``incidents`` and its member table are both here because step 9 REGENERATES
+    # them. ``conflict_incidents`` would be emptied by the CASCADE off
+    # ``conflicts`` in any case (``conflict_incidents_conflict_id_fkey``);
+    # ``incidents`` would not, and leaving it behind left the previous pass's rows
+    # as the newest batch with zero members each -- an endpoint answering
+    # "38 incidents, 0 conflicts in each", which is a worse answer than an empty
+    # one.
+    #
+    # ``docs/retention-policy.md`` lists ``incidents`` as *retained*, and that is
+    # not a contradiction: "retained" there means no clock ages a row out, which
+    # is a statement about the retention sweep. It never meant the graded harness
+    # leaves the table alone -- ``conflicts``, ``proposals`` and ``proposal_events``
+    # all carry retention windows AND are truncated here. Emptying a harness
+    # workspace is not a retention decision. What the policy document does not
+    # yet say is that this list touches the row at all; that footnote is named as
+    # a required edit in this ticket's report rather than made here, because
+    # ``docs/`` belongs to another ticket.
+    "incidents",
     "conflict_incidents",
     "conflicts",
     "invariant_results",
 )
+
+#: Ledger cap for the harness-owned scope the clustering stage spends against,
+#: in microusd. 1 USD, the same default :data:`recon.budget.PER_RUN_CAP_USD`
+#: gives a production run, so the stage meets a production-sized cap rather than
+#: one sized to fit -- the measured cost of the golden set is 56,487 microusd,
+#: about 5.6% of it, and a stage that ever hit this cap would be a real finding.
+INCIDENT_SCOPE_CAP_MICROUSD = 1_000_000
 
 #: ``raw_records`` columns that identify one manifest slice.
 _LANDING_COUNTS = text(
@@ -121,7 +187,12 @@ _CONFLICT_STATUS = text("SELECT status::text AS status, count(*) AS n FROM confl
 _PROPOSAL_ROWS = text(
     "SELECT p.id, p.fingerprint, p.status::text AS status, p.sensitive, p.action, "
     "       p.confidence::text AS confidence, c.type AS conflict_type, "
-    "       c.disagreeing_fields, c.status::text AS conflict_status, c.oscillating "
+    "       c.disagreeing_fields, c.status::text AS conflict_status, c.oscillating, "
+    # Migration 0015 granted `recon_writer` UPDATE on this column, so the
+    # oscillation check can now read the reason off the row instead of taking the
+    # reconciler's word for it (`ReconcileReport.escalation_reason_persisted` is
+    # only a `has_column_privilege` probe -- a grant is not a write).
+    "       c.escalation_reason "
     "FROM proposals p JOIN conflicts c ON c.id = p.conflict_id "
     "ORDER BY p.id"
 )
@@ -157,6 +228,11 @@ class ProposalRow:
     disagreeing_fields: tuple[str, ...]
     conflict_status: str
     oscillating: bool
+    #: ``conflicts.escalation_reason``, or ``None`` for a conflict that is not
+    #: escalated. ``None`` on an *escalated* row means the reason reached the
+    #: ``conflict.escalated`` audit row only -- which is what the whole run looked
+    #: like before migration 0015 granted the column to ``recon_writer``.
+    escalation_reason: str | None = None
 
     @property
     def target_paths(self) -> tuple[str, ...]:
@@ -185,6 +261,38 @@ class Precondition:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class IncidentStage:
+    """What step 9 did -- or, when ``error`` is set, why it did nothing.
+
+    Never ``None`` on a :class:`PipelineRun`: "the stage did not run" and "the
+    stage ran and found nothing" are different facts and a missing object cannot
+    tell them apart. ``ok`` is the one to read; ``error`` carries the refusal's
+    own message, which is the thing that names the fix.
+    """
+
+    ok: bool
+    run_id: str
+    scope: str
+    conflicts: int = 0
+    incidents: int = 0
+    biggest: int = 0
+    singletons: int = 0
+    model: str = ""
+    threshold: float = 0.0
+    seconds: float = 0.0
+    error: str | None = None
+
+    def summary(self) -> str:
+        if not self.ok:
+            return f"incident clustering did NOT run: {self.error}"
+        return (
+            f"{self.conflicts} conflicts -> {self.incidents} incidents "
+            f"(largest {self.biggest}, {self.singletons} singleton) via {self.model} "
+            f"at threshold {self.threshold} in {self.seconds:.1f}s"
+        )
+
+
 @dataclass
 class PipelineRun:
     """One graded pass. Built once per process; every check reads it."""
@@ -208,6 +316,14 @@ class PipelineRun:
     fixtures_root: Path
     dsn_database: str
     notes: list[str] = field(default_factory=list)
+    #: Step 9. Defaulted so the hand-built :class:`PipelineRun` instances in
+    #: ``tests/suite`` -- which exist to exercise a report over a run they can
+    #: describe exactly -- do not have to know about a stage they do not grade.
+    incidents: IncidentStage = field(
+        default_factory=lambda: IncidentStage(
+            ok=False, run_id="", scope="", error="the clustering stage did not run"
+        )
+    )
 
     @property
     def full_pass_seconds(self) -> float:
@@ -347,6 +463,95 @@ def _dry_reconcile(label: str) -> ReconcileReport:
     return report
 
 
+@contextmanager
+def _daily_scope(scope: str) -> Iterator[None]:
+    """Point the mandated daily cap at ``scope`` for the duration of a stage.
+
+    Lifted verbatim in intent from :func:`recon.suite.burst._daily`, which does
+    the same thing for the same reason: this does not remove a cap, it moves it
+    onto a row the harness owns. The reservation still lands on the daily scope
+    AND the run scope exactly as a production call does, and every rule the
+    reserve and settle triggers enforce still fires against it.
+    """
+    previous = os.environ.get(DAILY_SCOPE_ENV)
+    os.environ[DAILY_SCOPE_ENV] = scope
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(DAILY_SCOPE_ENV, None)
+        else:
+            os.environ[DAILY_SCOPE_ENV] = previous
+
+
+def _cluster_incidents() -> IncidentStage:
+    """Step 9: regenerate ``incidents`` / ``conflict_incidents`` for this pass.
+
+    Runs the real :func:`recon.incidents.cluster_conflicts` -- the same callable
+    ``python -m recon.incidents`` runs -- against the conflicts step 4 persisted,
+    through the real ``recon_writer`` grants and the real ledger. Nothing is
+    stubbed: the provider is whatever ``EMBEDDING_PROVIDER`` selects (``mock``
+    offline by default) and it is metered like any other.
+
+    The run id is a runtime artefact (pid + nanosecond clock, the way
+    :func:`recon.suite.burst._unique` builds one, never ``uuid4()``). It names
+    the ledger scope and seeds the reservation idempotency key, and nothing
+    graded depends on it: the incidents, their labels and their sizes are a
+    function of the conflicts alone. A *fresh* id each pass is required rather
+    than optional -- re-using one is a replay of a paid reservation and the
+    ledger refuses it.
+
+    **Returns a failed :class:`IncidentStage` instead of raising**, for the
+    reason the module docstring gives: fifteen graded rows about detection and
+    reconciliation must not go red because a stretch feature's provider is
+    misconfigured. The refusal's own message is carried out on ``error`` and
+    reported as a note either way, so "it failed" is never silence.
+    """
+    run_id = f"suite-incidents-{os.getpid()}-{time.time_ns()}"
+    scope = run_scope(run_id)
+    clock = time.perf_counter()
+    try:
+        # Built before the scope, not lazily inside ``cluster_conflicts``: that
+        # function returns early when there are no conflicts and never reaches
+        # the provider, so a misconfigured ``EMBEDDING_PROVIDER`` against an
+        # empty table reported a clean, empty, successful stage. The amount of
+        # work must not decide whether a misconfiguration is reported.
+        provider = build_embedding_provider()
+        provision_scope(scope, INCIDENT_SCOPE_CAP_MICROUSD)
+        with _daily_scope(scope):
+            run = cluster_conflicts(run_id=run_id, provider=provider)
+    # Bare `Exception` on purpose. The refusals this can meet are open-ended --
+    # an unpriced model, an absent key, a missing ledger row, a cap, a provider
+    # transport error -- and narrowing the clause would let the one that was not
+    # listed take fifteen unrelated graded rows down with it. It is reported in
+    # full on `error`, never swallowed.
+    except Exception as failure:
+        stage = IncidentStage(
+            ok=False,
+            run_id=run_id,
+            scope=scope,
+            seconds=time.perf_counter() - clock,
+            error=f"{type(failure).__name__}: {failure}",
+        )
+        log.warning("suite.incidents_stage_failed", label=stage.summary())
+        return stage
+
+    stage = IncidentStage(
+        ok=True,
+        run_id=run_id,
+        scope=scope,
+        conflicts=run.conflicts,
+        incidents=run.incidents,
+        biggest=max(run.sizes) if run.sizes else 0,
+        singletons=sum(1 for size in run.sizes if size == 1),
+        model=run.model,
+        threshold=run.threshold,
+        seconds=time.perf_counter() - clock,
+    )
+    log.info("suite.incidents_clustered", label=stage.summary())
+    return stage
+
+
 def _read_proposals(conn: Connection) -> tuple[ProposalRow, ...]:
     rows: list[ProposalRow] = []
     for row in conn.execute(_PROPOSAL_ROWS):
@@ -362,6 +567,9 @@ def _read_proposals(conn: Connection) -> tuple[ProposalRow, ...]:
                 disagreeing_fields=tuple(row.disagreeing_fields or ()),
                 conflict_status=str(row.conflict_status),
                 oscillating=bool(row.oscillating),
+                escalation_reason=(
+                    None if row.escalation_reason is None else str(row.escalation_reason)
+                ),
             )
         )
     return tuple(rows)
@@ -418,12 +626,37 @@ def build_pipeline() -> PipelineRun:
         proposals = _read_proposals(conn)
         conflict_status = {str(row.status): int(row.n) for row in conn.execute(_CONFLICT_STATUS)}
 
+    # -- R25: regenerate the incidents step 2 truncated. Last, because it is the
+    # one stage whose outcome no other artifact depends on.
+    incidents = _cluster_incidents()
+
+    # Reported in BOTH directions, never by staying quiet. The flag is the
+    # reconciler asking the live catalogue what it holds
+    # (`has_column_privilege(current_user, 'conflicts', 'escalation_reason',
+    # 'UPDATE')`, once per run), so it is a fact about the database this run
+    # actually touched -- which is exactly why silence would be the wrong report:
+    # a scorecard generated against a database that predates migration 0015, or
+    # one that has been downgraded past it, must say so, and a scorecard
+    # generated against a granted database must say THAT. Emitting the note only
+    # in the degraded case made "no note" ambiguous between "checked and fine"
+    # and "nobody looked".
     notes: list[str] = []
-    if not report_first.escalation_reason_persisted:
+    if report_first.escalation_reason_persisted:
+        notes.append(
+            "conflicts.escalation_reason IS writable by recon_writer (migration 0015), so "
+            "the escalation reason is persisted on the conflict row as well as in the "
+            "conflict.escalated audit row"
+        )
+    else:
         notes.append(
             "conflicts.escalation_reason was not writable by recon_writer; the "
             "escalation reason is in the conflict.escalated audit row only"
         )
+    # Same rule for step 9, and for the same reason: the pass truncates
+    # `incidents`/`conflict_incidents` and then regenerates them, so "the
+    # endpoint has data" and "the endpoint is empty because the stage refused"
+    # must be distinguishable from the scorecard alone.
+    notes.append(f"R25 incident clustering (stretch #8): {incidents.summary()}")
 
     return PipelineRun(
         started_at=started_at,
@@ -445,6 +678,7 @@ def build_pipeline() -> PipelineRun:
         fixtures_root=root,
         dsn_database=_database_name(),
         notes=notes,
+        incidents=incidents,
     )
 
 

@@ -154,7 +154,7 @@ def test_malformed_cases_are_structural_and_isolated(any_tree: SeedTree) -> None
     cases = any_tree.read_jsonl("malformed/cases.jsonl")
     assert len(cases) >= 20
     assert all(isinstance(case["raw"], str) for case in cases), "raw is the LITERAL payload string"
-    assert {case["case_id"] for case in cases} == {case["case_id"] for case in cases}
+    assert len({case["case_id"] for case in cases}) == len(cases), "case_id must be unique"
     duplicates = [case for case in cases if case["kind"] == "duplicate_primary_key"]
     assert duplicates and all(case["entity_type"] == "contact" for case in duplicates), (
         "SS12 D-3: duplicate PK is exercised on a CRM contact only, never on a payment"

@@ -24,8 +24,42 @@ import { useConflict, useProposals } from '../lib/queries'
 import {
   CONFLICT_TYPE_LABEL,
   RULE_ID_BY_TYPE,
+  type Conflict,
   type ConflictType,
+  type Proposal,
 } from '../lib/contract'
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined
+}
+
+/**
+ * A9 — where the observed values actually live, in preference order.
+ *
+ * 1. `conflict.observed_values`, TOP-LEVEL on the conflict row
+ *    (`review.py::_conflict_row`). Preferred: it is the row this page is ABOUT,
+ *    it is there whether or not a proposal exists, and it needs no proposal
+ *    fetch to have landed.
+ * 2. `proposal.evidence.conflict.observed_values` — where
+ *    `reconciler.py::EvidencePacket.as_dict` nests it.
+ *
+ * This used to read `proposal.evidence.observed_values`, a top-level key
+ * NOTHING writes, so the "Observed values" column rendered "—" on every single
+ * conflict — deleting exactly the "CRM says X, App DB says Y" view the brief
+ * asks for. It is a fallback chain, not a guess: each step is a key path read
+ * out of the service, and running out of them still degrades to "—".
+ */
+function observedValues(
+  conflict: Conflict | undefined,
+  proposal: Proposal | undefined,
+): Record<string, unknown> | undefined {
+  const fromRow = asRecord(conflict?.observed_values)
+  if (fromRow) return fromRow
+  const evidence = asRecord(proposal?.evidence)
+  return asRecord(asRecord(evidence?.conflict)?.observed_values)
+}
 
 export function ConflictDetailRoute({ id }: { id: string }) {
   const conflict = useConflict(id)
@@ -35,12 +69,7 @@ export function ConflictDetailRoute({ id }: { id: string }) {
   )
   const proposal = proposals.data?.items[0]
 
-  const observed =
-    proposal && typeof proposal.evidence === 'object' && proposal.evidence
-      ? ((proposal.evidence as Record<string, unknown>).observed_values as
-          | Record<string, unknown>
-          | undefined)
-      : undefined
+  const observed = observedValues(conflict.data, proposal)
 
   return (
     <>
