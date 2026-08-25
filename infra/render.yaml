@@ -297,7 +297,7 @@ services:
       # up as every dashboard request failing with an opaque CORS error and
       # NOTHING in the service log.
       - key: KEYSTONE_CORS_ORIGINS
-        value: https://keystone-dashboard.onrender.com
+        value: https://keystone-dashboard-2rot.onrender.com
       # ---- Spend caps (R17). Read at migration time to provision the ledger
       # rows and by `recon.budget` to provision each run's scope.
       - key: DAILY_CAP_USD
