@@ -39,17 +39,27 @@ AI tooling disclosure: **[AI_USAGE.md](AI_USAGE.md)**.
 
 ## Deployed application
 
-> **⚠️ PLACEHOLDER — TO BE FILLED IN BEFORE SUBMISSION. Not yet deployed.**
->
-> - **Service:** `<service URL here>`
-> - **Dashboard:** `<dashboard URL here>`
+- **Dashboard:** <https://keystone-dashboard-2rot.onrender.com>
+- **Service:** <https://keystone-service-bxs8.onrender.com> — `/health`, `/docs`, and the client API
+- **Demo key:** send `X-Api-Key: keystone-demo-admin-8c25e0b71a94f36d` (the dashboard already does)
+
+Render appends a suffix when a service name is taken globally, which is why the hosts carry
+`-2rot` / `-bxs8` rather than the bare names the blueprint asks for.
+
+> **The deployed instance carries the `dev` dataset, not the graded one.** Neon's free tier caps a
+> project at 512 MB and the graded `--profile full` dataset needs ~1 GB in Postgres, so the first
+> deployed sync died mid-`COPY`. The deployed build therefore seeds `--profile dev`: the same code
+> path and seed semantics, all 14 conflict classes present at scaled-down minimums — **161 conflicts
+> → 161 proposals (139 pending, 22 `sensitive_hold`, 25 escalated for oscillation)**.
+> Everything graded — `golden/`, `docs/scorecard.txt`'s 16/16, and every benchmark — is measured on
+> `--profile full` locally, as the scorecard's own scope note records.
 
 The blueprint is committed at [`infra/render.yaml`](infra/render.yaml): a Python web service, a
 static dashboard, and three cron jobs. Two of them — sync and reconcile — trigger over HTTPS with a
 per-job shared-secret header; the third, the budget sweeper, runs `python -m recon.budget sweep`
 directly as the ops principal and carries no trigger secret. The database is **Neon**, named
 explicitly — the blueprint declares no Render Postgres. Migrations run as `preDeployCommand`. Until
-the URLs above are filled in, the local quick start below is the runnable build.
+The local quick start below reproduces the graded full-profile dataset.
 
 ---
 
