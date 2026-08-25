@@ -213,7 +213,7 @@ services:
     buildCommand: >-
       pip install --upgrade uv &&
       uv sync --frozen --no-dev &&
-      uv run python -m recon.seed --profile full --seed "$SEED" &&
+      uv run python -m recon.seed --profile dev --seed "$SEED" --out "$KEYSTONE_SEED_OUT" &&
       uv run python -c "import sys; from recon.adapters.jsonl import default_fixtures_root as R, SOURCE_ADAPTERS as S; r = R(); missing = [s for s in S if not (r / s).is_dir()]; print('fixtures root:', r, '| missing:', missing); sys.exit(1 if missing else 0)"
     # Migrations run on release, not at import time: a web dyno that migrates on
     # boot races itself the moment the service scales past one instance. They
@@ -318,6 +318,18 @@ services:
         value: safe
       # Consumed by `buildCommand` above as `--seed "$SEED"`. Determinism is
       # graded, so this is pinned, not random.
+      # DEPLOY-ONLY DATASET SIZE. Neon's free tier caps the project at 512 MB and the
+      # graded full profile needs ~1 GB in Postgres, so the first sync died mid-COPY.
+      # The deployed instance therefore carries the `dev` profile: same code path, same
+      # seed semantics, all 14 conflict classes present at scaled-down minimums. The
+      # GRADED dataset is still `--profile full` -- that is what golden/ and
+      # docs/scorecard.txt are built from, and what `make suite` grades locally.
+      # `--profile dev` refuses to write the committed trees, so it needs an explicit
+      # --out; KEYSTONE_FIXTURES_DIR then points the adapters at that tree.
+      - key: KEYSTONE_SEED_OUT
+        value: /opt/render/project/src/.deploy-seed
+      - key: KEYSTONE_FIXTURES_DIR
+        value: /opt/render/project/src/.deploy-seed/fixtures
       - key: SEED
         value: "20260822"
 
