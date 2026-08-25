@@ -380,11 +380,17 @@ services:
     # "https://" -- a green build, a green deploy, and every dashboard request
     # failing in the browser with NOTHING in any server log. So an empty
     # KEYSTONE_API_HOST fails the build loudly instead of shipping that bundle.
+    # `fromService ... property: host` returned the service NAME
+    # (`keystone-service-bxs8`), NOT the FQDN, so the first deploy baked
+    # VITE_API_BASE_URL=https://keystone-service-bxs8 -- an unresolvable host. The
+    # dashboard rendered fine and fired ZERO requests, because DNS fails before a
+    # request exists: nothing in the service log, nothing in the browser network tab.
+    # The case below accepts either form, so it is correct whichever Render returns.
     buildCommand: >-
       test -n "$KEYSTONE_API_HOST" || { echo "FATAL: KEYSTONE_API_HOST is empty - fromService did not resolve into the static-site build env; VITE_API_BASE_URL would bake as 'https://'. Failing the build." >&2; exit 1; } &&
       npm install -g pnpm@10 &&
       pnpm install --frozen-lockfile --prod=false &&
-      VITE_API_BASE_URL="https://$KEYSTONE_API_HOST" pnpm build
+      case "$KEYSTONE_API_HOST" in *.*) API_HOST="$KEYSTONE_API_HOST" ;; *) API_HOST="$KEYSTONE_API_HOST.onrender.com" ;; esac && echo "baking VITE_API_BASE_URL=https://$API_HOST" && VITE_API_BASE_URL="https://$API_HOST" pnpm build
     staticPublishPath: ./dist
     routes:
       - type: rewrite
