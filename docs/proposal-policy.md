@@ -344,11 +344,12 @@ green for the clean one.
 
 ### What an auto-applied write is observable IN
 
-R24 says auto-apply "applies only to Keystone's canonical layer". It does — and **every write it
-admits is still invisible to every reader**. That is a different failure from an unsafe one, and no
-test that asserts "the row moved" can catch it. This section says exactly what is observable and what
-is not; §8.10 says why the *unattended* half of the gap cannot be closed without a model change or a
-contract change, and gives the number rather than an impression.
+R24 says auto-apply "applies only to Keystone's canonical layer". It does — and **the VALUE it lands
+is still invisible to both readers of the entity projection**. That is a
+different failure from an unsafe one, and no test that asserts "the row moved" can catch it. This
+section says exactly what is observable and what is not; §8.10 says why the *unattended* half of the
+gap cannot be closed without a model change or a contract change, and gives the number rather than an
+impression.
 
 `AUTO_APPLY_ELIGIBLE` is written in source-qualified paths; `recon.resolve.VIEW_FIELDS` is the key set
 the entity **projection** is built from. **They share no member.**
@@ -364,9 +365,21 @@ two readers:
 
 `golden/expected-views.json` is the *shape they are checked against*, not a third reader. **The
 dashboard is not a reader of it at all**: `dashboard/src/lib/httpClient.ts` calls `/api/conflicts`,
-`/api/proposals`, the three decision verbs and `/api/scorecard`, and never touches the entities
-endpoint. Naming it here overstated who would notice an invisible write — the same class of error as
-the other five in §8, made on the observability claim rather than on a control.
+`/api/proposals`, the four proposal verbs (`approve`, `reject`, `apply`, `rollback`),
+`/api/scorecard` and `/api/audit`, and never touches the entities endpoint. Naming it here overstated
+who would notice an invisible write — the same class of error as the other five in §8, made on the
+observability claim rather than on a control.
+
+**The ACT is observable now; the VALUE still is not, and the two are different claims.**
+`GET /api/audit` (`recon/api/audit.py`) and the dashboard's "Audit log" page did not exist when this
+section was first written. An apply lands an `audit_log` row through
+`recon.logging.insert_audit_row` — `system:auto-apply` / `proposal.auto_applied` on the unattended
+path, `system:apply` / `proposal.applied` on the manual one, and `proposal.auto_apply_refused` for a
+refusal, written in a transaction of its own so the raise cannot roll it back — and that row is
+served redacted, paged and filterable by actor/action/subject to a reviewer's screen. So *"the
+machine wrote something, and to which proposal"* is now answerable from the dashboard. What is still
+not answerable there is *what the canonical value became*, because the paths R24 admits are projected
+by neither reader above. §8.10 measures that residue and does not treat the audit row as closing it.
 
 So an auto-apply of `{"set": {"crm.contact.grade": "7"}}` adds a NEW TOP-LEVEL KEY to
 `entities.current` that neither reader projects: the row moves, the digest moves,
@@ -550,12 +563,13 @@ the same reader just as badly, and because §8's numbering is cited by name from
    "escalation_reason")` and `_rescope` (`:100-102`, called by `upgrade()` at `:105-106`) re-grants
    exactly those three — still a closed list, still narrower than the table: `fingerprint`, `type`,
    `entity_refs`, `first_seen_run` and `oscillating` stay ungranted. So `_escalate` issues the
-   single statement it was always meant to (`_ESCALATE_CONFLICT`, `reconciler.py:876-885`, which
-   sets `escalation_reason = :reason` at `:880`) whenever the once-per-run catalogue probe
+   single statement it was always meant to (`_ESCALATE_CONFLICT`, `reconciler.py:879-888`, which
+   sets `escalation_reason = :reason` at `:883`) whenever the once-per-run catalogue probe
    `has_column_privilege(current_user, 'conflicts', 'escalation_reason', 'UPDATE')`
-   (`reconciler.py:905-907`) says it holds the column; the run reports the answer as
-   `escalation_reason_persisted` (`:485`, `:1652`). The status-only fallback
-   (`_ESCALATE_CONFLICT_STATUS_ONLY`, `:892-899`) is kept for a database still on 0014, which is why
+   (`reconciler.py:908-910`) says it holds the column; the run reports the answer as
+   `escalation_reason_persisted` (declared `:488`, serialised into the run report `:530`, set
+   `:1675`). The status-only fallback
+   (`_ESCALATE_CONFLICT_STATUS_ONLY`, `:895-902`) is kept for a database still on 0014, which is why
    the probe stays rather than the grant being assumed. After `alembic upgrade head` the grant reads
    `{escalation_reason, last_seen_run, status}`, so the API's `escalated:<reason>` branch — not the
    bare `escalated` one — is what now serves an escalated row, and `contract.ts` A6's labelled
@@ -682,7 +696,14 @@ the same reader just as badly, and because §8's numbering is cited by name from
    already **applied** is a canonical write that has happened: reverse it with
    `recon.apply.rollback_proposal` first, so the ledger records the reversal, and only then delete.
 
-10. **Nothing the machine may take unattended is observable, and that is structural.**
+10. **No value the machine may write unattended reaches the entity projection, and that is
+    structural.** (The *act* does reach a reader — `GET /api/audit` and the dashboard's Audit log
+    page serve the `audit_log` row every apply and every **refused auto-apply** lands, per §4.
+    Say *auto*-apply and mean it: `recon.apply._audit_refusal` has exactly one caller, the
+    `if not decision.allowed` arm of `auto_apply`, and every other refusal in the module is a bare
+    `raise ApplyError` that writes nothing — including §8.11's `nested_member_introduced`, which is
+    the refusal a *reviewer* gets. This entry is about the canonical value, which that row does not
+    carry.)
     §4's "What an auto-applied write is observable in" makes one eligible path observable, and
     `recon.reconciler` now emits it: 120 of the 3,050 committed proposals write
     `survived->crm.contact.lifecycle_stage`, and `test_the_real_proposal_applies_visibly_and_rolls_back`
@@ -707,9 +728,9 @@ the same reader just as badly, and because §8's numbering is cited by name from
       `VIEW_FIELDS`. The path set is the structural claim; the population behind it is a dataset
       property and the test asserts only that it is non-empty.
 
-    **The honest count of proposals that are both auto-appliable and visible is 0**, and no seed
-    change moves it. Three routes could close it; only two are available, and neither is this
-    ticket's:
+    **The honest count of proposals that are both auto-appliable and visible in the entity
+    projection is 0**, and no seed change moves it. Three routes could close it; only two are
+    available, and neither is this ticket's:
 
     1. **Change the model** so a single disagreeing row leaves headroom — a smaller
        `disagreeing_field` weight, or subtracting penalties before the clamp. That is a

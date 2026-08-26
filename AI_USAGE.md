@@ -227,6 +227,20 @@ passing test suite at the time it was found:
   `POST /internal/reconcile` authenticated, consumed the run id, and answered HTTP 200
   `{"status": "started", "handler": "unbound"}` — with an hourly cron in `infra/render.yaml`
   pointed at it. Now bound: `register_job_handler(JOB_RECONCILE, reconcile_job, app=app)`.
+- **And then those crons had still never once run.** `fromService … property: host` returns the
+  service *name*, not its FQDN, so every firing since the blueprint was applied died on
+  `curl: (7) Failed to connect to keystone-service-bxs8 port 443` — invisibly, because a cron
+  failure shows up only in that cron's own log. The identical defect had already been found and
+  fixed once in the dashboard's build command and was never swept for elsewhere; a fix applied at
+  one site is not a fix. **Both trigger crons** normalise either form now, the same `case
+  "$KEYSTONE_API_HOST"` the dashboard build already carried — three sites in `infra/render.yaml`,
+  and three `property: host` references to match. Be exact about the third schedule rather than
+  rounding it up to "all of them": `keystone-budget-sweeper` runs `python -m recon.budget sweep`
+  against a `DATABASE_URL` copied `fromService … envVarKey: OPS_DATABASE_URL`. It resolves no host,
+  never curled the service, and was never affected. What proves the fix is not the count anyway —
+  the deployed audit log carries the `trigger.sync` and `trigger.reconcile` rows the crons
+  themselves wrote through `claim_run` (`api/internal.py:277`), which is the only evidence that
+  counts here, since the suite cannot test a Render schedule.
 - **The rationale seam had no production caller.** `reconcile()`'s `rationale` parameter defaults
   to `no_rationale`, and nothing outside the tests passed anything else — so `recon.llm`'s whole
   reserve → call → settle chain was armed, correct, and never once exercised by the service, and
@@ -285,13 +299,16 @@ golden set cannot drift away from what the detector actually sees. Measured cons
 (`docs/scorecard.txt`, `bench:conflict-accuracy`): `precision 1.000000 recall 1.000000 on 3050
 golden entries (FN=0 FP=0 field-mismatches=0)`.
 
-**Scorecard at the time of writing** (`docs/scorecard.txt`, `generated 2026-08-23T21:04:57+00:00`):
-16/16 checks passed, combined coverage 92.5% over the seven core modules against a floor of 80%.
-That file is a generated artifact and its timestamp precedes the rationale wiring described in
-§1, so treat its coverage percentage as of that run rather than of this commit. The graded
-figures are unaffected: under the `mock` default `rationale_hook_for` returns `no_rationale`
-itself, so the dataset, conflict set and confidence vector a run produces are byte-identical to
-what they were before that function existed.
+**Scorecard** (`docs/scorecard.txt`, `generated 2026-08-26T07:39:39+00:00`): 16/16 checks passed,
+combined coverage 93.1% over the seven core modules against a floor of 80%, measured by a real
+pytest run — 4,771 passed, 2 skipped, in 1949.13s. That file is a generated artifact and it is
+regenerated against a rebuilt database rather than hand-edited. This paragraph used to carry a
+caveat that the scorecard predated the rationale wiring described in §1 and that its coverage
+figure was therefore an earlier tree's; **that caveat is gone because the run is now later than
+the wiring**, not because it was argued away. The graded figures were never affected either way:
+under the `mock` default `rationale_hook_for` returns `no_rationale` itself, so the dataset,
+conflict set and confidence vector a run produces are byte-identical to what they were before that
+function existed.
 
 ---
 
@@ -332,7 +349,9 @@ independent blockers, and both of them had a green test suite in front of them:
 models (Voyage and OpenAI list rates, captured 2026-08-24; the mock at the higher of the two, for the
 reason `mock-rationale-v1` is priced at a production rate — a free mock makes "the embedding path is
 metered" a claim about a no-op), migration `0016_price_embedding_models` seeds `budget_model_prices`,
-the stand-in fixture is deleted, and two real callers write the rows: `python -m recon.incidents` and
+the stand-in stopped standing in — `embedding_prices` supplies **nothing** now and instead fails if
+the database it is about to reserve against does not already carry the committed rates, which is the
+opposite of what it used to do — and two real callers write the rows: `python -m recon.incidents` and
 step 9 of the graded pass, which regenerates the incidents that same pass truncates. The refusal
 branch was *re-pointed*, not removed — `test_an_unpriced_model_is_still_refused_at_build_time` now
 hands `build_embedding_provider` a price table with the model taken out, so the door that stops an

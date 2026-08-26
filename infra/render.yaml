@@ -154,10 +154,11 @@
 # -------------------------------------------------------------
 # Compute `ep-young-shape-ayr8cqc1` has `suspend_timeout_seconds: 0`, which in
 # Neon's API means "use the default" (~5 minutes idle), not "never suspend".
-# `/health` opens a real connection under a hard 2.0s bound
-# (`HEALTH_PROBE_TIMEOUT_SECONDS` in `recon/health.py`) and a cold Neon start
-# exceeds that; the probe then reports `timeout`, severity 3 >= _FATAL, so
-# `/health` answers **503** and Render pulls the instance out of rotation.
+# `/health` opens a real connection under a per-probe bound that defaults to
+# 2.0s (`recon.config.DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS`, resolved by
+# `recon.health.health_probe_timeout`) and a cold Neon start exceeds that;
+# the probe then reports `timeout`, severity 3 >= _FATAL, so `/health` answers
+# **503** and Render pulls the instance out of rotation.
 #
 # What this file does about it: `preDeployCommand` runs `alembic upgrade head`
 # against the DIRECT endpoint immediately before the deploy goes live, and the
@@ -165,10 +166,27 @@
 # when Render's first health check lands. That covers the deploy, not steady
 # state.
 #
-# What this file CANNOT do about it: `HEALTH_PROBE_TIMEOUT_SECONDS` is a module
-# constant with no environment override, and Render exposes no health-check
-# interval or timeout in the blueprint spec. **Set the Neon compute to never
-# suspend before relying on this deployment:**
+# What this file does NOT currently do about it: `HEALTH_PROBE_TIMEOUT_SECONDS`
+# is now a real environment override (`Settings.health_probe_timeout_seconds`)
+# -- this comment used to say it was a module constant with no override, and
+# that stopped being true when the constant moved to `recon.config`.
+# Precisely what that override is, because the difference decides how it is
+# operated: `recon.health.health_probe_timeout` reads it through
+# `recon.config.get_settings`, which carries `@lru_cache(maxsize=1)`, so the
+# environment is read ONCE per process and cached for that process's lifetime.
+# Setting it in `envVars` therefore works — Render starts a fresh process — and
+# changing it under a running one does nothing. What calling the resolver per
+# probe (rather than binding the value to a default argument evaluated at
+# import) buys is narrower and still worth having: the bound belongs to the
+# process that SERVES the probe, not to whichever process first imported
+# `recon.health`.
+# The variable is deliberately NOT set in `envVars` below, so the deployed bound
+# is the 2.0s default; `.env.example` documents 15 as the sane value in front of
+# a scale-to-zero database, and adding one `HEALTH_PROBE_TIMEOUT_SECONDS` entry
+# there is the fix this file CAN make.
+# What this file still cannot do: Render exposes no health-check interval or
+# timeout in the blueprint spec. **Set the Neon compute to never suspend before
+# relying on this deployment:**
 #     neon compute update ep-young-shape-ayr8cqc1 --suspend-timeout -1
 # (or PATCH the endpoint with `suspend_timeout_seconds: -1`). Until that is
 # done, the service can 503 after five idle minutes.
@@ -176,8 +194,10 @@
 # TLS (R20) is not optional and not configured here: Render terminates TLS on
 # every `onrender.com` host, and each cron below pins `--proto '=https'` so the
 # request fails rather than silently downgrading if the host variable is ever
-# edited to an http:// origin; `property: host` yields a bare hostname, so the
-# scheme is written literally in the command rather than inherited from a URL.
+# edited to an http:// origin; `property: host` yields a bare token with no
+# scheme -- and, as the dashboard build and both crons found the hard way, the
+# token is the service NAME rather than the FQDN -- so the scheme is written
+# literally in the command and the name is normalised there too.
 # `sslmode=require` is pinned on the composed DSN for the same reason — Neon
 # requires TLS regardless, but the setting is written down rather than assumed.
 # ---------------------------------------------------------------------------
@@ -201,7 +221,7 @@ services:
     #
     # `--profile full` is the GRADED dataset and it is what runs here. The cost
     # was measured, not guessed: `docs/scorecard.txt` records the determinism
-    # row regenerating this exact profile twice at **27.3s and 27.0s**, for
+    # row regenerating this exact profile twice at **26.2s and 26.0s**, for
     # ~123MB of fixtures. That is a rounding error in a build, so there is no
     # reason to ship the deployment a `--profile dev` dataset that is not the
     # one the golden files, the scorecard and the Appendix-A minimums describe.
@@ -240,7 +260,10 @@ services:
     #
     # Nothing else is composed here. `KEYSTONE_CORS_ORIGINS` -- the one other
     # value that could have been, since the dashboard's origin needs a scheme
-    # and `property: host` yields a bare hostname -- is a plain literal in
+    # and `property: host` yields a bare token with no scheme, and (measured on
+    # the `keystone-service` reference this file does make) that token is the
+    # service NAME rather than the FQDN, so NEITHER half of the origin a browser
+    # actually sends could have been inherited from it -- is a plain literal in
     # `envVars` below instead, with the scheme written out. This comment used to
     # claim it was composed in this command; it never was, and the value would
     # then have come from `DEFAULT_CORS_ORIGINS` (localhost:5173) and refused
@@ -303,10 +326,14 @@ services:
       # the one that can be a literal, because it is read at RUNTIME.
       #
       # !! Render appends a random suffix if `keystone-dashboard` is taken in
-      # the workspace. After the first apply, check the static site's real
-      # onrender.com host and correct this value if it differs. A mismatch shows
-      # up as every dashboard request failing with an opaque CORS error and
-      # NOTHING in the service log.
+      # the workspace, and it DID: the static site came up as
+      # `keystone-dashboard-2rot.onrender.com` while this value still read
+      # `https://keystone-dashboard.onrender.com` -- a host no browser ever
+      # sends, so every dashboard request would have failed with an opaque CORS
+      # error and NOTHING in the service log. The value below is the real host,
+      # read back off the deployed site. Re-apply the blueprint into a fresh
+      # workspace and the suffix changes again, so check it after the first
+      # apply rather than trusting the name written here.
       - key: KEYSTONE_CORS_ORIGINS
         value: https://keystone-dashboard-2rot.onrender.com
       # ---- Spend caps (R17). Read at migration time to provision the ledger
@@ -373,10 +400,13 @@ services:
   # VITE_API_KEY), so the API origin is frozen into the bundle and cannot be
   # configured afterwards. Render resolves `fromService` before the build runs,
   # so `KEYSTONE_API_HOST` is available to `buildCommand` -- but `property:
-  # host` yields a BARE HOSTNAME, and a `VITE_` variable cannot prepend a
-  # scheme. Hence the scheme is prepended in the build command itself, which
-  # Vite picks up because it reads prefixed variables from the process
-  # environment, not only from `.env` files.
+  # host` yields a BARE TOKEN WITH NO SCHEME, and a `VITE_` variable cannot
+  # prepend one. Worse than a missing scheme, and the distinction is the whole
+  # bug below: the token is the service NAME, not the FQDN. A bare *hostname*
+  # would have resolved once a scheme was glued on; a bare service name does
+  # not resolve at all. Hence the build command below prepends the scheme AND
+  # normalises the name, which Vite picks up because it reads prefixed
+  # variables from the process environment, not only from `.env` files.
   #
   # The bundle is a client-side-routed SPA (`dashboard/src/lib/router.tsx` uses
   # `history.pushState` and reads `window.location.pathname`), so a deep link
@@ -398,19 +428,21 @@ services:
     # NODE_ENV=production in the build environment, a default install would
     # skip them and the build would fail on a missing `tsc`.
     #
-    # THE FIRST CLAUSE IS A GATE, NOT A NICETY. It is UNVERIFIED that
-    # `fromService` resolves into a STATIC SITE's build environment (it is
-    # documented for services; static-site builds are the untested case). If it
-    # resolves to nothing, `VITE_API_BASE_URL` bakes as the literal string
-    # "https://" -- a green build, a green deploy, and every dashboard request
-    # failing in the browser with NOTHING in any server log. So an empty
+    # THE FIRST CLAUSE IS A GATE, NOT A NICETY. `fromService` DOES resolve into
+    # a static site's build environment -- that was the untested case when this
+    # gate was written, and the deployed bundle has now settled it -- but if it
+    # ever resolved to nothing, `VITE_API_BASE_URL` would bake as the literal
+    # string "https://": a green build, a green deploy, and every dashboard
+    # request failing in the browser with NOTHING in any server log. So an empty
     # KEYSTONE_API_HOST fails the build loudly instead of shipping that bundle.
-    # `fromService ... property: host` returned the service NAME
-    # (`keystone-service-bxs8`), NOT the FQDN, so the first deploy baked
+    # What it resolves TO is the second half of the problem: `fromService ...
+    # property: host` returned the service NAME (`keystone-service-bxs8`), NOT
+    # the FQDN, so the first deploy baked
     # VITE_API_BASE_URL=https://keystone-service-bxs8 -- an unresolvable host. The
     # dashboard rendered fine and fired ZERO requests, because DNS fails before a
     # request exists: nothing in the service log, nothing in the browser network tab.
-    # The case below accepts either form, so it is correct whichever Render returns.
+    # The case below accepts either form, so it is correct whichever Render returns;
+    # the live bundle now carries https://keystone-service-bxs8.onrender.com.
     buildCommand: >-
       test -n "$KEYSTONE_API_HOST" || { echo "FATAL: KEYSTONE_API_HOST is empty - fromService did not resolve into the static-site build env; VITE_API_BASE_URL would bake as 'https://'. Failing the build." >&2; exit 1; } &&
       npm install -g pnpm@10 &&
@@ -477,13 +509,28 @@ services:
     #     curl: (7) Failed to connect to keystone-service-bxs8 port 443
     # so `lastSuccessfulRunAt` was empty on both trigger crons and the deployment
     # had never once run itself. The `case` normalises either form, exactly as the
-    # dashboard build does, so this is correct whichever Render returns.
+    # dashboard build does, so this is correct whichever Render returns -- and all
+    # three crons here now succeed unattended.
     #
-    # `--max-time` is 1800, not 300. The graded full-profile sync lands 360,400
-    # records across three generations and then materializes 43,375 entities and
-    # 1,279,575 field_lineage rows; `make sync` allows 3600 for the same call
-    # locally. 300 would have failed the first honest run even after the host was
-    # fixed, and a timeout here reads exactly like an outage.
+    # `--max-time` is 1800, not 300. `POST /internal/sync` is ingest ->
+    # materialize -> invariants, and on the graded full profile that is 360,400
+    # records across three generations, 43,375 entities and 1,712,775
+    # field_lineage rows; `make sync` allows 3600 for the same call locally. 300
+    # would have failed the first honest run even after the host was fixed, and a
+    # timeout here reads exactly like an outage.
+    #
+    # BUT NOTE WHAT THIS CRON CANNOT DO, WHICH NO TIMEOUT FIXES. It posts to the
+    # `plan: starter` web service above -- 512 MB -- and the ONE-TIME canonical
+    # build does not fit there. Ingest is fine (all nine source-generations
+    # landed in ~75s, 0 rejected), but building those 43,375 entities and
+    # 1,712,775 lineage rows OOM-kills the web dyno: uvicorn restarts
+    # mid-request. That build was run once instead as a 4 GB one-off Render job
+    # (`render jobs create <service-id> --plan-id plan-srv-010`, 39.5s) -- see
+    # README.md for the exact invocation and why it calls `sync_job` rather than
+    # `materialize`. Every firing AFTER that takes the `already_current` path:
+    # nothing to re-ingest, nothing to rebuild, detection re-run in Postgres.
+    # So 1800s is the ceiling for a bootstrap this cron is not sized to perform
+    # and generous slack for the steady-state pass it actually does.
     startCommand: >-
       case "$KEYSTONE_API_HOST" in *.*) API_HOST="$KEYSTONE_API_HOST" ;; *) API_HOST="$KEYSTONE_API_HOST.onrender.com" ;; esac &&
       echo "POST https://$API_HOST/internal/sync" &&
@@ -515,10 +562,12 @@ services:
     autoDeployTrigger: "off"
     buildCommand: "true"
     # Same `property: host` -> service-name defect as the sync cron above; see the
-    # comment there. This job died identically on every hourly run.
-    # 900, not 300: the measured reconcile over HTTP on the graded dataset is
-    # 11.2s (3,050 conflicts -> 3,050 proposals), so this is slack rather than an
-    # expectation -- but it is slack that survives a cold Neon compute.
+    # comment there. This job died identically on every hourly run, and now runs.
+    # 900, not 300: `bench:detect-persist-reconcile` clocks the reconcile stage
+    # alone at 8.81s on the graded dataset (3,050 conflicts -> 3,050 proposals)
+    # and the end-to-end HTTP call measured 11.2s when it was last timed by hand,
+    # so this is slack rather than an expectation -- but it is slack that survives
+    # a cold Neon compute.
     startCommand: >-
       case "$KEYSTONE_API_HOST" in *.*) API_HOST="$KEYSTONE_API_HOST" ;; *) API_HOST="$KEYSTONE_API_HOST.onrender.com" ;; esac &&
       echo "POST https://$API_HOST/internal/reconcile" &&
@@ -609,7 +658,9 @@ services:
 
 # There is deliberately NO `databases:` block. The database is Neon (project
 # green-wave-67653806, branch production, PostgreSQL 18.6). Migrations 0001-0014
-# were applied there by hand and verified; `0015_escalation_reason_grant` landed
-# afterwards and is applied by the `preDeployCommand` above like any other.
+# were applied there by hand and verified; 0015_escalation_reason_grant,
+# 0016_price_embedding_models and 0017_cap_message_states_refusal landed
+# afterwards and are applied by the `preDeployCommand` above like any other.
+# Head is 0017, and the deployed database was read back at 0017.
 # Re-adding a Render Postgres here would provision a second, empty database and
 # every `fromDatabase` reference would quietly point the service at it.

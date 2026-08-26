@@ -70,9 +70,12 @@ was empty on both `keystone-sync` and `keystone-reconcile` — the deployment ha
 itself. Both crons now normalise either form with the same `case` the dashboard build uses, and echo
 the URL they are about to POST so the next failure is legible in the log. `--max-time` went from
 300 s to 1800 (sync) and 900 (reconcile); 300 could not have completed an honest full-profile sync
-even after the host was fixed. `keystone-reconcile` has since succeeded unattended at
-2026-08-26T04:23:25Z and written all 3,050 proposals — proposal detail pages on the deployed
-dashboard show `Created on run: reconcile-20260826T042010Z`, which is that cron's own run id.
+even after the host was fixed. **All three crons now report a `lastSuccessfulRunAt`** — read off
+`render services` at 2026-08-26T08:15Z: `keystone-sync` 08:04:30Z, `keystone-reconcile` 07:20:22Z,
+`keystone-budget-sweeper` 08:10:16Z. The first unattended reconcile wrote all 3,050 proposals, and
+proposal detail pages on the deployed dashboard still show `Created on run:
+reconcile-20260826T042010Z` — that cron's own run id, unchanged by the later passes because each one
+re-fingerprints the same 3,050 conflicts and proposes 0 (R16).
 
 **The one-time canonical build does not fit the 512 MB Render starter web plan.** Ingest is fine —
 all 9 source-generations landed cleanly in ~75 s with 0 rejected — but building 43,375 entities and
@@ -189,26 +192,40 @@ make reconcile
 make dash
 ```
 
-Open **http://localhost:5173**. The Overview reconciles against `GET /api/scorecard`; Conflicts and
-Proposals read the live database.
+Open **http://localhost:5173**. Four pages. The Overview reconciles twice — the fourteen per-type
+conflict counts, and the proposal-status mix — putting `GET /api/scorecard` beside the live
+`GET /api/conflicts` and `GET /api/proposals` totals and saying **Mismatch** in words when they
+disagree; Conflicts and Proposals read the live database; **Audit log** serves `GET /api/audit`
+alongside the scorecard's verification verdicts.
 
 Stop the database with `make down` (the data volume is kept).
 
 ### Why step 8 is the slow one, and what it actually measures
 
-`recon.resolve.materialize` validates ~1.28 M `field_lineage` rows through deferred provenance
+`recon.resolve.materialize` validates ~1.71 M `field_lineage` rows through deferred provenance
 triggers at COMMIT, so the step is I/O-bound rather than CPU-bound and its wall clock tracks how
 hard the Postgres volume is working. Measured end to end over HTTP on a warm local container
 (2026-08-24, `--profile full`, 360,400 records, run `doc-path-001`): **59.6 s total — ingest 21.9 s,
 materialize 23.1 s, invariants 14.5 s**, with 3,050 conflicts detected and 25 marked oscillating.
-An earlier record in this repo put the same step at ~6 minutes and this run did not reproduce it;
+That run predates the payments lineage this commit adds, so its materialize stage built 1,279,575
+rows rather than today's 1,712,775. The committed 2026-08-26 harness does re-time materialize alone
+against the full 1,712,775 — **14.22 s**, in the detail line under `bench:detect-persist-reconcile`
+— but it runs it with **`persist=False`**: it resolves generation 3 and builds the 43,375 entities /
+120,000 links / 1,712,775 lineage rows and *writes none of them*, so it skips the COPY and the
+COMMIT where the deferred KS008/KS009 provenance triggers this section opens with actually run.
+The scorecard therefore calls 14.22 s a **floor on the real cost**, and records why the persisting
+variant cannot be re-timed against an already-loaded database: the identity layer is append-only to
+`recon_writer` (migration `0004`). So 14.22 s is not a faster materialize than the 23.1 s above — it
+is a different measurement with the expensive half removed, and the two are not comparable.
+
+An earlier record in this repo put the same step at ~6 minutes and neither run reproduced it;
 the likeliest difference is the state of the Postgres volume — a run during the same session died
 outright with `DiskFull` at 95% used. So treat ~1 minute as the floor rather than a promise, and read
-the per-stage clock the response body prints instead of trusting either figure.
+the per-stage clock the response body prints instead of trusting any of these figures.
 
 It is a one-time load, not a per-run cost — the detect-and-reconcile pass over those same 360,400
-records is measured at **22.94 s** in `bench:detect-persist-reconcile` (invariants 12.94 s + persist 2.72 s +
-reconcile 7.29 s).
+records is measured at **24.22 s** in `bench:detect-persist-reconcile` (invariants 12.72 s + persist 2.68 s +
+reconcile 8.81 s).
 
 `make sync` and `make reconcile` are both idempotent per run id, and the claim is keyed on the job as
 well as the id, so one `RUN_ID` covers both: firing either twice under the default id answers
@@ -233,7 +250,7 @@ sees a zero.
 ### The graded gate
 
 ```bash
-make suite          # ~25 minutes; writes docs/scorecard.{txt,json}
+make suite          # ~35 minutes; writes docs/scorecard.{txt,json}
 ```
 
 `make suite` grades an already-loaded database (step 8 is its precondition — a half-loaded database
@@ -250,7 +267,7 @@ createdb -h localhost -p 55432 -U keystone ks_coverage
 # then set KEYSTONE_COVERAGE_DATABASE_URL in .env (the recipe is in .env.example)
 ```
 
-**Fast subset** — the correctness rows without the 23-minute coverage row (~1 minute).
+**Fast subset** — the correctness rows without the 32-minute coverage row (~1 minute).
 `--no-write` matters: without it a partial run overwrites the committed `docs/scorecard.txt`. Any
 row that grades the pass also truncates and regenerates the graded layer — `conflicts`,
 `invariant_results`, `proposals`, `proposal_events`, **`incidents`**, `conflict_incidents`. The
@@ -436,8 +453,10 @@ simulation of a cap instead of a test of one.
 price an unlisted model (`UnknownModelError`) rather than defaulting to zero, because a zero-cost
 default is an unbounded spend path, not a conservative fallback. Units are **microUSD per token**,
 parsed as `decimal.Decimal` and rounded **up** to whole microUSD, so rounding can only over-charge
-the ledger. `version: 1`, captured 2026-06-24, Anthropic first-party API **list** prices (list, not
-promotional — a reservation must bound the worst case).
+the ledger. `version: 2`, captured 2026-08-24. The completion rates are Anthropic first-party API
+**list** prices (list, not promotional — a reservation must bound the worst case); the three
+embedding rates R25 reserves against were added at v2 and are seeded into `budget_model_prices` by
+migration `0016_price_embedding_models`.
 
 | Model | input | output | cache_read | cache_write |
 |---|---|---|---|---|
@@ -450,6 +469,9 @@ promotional — a reservation must bound the worst case).
 | `claude-sonnet-4-6` | 3 | 15 | 0.3 | 3.75 |
 | `claude-haiku-4-5` | 1 | 5 | 0.1 | 1.25 |
 | `mock-rationale-v1` | 5 | 25 | 0.5 | 6.25 |
+| `voyage-3.5` | 0.06 | 0.06 | 0.06 | 0.06 |
+| `text-embedding-3-small` | 0.02 | 0.02 | 0.02 | 0.02 |
+| `mock-embedding-v1` | 0.06 | 0.06 | 0.06 | 0.06 |
 
 Caps are environment-set and enforced in-app by `recon.budget`, not by a gateway:
 `DAILY_CAP_USD=5.00` (per UTC day) and `PER_RUN_CAP_USD=1.00` (per reconcile run), reserved
@@ -494,11 +516,11 @@ cannot perturb conflict detection.
 | `manifest` | **47 / 47** generator self-checks green; Appendix A.4 conflict minimums **14 / 14**; A.5 compound ratio 0.2295. |
 | `spend-cap-burst` | 120 contenders → **6 granted, 114 refused** (`KS006`); reserved-while-open 81,600 µUSD == cap; **0 ledger violations**; 124 `cap_hit` audit rows, 124 alerts; 10 retries, 0 granted. |
 | `bench:cross-source-query-p95` | p50 6.6 ms, **p95 9.1 ms** (threshold < 1 s), n=20. |
-| `bench:detect-persist-reconcile` | **24.22 s** = invariants 12.72 + persist 2.68 + reconcile 8.81, over 360,400 records (threshold < 30 s). **Excludes materialization**, which this run re-timed live at **14.22 s** — so the honest end-to-end figure is ~38 s and the row is named for what it measures rather than for the brief's row it would otherwise overclaim. |
+| `bench:detect-persist-reconcile` | **24.22 s** = invariants 12.72 + persist 2.68 + reconcile 8.81, over 360,400 records (threshold < 30 s). **Excludes materialization**, which this run re-timed live at **14.22 s** — with `persist=False`, so that stage figure is itself a floor ([why](#why-step-8-is-the-slow-one-and-what-it-actually-measures)). The scorecard puts the honest end-to-end pass at **≥ 38.43 s**, which does *not* fit 30 s, and the row is named for what it measures rather than for the brief's row it would otherwise overclaim. |
 | `bench:ingestion-rps` | **14,468 rec/s** sustained over 240,200 records (threshold ≥ 500). |
 | `bench:conflict-accuracy` | **precision 1.000000, recall 1.000000** on 3,050 golden entries (threshold: EXACT). |
 | `bench:spend-cap-exact` | 6/6 of 120 granted, settled spend == 1,797 × 6, over-admitted **False** (threshold: EXACT). |
-| `bench:dashboard-api-p95` | **p95 115.6 ms** (threshold < 1 s), n=20, 15 server calls per Overview load — **service-side only**: in-process ASGI, no network, no browser. A floor on a page load, not a page load. |
+| `bench:dashboard-api-p95` | **p95 115.6 ms** (threshold < 1 s), n=20, over the 15 calls the bench models (`GET /api/scorecard` + 14 × `GET /api/conflicts`) — **service-side only**: in-process ASGI, no network, no browser. A floor on a page load, not a page load, and the Overview now also counts the proposal mix, which this row does not model. |
 
 **Scope, stated with the numbers.** Every row except `manifest` and `determinism`'s dataset half
 grades the loaded database. **Not covered:** browser-side dashboard timing, a live Anthropic provider
@@ -516,15 +538,20 @@ scorecard row). The full note block is printed under every scorecard, green or r
 - **Auto-apply is separate, gated and reversible.** It fires only at confidence **≥ 0.95**, only on a
   non-sensitive target, only against a cited proposal, and every citation is **single-use** (partial
   unique indexes) with a recorded reversal path. Policy: [`docs/proposal-policy.md`](docs/proposal-policy.md).
-- **Spend cap.** No writable spend column; refusals carry SQLSTATE `KS006`; every halt writes a
-  `cap_hit` audit row and fires an alert. There is no bypass path.
+- **Spend cap.** No writable spend column; refusals carry SQLSTATE `KS006`; every refusal writes a
+  `cap_hit` audit row and fires an alert. There is no bypass path. `KS006` stops the **spend**, always
+  — what it does to the run is the caller's decision, and the two callers differ on purpose:
+  `python -m recon.incidents` catches `BudgetError` and exits refused, while the reconcile path
+  continues, the caller getting `status="cap_hit"` and `text=None` and the proposal landing with
+  `rationale` NULL. Migration `0017_cap_message_states_refusal` rewrote the trigger's message to say
+  exactly that (it used to end `-- halt the run`, which described neither caller).
 
 ---
 
 ## Make targets
 
 `make help` prints this list. Every target that needs configuration — `env`, `migrate`, `db-ready`,
-`seed`, `seed-dev`, `serve`, `sync`, `reconcile`, `dash`, `suite`, and the pytest half of `test` — loads the
+`seed`, `seed-dev`, `serve`, `sync`, `reconcile`, `incidents`, `dash`, `suite`, and the pytest half of `test` — loads the
 repo-root `.env` and exports it into the recipe's environment, including the variables read straight
 from `os.environ` (`DAILY_CAP_USD`, `PER_RUN_CAP_USD`, `OPS_DATABASE_URL`, the `*_WRITER_PASSWORD`
 trio, every `KEYSTONE_*` override) and the `VITE_*` values Vite inlines. `up`, `down`, `db-shell`,
@@ -543,8 +570,9 @@ trio, every `KEYSTONE_*` override) and the `VITE_*` values Vite inlines. `up`, `
 | `make serve` | FastAPI on `:8000` with reload (refuses to start unmigrated) | — |
 | `make sync` | **Load + detect**: `POST /internal/sync` — ingest, materialize, invariants | **~1 min+** |
 | `make reconcile` | **Propose**: `POST /internal/reconcile` — conflicts → held proposals | ~11 s |
+| `make incidents` | Cluster conflicts into incidents (R25) — what `GET /api/incidents` serves | seconds |
 | `make dash` | Dashboard dev server on `:5173` | — |
-| `make suite` | The committed grading harness; writes `docs/scorecard.{txt,json}` | **~25 min** |
+| `make suite` | The committed grading harness; writes `docs/scorecard.{txt,json}` | **~35 min** |
 | `make test` | `pytest` + `vitest`, with `KEYSTONE_REQUIRE_DB=1` | minutes |
 | `make lint` / `make fmt` | `ruff` + `eslint`, check / autofix | seconds |
 

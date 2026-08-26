@@ -456,7 +456,8 @@ Conflict rows are assembled in Python from SQL rule output; `rules/*.sql` never 
 fixtures/*.jsonl --ReadOnlyAdapter--> raw_records (append-only, per generation, lineage stamped)
                                   --> source_generations (completeness ledger)
 raw_records --recon/normalize.py--> stg_crm_contact, stg_crm_deal, stg_student, stg_enrollment, stg_payment
-stg_* --recon/er.py--> entity_links + entity_link_candidates + entities(person) + field_lineage
+stg_* --recon/er.py (cascade) + recon/resolve.py (materialize)--> entity_links + entity_link_candidates
+                                                                 + entities(person) + field_lineage
 stg_* + entities --rules/*.sql--> invariant_results (per record) --> conflicts (fingerprinted)
 ```
 
@@ -477,11 +478,31 @@ generation)` is the `raw_records` key.
 ```
 field_lineage(person_key, field_path, generation, value_canon, source_ref)
 ```
-`field_path` is a **source-qualified path** from the same vocabulary as `COMPARED_FIELDS` (§2.4) and
-`SENSITIVE_FIELDS` (§6) — never a bare column name and never a logical name. `value_canon` is
-`canon_value(v)` (§2.5) of that source's normalized value. The A→B→A oscillation scan of §7 compares
+`field_path` is a **source-qualified path** — the same shape `COMPARED_FIELDS` (§2.4) and
+`SENSITIVE_FIELDS` (§6) use, never a bare column name and never a logical name. Its range is
+`LINEAGE_PATHS`, declared in `recon/resolve.py` as one path map per `(source_id, record_class)` — all
+five record classes of §1, `payments.payment` **included** — with `LINEAGE_PATHS` their union, so a path
+cannot be declared without being written and cannot be written without being declared.
+
+**The derivation runs from the maps to `LINEAGE_PATHS`, and never the other way.** It used to read
+`set(COMPARED_FIELD_PATHS) | set(SURVIVED_PATHS)`, which tied the reach of lineage to the reach of
+detection: R1 mandates field-level lineage on all three sources, and under that definition giving the
+payments source lineage meant adding a `payments.*` entry to `COMPARED_FIELD_PATHS` — the vocabulary
+§2.4's comparisons name — which would have changed which conflicts exist and moved the committed golden
+set. Inverting it severs the dependency in the only direction that can do harm: `COMPARED_FIELD_PATHS`
+is unchanged (the 12 paths of §2.4, none of them `payments.*`), payment fields are still **not** compared
+fields, and lineage covers all three sources regardless. The two containments that must still hold —
+`COMPARED_FIELD_PATHS ⊆ LINEAGE_PATHS` and `SURVIVED_PATHS ⊆ LINEAGE_PATHS`, so §7's A→B→A scan and the
+canonical view's `survived` block (§4.6) can name the provenance of every value they carry — are
+assertions in `service/tests/er/test_materialization.py` rather than tautologies of the definition.
+
+`value_canon` is `canon_value(v)` (§2.5) of the value that source's record **holds** — the staged raw
+value, not its normalized form. Lineage records what a source *said*, so `customer` and `CUSTOMER` are
+two different assertions of `crm.contact.lifecycle_stage`. The A→B→A oscillation scan of §7 compares
 `value_canon` for **string** equality; §7's "≥25 re-asserting fields" counts distinct
-`(person_key, field_path)` pairs. One row per `(person_key, field_path, generation, source_ref)`.
+`(person_key, field_path)` pairs. One row per `(person_key, field_path, generation, source_ref)` — and
+**every** payment a person owns is written, not only the survived one, so a person holding three payments
+carries three rows per payment path per generation.
 
 ---
 
@@ -1160,9 +1181,12 @@ because the C2/C9 linkage templates and the ER-repair path write it; nothing abo
 - **Golden set describes generation 3.** Entries carry `"oscillating": true` where the conflict's field
   oscillated.
 - **Oscillation detection**: window scan of `field_lineage` per `(person_key, field)` for the pattern
-  `A, B, A` across ascending generations. `field_lineage`, the A,B,A scan and R16's fingerprint dedup are
-  **all keyed on `person_key`** (§4.1), which is stable across generations. On oscillation the conflict is
-  marked `escalated:oscillation` and the reconciler **must not** re-propose the identical fix (R16).
+  `A, B, A` across ascending generations, over **one row per generation** — the one with the
+  lexicographically smallest `source_ref`, §4.6's survivorship tiebreak reused so a person carrying
+  several records of one source (its payments, say) cannot make the scan depend on row order.
+  `field_lineage`, the A,B,A scan and R16's fingerprint dedup are **all keyed on `person_key`** (§4.1),
+  which is stable across generations. On oscillation the conflict is marked `escalated:oscillation` and
+  the reconciler **must not** re-propose the identical fix (R16).
 - **Malformed payloads** live in `fixtures/malformed/cases.jsonl`, one JSON object per line:
   `{case_id, source, entity_type, expect_code, raw}` where `raw` is the **literal payload string** (so
   truncated JSON is representable). **≥20 cases** covering: missing required field, wrong scalar type,

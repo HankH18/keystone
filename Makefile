@@ -7,7 +7,13 @@
 #     make serve            # terminal 1
 #     make sync             # terminal 2 — loads the database and DETECTS (~1 min+)
 #     make reconcile        # terminal 2 — turns conflicts into proposals (seconds)
-#     make suite            # the graded scorecard
+#     make suite            # the graded scorecard (~35 min — see below)
+#
+# `make suite` IS THE SLOW STEP, and one row is why: `coverage` shells out to a
+# real pytest run rather than trusting a stored number, and the committed
+# `docs/scorecard.txt` clocks that child at 32m29s (4,771 passed, 2 skipped).
+# `KEYSTONE_COVERAGE_TIMEOUT` (default 2400s) kills it and turns the row RED, so
+# the headroom is roughly seven minutes — raise it before adding tests.
 #
 # `make reconcile` IS PART OF THE PATH, not an extra. `sync` ends at detection
 # (`SYNC_STAGES` = ingest, materialize, invariants), so it leaves `conflicts`
@@ -66,17 +72,21 @@ API_URL ?= http://localhost:8000
 RUN_ID  ?= grader-001
 
 #: `POST /internal/sync` ingests three generations, materializes the canonical
-#: layer and then runs the committed invariant rule set over it. Measured at
-#: 59.6s on the full profile (ingest 21.9s + materialize 23.1s + invariants
-#: 14.5s, 360,400 records), and materialize is I/O-bound at COMMIT, so a busy
-#: volume stretches it into minutes. The ceiling stays generous for that reason.
+#: layer and then runs the committed invariant rule set over it. Last timed end
+#: to end at 59.6s on the full profile (ingest 21.9s + materialize 23.1s +
+#: invariants 14.5s, 360,400 records). Do NOT read that split against the
+#: scorecard's: `bench:detect-persist-reconcile` clocks invariants at 12.72s,
+#: but that is a different rig -- in-process, no HTTP, and no ingest or
+#: materialize run ahead of it -- not a newer measurement of this one.
+#: Materialize is I/O-bound at COMMIT, so a busy volume stretches it into
+#: minutes. The ceiling stays generous for that reason.
 SYNC_TIMEOUT ?= 3600
 
 #: `POST /internal/reconcile` scores the conflicts `sync` detected and writes
-#: proposals. Measured at 11.2s end to end over HTTP on the graded dataset
-#: (3,050 conflicts -> 3,050 proposals; the isolated reconcile clock in
-#: `bench:detect-persist-reconcile` is 7.29s), so this ceiling is slack, not an
-#: expectation.
+#: proposals. The isolated reconcile clock in `bench:detect-persist-reconcile` is
+#: 8.81s on the graded dataset (3,050 conflicts -> 3,050 proposals) and the
+#: end-to-end HTTP call measured 11.2s the last time it was timed by hand, so
+#: this ceiling is slack, not an expectation.
 RECONCILE_TIMEOUT ?= 900
 
 DOTENV = if [ -f "$(DOTENV_FILE)" ]; then \
@@ -194,7 +204,7 @@ sync: db-ready ## Load + DETECT: POST /internal/sync (ingest, materialize, invar
 	    exit 1 ;; \
 	esac
 
-reconcile: db-ready ## Propose: POST /internal/reconcile (conflicts -> held proposals; ~11 s)
+reconcile: db-ready ## Propose: POST /internal/reconcile (conflicts -> held proposals; ~11 s hand-timed)
 	@$(DOTENV) \
 	if [ -z "$${TRIGGER_SECRET_RECONCILE:-}" ]; then \
 	  echo "make reconcile: TRIGGER_SECRET_RECONCILE is not set, and the trigger fails closed (401)." >&2; \
@@ -250,11 +260,14 @@ reconcile: db-ready ## Propose: POST /internal/reconcile (conflicts -> held prop
 #: so this target is for clustering WITHOUT a graded pass, after a reconcile.
 #:
 #: It runs the CLI's default budget mode, which charges this run's own
-#: ops-provisioned ledger row rather than the deployment's shared `daily` one.
-#: That matters here: nothing rolls `daily`, one pass costs 56,487 microusd of
-#: its seeded 5 USD, and reservation rows left on it turn
-#: `tests/budget/test_ledger.py::test_a_test_process_cannot_touch_the_real_daily_scope`
-#: red on this database for good. A deployment cron with a managed daily budget
+#: ops-provisioned ledger row rather than the mandated daily one. That matters
+#: here: one pass costs 56,487 microusd, and the daily row is the deployment's
+#: real R17 budget for the day -- local clustering has no business spending it.
+#: The older reason written here, "nothing rolls `daily`", is no longer true and
+#: is not why: the mandated cap is date-keyed now (`daily:<YYYY-MM-DD>`,
+#: `recon.budget.daily_scope_for`) and today's row opens itself the first time a
+#: reservation finds it missing (`_open_todays_daily_scope`), so a day's spend
+#: does not become a permanent one. A deployment cron with a managed daily budget
 #: adds `--charge-daily-cap`; `make incidents ARGS=--charge-daily-cap` does that.
 INCIDENTS_ARGS ?=
 
@@ -269,7 +282,7 @@ incidents: db-ready ## Cluster conflicts into incidents (R25) -- what GET /api/i
 dash: ## Run the dashboard dev server
 	@$(DOTENV) $(PNPM) dev
 
-suite: db-ready ## Run the committed grading harness and print the scorecard
+suite: db-ready ## Run the committed grading harness and print the scorecard (~35 min)
 	@$(DOTENV) \
 	if [ -z "$${KEYSTONE_COVERAGE_DATABASE_URL:-}" ]; then \
 	  echo "note: KEYSTONE_COVERAGE_DATABASE_URL is unset, so the 'coverage' row's pytest" >&2; \

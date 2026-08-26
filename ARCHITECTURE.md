@@ -79,6 +79,10 @@ flowchart TB
   RC --> AUD
   DEC --> AUD
   AP --> AUD
+  TRG["claim_run — api/internal.py:277<br/>the at-most-once claim, one row per cron firing,<br/>committed before either job body runs"]
+  TRG -->|"trigger.sync · trigger.reconcile — actor system:budget"| AUD
+  RAT -->|"record_cap_hit() budget.py:1739 writes cap_hit · settle() budget.py:2335 writes llm_call<br/>settle is the only writer that carries tokens_in · tokens_out · cost_microusd, under<br/>whichever action its audit_action argument names — llm_call, llm_call_failed, or<br/>embedding_call from R25. cap_hit carries none of them"| AUD
+  AUD -->|"admin scope only · redacted again on the way out · paged"| AUDV["Reviewer dashboard /audit<br/>GET /api/audit — list_audit, api/audit.py:275<br/>the log is a surface, not only a table"]
 ```
 
 Two things this diagram deliberately does **not** show, because the code does not do them:
@@ -92,13 +96,27 @@ Two things this diagram deliberately does **not** show, because the code does no
   materializes. No rule references `entities`, `entity_links`, `entity_link_candidates`, `field_lineage` or
   `raw_records`. The canonical layer feeds the *reconciler*, not the detector.
 
+The audit fan-in is every caller of the chokepoint but one: `run_purge` (`privacy.py:1672`) writes the
+retention sweep's own row, and that is an ops CLI rather than a pipeline stage. The `claim_run` arrow
+is the one that matters most on the *deployed* instance, which is why it is drawn rather than left to
+the prose: until a reviewer decides something there, `GET /api/audit` reports two actors —
+`system:budget` and `system:reconciler` — and `trigger.sync` / `trigger.reconcile` are two of the
+five actions present. `system:budget` is the actor `claim_run` writes under — one of only two the log
+has, and it had no arrow into `audit_log` at all until this one was drawn. Which modules may contain
+an `INSERT INTO audit_log` is published as data rather than prose — `AUDIT_WRITERS`
+(`logging.py:634`), which `tests/privacy/test_sinks.py` compares against the INSERT sites it finds
+in the source, so a new writer cannot appear unnoticed.
+
 One label needs a footnote. The three-column `conflicts` grant is what migration
-`migrations/versions/0015_escalation_reason_grant.py` establishes; `docs/scorecard.txt` was generated
-against a database one migration earlier and carries two notes saying `escalation_reason` is *not*
-writable by `recon_writer`. **Those notes are stale, not a disagreement** — they describe the tree
-before 0015 and go away on the next suite run. The reconciler is correct either side of it: it asks
-`has_column_privilege` once per run and escalates with the columns it actually holds, reporting
-`escalation_reason_persisted`, and the reason always reaches the `conflict.escalated` audit row.
+`migrations/versions/0015_escalation_reason_grant.py` establishes. `docs/scorecard.txt` used to carry
+two notes saying `escalation_reason` was *not* writable by `recon_writer`, because it had been
+generated against a database one migration earlier; **that has since resolved itself the way it was
+predicted to**. The current scorecard was regenerated against a database at head and carries the
+opposite note — *"conflicts.escalation_reason IS writable by recon_writer (migration 0015)"* — and its
+`oscillation-dedup` row reports `escalation_reason on the row 25/25`. The reconciler is correct either
+side of it: it asks `has_column_privilege` once per run and escalates with the columns it actually
+holds, reporting `escalation_reason_persisted`, and the reason always reaches the
+`conflict.escalated` audit row.
 
 ---
 
@@ -116,7 +134,7 @@ sequenceDiagram
   participant Prov as LLM provider
   participant Rev as Reviewer
 
-  Note over Cron,PG: BEATS 1-4 ARE A DIFFERENT CRON. keystone-sync fires at 0 past the hour,<br/>keystone-reconcile at 20 past — two schedules in infra/render.yaml, never one call.<br/>So a reconcile cycle opens on a conflict store the sync cron already filled.
+  Note over Cron,PG: BEATS 1-4 ARE A DIFFERENT CRON. keystone-sync fires at 0 past the hour,<br/>keystone-reconcile at 20 past — two of the three schedules in infra/render.yaml, never one call.<br/>So a reconcile cycle opens on a conflict store the sync cron already filled.
   Cron->>API: POST /internal/sync with X-Trigger-Secret — TRIGGER_SECRET_SYNC, the sync job's own secret
   API->>PG: sync_job api/internal.py:519 — stage 1 ingest_all COPYs raw_records and _materialize<br/>normalizes into stg_* in the SAME transaction, then stage 2 resolve.materialize rebuilds the canonical layer
   API->>PG: run_invariant_stage api/internal.py:421 — rules/NNN_name.vX.sql in filename order,<br/>one invariant_results row per in-scope record per rule
@@ -160,6 +178,8 @@ sequenceDiagram
   Rev->>API: POST /api/proposals/:id/apply
   API->>PG: as apply_writer, ONE transaction: INSERT proposal_events citing the proposal,<br/>UPDATE proposals status, UPDATE entities.current to OLD.current merged with action.set
   API->>PG: INSERT audit_log proposal.applied
+  Rev->>API: GET /api/audit — list_audit, api/audit.py:275
+  API-->>Rev: the cycle's own rows back, newest first — proposal.applied, proposal.approved,<br/>reconcile.run, proposal.created, conflict.escalated, trigger.reconcile — and tokens_in,<br/>tokens_out and cost_microusd are NULL on every one of them. Only recon.budget's settle writes<br/>a cost, under whichever action its audit_action names — llm_call, llm_call_failed, or<br/>embedding_call from R25's clustering. Under the mock default no reservation is taken,<br/>so the deployed log has none and its totals read 0. Admin scope only — a client key is 403.<br/>The audit beat is a surface a reviewer reads, not only a table psql can reach.
 ```
 
 **All nine beats are above, but the first four are not the same HTTP call.** Sync, the invariant
@@ -183,9 +203,15 @@ separate gate after the proposal would show a control that does not exist.
 everywhere: the reserve trigger refuses the INSERT, `reserve` raises `BudgetCapExceeded`
 (`budget.py:515`), **nothing is charged and no provider call is made**, and the refusal writes its own
 `cap_hit` audit row and fires the alert (`record_cap_hit`, `budget.py:1739`). Spend is bounded because
-the reservation strictly precedes the request: *no reservation ⇒ no provider call.* **What stops
+the reservation strictly precedes the request: *no reservation ⇒ no provider call.* The sentence the
+trigger raises now says exactly that and nothing more — migration `0017_cap_message_states_refusal`
+replaced the old tail `-- halt the run` with `-- this reservation is refused and nothing was
+charged`, leaving the SQLSTATE, the raising condition, the `FOR UPDATE` ledger lock and the grants
+untouched. The mechanism was always right; the message was the part that issued an order, and an
+error string is read as an instruction by whoever has to act on it. **What stops
 besides the spend is the caller's decision, and the two callers differ** — so this says which, rather
-than saying "halt", which is what it used to do while one of the two performed no halt at all:
+than saying "halt", which is what this section used to do while one of the two performed no halt at
+all:
 
 - **The reconcile cycle degrades and does not halt.** `generate_rationale` (`llm.py:684`) catches it,
   ends **that one call's** attempt loop — a cap hit is terminal, retrying only produces another
@@ -268,10 +294,26 @@ claim. A boundary stated without its limits is a boundary nobody can audit, so n
 ### A. What the adapter and write boundaries do **not** guarantee
 
 `assert_sources_are_unwritable()` publishes its own limit in its own docstring: `WRITE_NAME_TOKENS`
-(`adapters/base.py:93`) is a substring list, not a decision procedure. It and
-`source_tree_digest()` (`apply.py:1971`, which hashes
-the whole fixture tree either side of a real committed apply and rollback) are reached only from
-tests; the load-bearing arm is the Protocol's missing write member, not either of them.
+(`adapters/base.py:93`) is a substring list, not a decision procedure, and the sweep is exactly as
+exhaustive as the list is. It carries seventeen verbs now, including `persist`, `commit`, `flush`,
+`sync`, `emit` and `land` — this codebase's own word for the write — so an adapter defining any of
+those is **refused here rather than passing**. The gap that closed was in the code, never in this
+appendix: `assert_sources_are_unwritable`'s own docstring used to say that an adapter with
+`def persist(...)`, `def commit(...)`, `def flush(...)` or `def sync(...)` *"carries no listed token
+and passes here"* (`git show d8a120a^:service/recon/apply.py`), and the list was widened until that
+stopped being true. `tests/ingest/test_write_token_widening.py` builds a write-back connector for
+each of the **six** verbs that widening added — `_NEWLY_COVERED`
+(`tests/ingest/test_write_token_widening.py:49`) — and requires both the ingest-side predicate and
+this sweep to refuse it, so those six are a property of the list rather than a reading of it. The
+other eleven are not: no test defines `def upsert` or `def truncate` on a connector, so their
+coverage is still read off the tuple, checked only against adapters that have no such method.
+Widening is bounded by the read-side vocabulary: `emit` could only be listed once
+`FaultInjectingAdapter`'s read-side counter was renamed from `emitted` to `records_handed_over`,
+because the match is on substrings.
+Any verb not on the list — `store`, `apply`, a vendor SDK's own word — is still
+uncovered, and nothing decides the general case. It and `source_tree_digest()` (`apply.py:1971`,
+which hashes the whole fixture tree either side of a real committed apply and rollback) are reached
+only from tests; the load-bearing arm is the Protocol's missing write member, not either of them.
 
 1. **Canonical CREATION is not citation-guarded, by design** — the pipeline may APPEND, only the
    guarded path may MUTATE. `recon_writer` holds INSERT on `entities`; the INSERT-side check is
@@ -309,9 +351,13 @@ tell a truthful pre-send failure from a fabricated one.
 ### C. The scaling change — the measurement behind it
 
 Measured (`api/internal.py:114-117`; dataset `docs/scorecard.txt:4`): first sync 58.3s = 22.3 ingest
-+ 22.1 materialize + 13.8 invariants over 360,400 records; `bench:detect-persist-reconcile` already burns 76% of
-its `<30s` budget at 3.6% of target volume; and 376,000 `invariant_results` rows land per sync
-(`api/internal.py:92-93`), hourly.
++ 22.1 materialize + 13.8 invariants over 360,400 records; `bench:detect-persist-reconcile` already
+burns 24.22s of its `<30s` budget — 81% — at 3.6% of target volume, and that row **excludes**
+materialization, which the same suite run re-timed live at 14.22s. The scorecard adds the two
+unrounded and reports the end-to-end pass — materialize plus the three stages — at **≥38.43s**
+(`docs/scorecard.txt:70-84`; 12.72 + 2.68 + 8.81 = 24.21, plus 14.22, which is why it is 38.43 and
+not the 38.44 the rounded total suggests). It does not fit 30s even at today's volume; and
+376,000 `invariant_results` rows land per sync (`api/internal.py:92-93`), hourly.
 
 Two properties already make the incremental plan safe: `persist_run`'s `ON CONFLICT (fingerprint) DO
 UPDATE SET last_seen_run` (`invariants/runner.py:344`) makes re-detection idempotent, and

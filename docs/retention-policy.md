@@ -186,6 +186,66 @@ own window is **retained until the child ages out**. The three dependency graphs
 
 ### 3.2 Running it
 
+**`python -m recon.privacy` is the entry point, and it counts rather than deletes.** This section
+used to show only the library call, and §6 recorded that nothing ran it — `run_purge` was a callable
+with no caller, reachable from a Python prompt and from `tests/privacy/test_purge.py` and nowhere
+else. A policy whose sweep has no way to be run is a document, not a control. It is now one of the
+entry points in `recon.logging.ENTRY_POINTS`, so it installs the redaction chain before it can emit a
+line, and its report goes through `console` (§4.0).
+
+```bash
+cd service
+uv run python -m recon.privacy                 # DRY RUN: counts what it would remove, writes nothing
+uv run python -m recon.privacy --dry-run       # the same run, spelled out
+uv run python -m recon.privacy --apply         # DELETES and rewrites; asks first ONLY on a terminal
+uv run python -m recon.privacy --apply --yes   # the same, skipping the prompt (cron, CI)
+```
+
+**The safety contract, stated here because this is the one destructive tool in the repository and
+this document is where its contract lives:**
+
+* **Dry run is the default.** A bare `python -m recon.privacy` — which is what a stray invocation, a
+  test, or a misconfigured cron entry actually runs — names the target, reports every row it *would*
+  remove, rolls back, and exits 0 — or exits `1` with no report at all, if the connected principal is
+  one of the three application writer roles §3.3 refuses, because the *preview* pass is the one that
+  raises `PurgeNotPermitted` and it raises before it has counted anything. Nothing is deleted without
+  `--apply`. `--dry-run` sets no separate mode; it is the *name* of the default, so a script that
+  spells it out and a script that forgets behave identically. The two flags are mutually exclusive.
+* **`--apply` is the only thing that deletes**, and it runs the counting pass first and prints it,
+  so a report exists even if the DELETEs then fail. Both passes run in **one** transaction against
+  one pinned `now`, so the preview and the sweep cannot disagree; a refusal, an abort or an exception
+  rolls back the whole schedule rather than leaving it half-applied.
+* **Every run names the database it is pointed at, on its first line, before the first statement** —
+  dry or not: `retention target: database=… host=… port=… user=… mode=…`. No password is ever
+  rendered; the fields are read off the URL one at a time and `password` is not one of them, which is
+  stronger than a masking flag a later refactor could drop. The `key=value` spelling is load-bearing
+  rather than cosmetic: the line goes through `console`, and the obvious `user@host:port/database`
+  rendering is *email-shaped* on any real deployment host, so the scrubber would replace the identity
+  of the database with a token. A report that redacts which database it is about to empty is worse
+  than no report. All of this exists because the previous default was to sweep: a process with no
+  `DATABASE_URL` of its own inherited the repository `.env` and deleted 37,498 `field_lineage` rows
+  out of this project's shared development database, printing tables and row counts and never once
+  naming where they came from.
+* **An interactive `--apply` asks first.** On a terminal (`sys.stdin.isatty()`) it prints the target
+  again and requires the operator to type `apply`; anything else aborts and writes nothing. Off a
+  terminal there is nobody to ask and a prompt would hang, so `--apply` is the whole gate there —
+  `--yes` skips the prompt explicitly rather than by accident.
+* **Exit status:** `0` swept, or counted; `1` refused, because the connected principal is an
+  application writer role (§3.3); `2` misconfigured — argparse, or no `DATABASE_URL`; `3` aborted by
+  the operator at the prompt.
+
+**It is an entry point, not a scheduler.** Nothing runs it on a clock; §6 still records that.
+
+`tests/privacy/test_retention_cli.py` drives the entry point itself — argparse, the engine, the
+transaction, the principal check, the exit status and the report — against real committed rows. It
+creates a **scratch database of its own** and points the process at it, because the first version of
+that module committed its rows into the database `DATABASE_URL` named and ran a real sweep against
+it, which is how the 37,498 rows above were destroyed. Two of its tests hold that line from opposite
+directions: one asserts the process is not on the configured database at all, and one plants a row
+older than every window *in* the configured database and asserts a full `--apply` leaves it alone.
+
+The same schedule is callable directly, which is what the entry point wraps:
+
 ```python
 from recon.privacy import run_purge
 from recon.db import get_engine
@@ -240,10 +300,18 @@ So the sweep is an ops job, not a service job:
 * `tests/privacy/test_purge.py::test_no_writer_role_holds_delete_on_a_retention_table` asserts
   the grant set against `information_schema.role_table_grants`, so a future migration that
   widened one turns the suite red;
-* scheduling follows the same route as every other Keystone job (DESIGN: Render cron → HTTPS +
-  shared-secret header), but with the **ops** credentials, not the service role's. **The cron
-  entry itself is not wired up in this ticket** — `run_purge` is a callable job with a
-  transaction-owning caller, and nothing schedules it yet.
+* scheduling would be a Render cron, as every other Keystone job is — but of the **second** of the
+  two shapes `infra/render.yaml` already carries, not the first. Sync and reconcile are HTTPS
+  triggers (DESIGN: Render cron → HTTPS + shared-secret header) that reach the web service, which
+  connects as `recon_writer`; the budget sweeper instead runs `python -m recon.budget sweep`
+  directly, as the owner, precisely because a capped writer must not hold that power. The retention
+  sweep is in the sweeper's category for the same reason: §3.3 has `recon_writer`, `review_writer`
+  and `apply_writer` refused outright, so an HTTPS trigger into the serving process could not run it
+  at all. **The cron entry itself is still not wired up** — those three crons are the source sync
+  hourly, reconcile at :20 and the budget reservation sweeper every 10 minutes, and none of them is
+  this. What changed is that the sweep now *has* a way to be run: §3.2's `python -m recon.privacy`,
+  which such a cron would invoke as `--apply --yes` with an ops `DATABASE_URL`. Nothing invokes it on
+  a clock today, and §6 says so.
 
 ---
 
@@ -264,7 +332,7 @@ source against it, so a fifth sink fails the suite on the commit that adds it.
 |---|---|---|
 | structlog event | the `redaction_processor` in the configured chain (`recon.logging.configure_logging`) | every `log.info/warning/error` in the package, including values bound onto a logger and context variables |
 | audit_log row | `recon.logging.audit_row` / `recon.logging.insert_audit_row` | `actor`, `action`, `subject`, `detail` and the three counters — **for every `audit_log` writer in the package; enumerated in `recon.logging.AUDIT_WRITERS`** |
-| direct terminal write | `recon.logging.console` | the `python -m recon.suite` scorecard, and any other human-readable line written straight to stdout/stderr |
+| direct terminal write | `recon.logging.console` | the `python -m recon.suite` scorecard, `python -m recon.privacy`'s target line and sweep report (§3.2), and any other human-readable line written straight to stdout/stderr |
 | stdlib logging record | `recon.logging._install_stdlib_bridge` (a `ProcessorFormatter` ending in the *same* `redaction_processor`) and `recon.logging.uvicorn_log_config` | uvicorn's access and error logs, sqlalchemy, alembic, httpx, anthropic, and captured `warnings` |
 
 The last two were real leaks, not hypotheticals:
@@ -321,7 +389,9 @@ A processor chain is process-wide state, so it only covers anything if the proce
 `uvicorn … --factory` run), the `recon` CLI (`recon/__main__.py`), `python -m recon.seed`
 (`recon/seed/__main__.py`), `python -m recon.suite` (`recon/suite/__main__.py`),
 `python -m recon.bench` (`recon/bench/__main__.py`), `python -m recon.invariants`
-(`recon/invariants/__main__.py`), and alembic's `migrations/env.py`. `tests/privacy/test_logging_installed.py` asserts each one still
+(`recon/invariants/__main__.py`), `python -m recon.privacy` (`recon/privacy.py`, the retention sweep
+of §3.2 — a process that empties tables must not be the one process that logs raw), and alembic's
+`migrations/env.py`. `tests/privacy/test_logging_installed.py` asserts each one still
 does, imports the **real** application and asserts the *active* structlog configuration contains
 the redaction processor, and runs each entry point in a subprocess to check the configuration a
 real process ends up with.
@@ -452,8 +522,21 @@ A token is `[pii:<kind>:<digest>:<shape>]`.
 cd service
 uv run ruff check recon/privacy.py recon/logging.py recon/app.py recon/suite tests/privacy
 uv run ruff format --check recon/privacy.py recon/logging.py recon/app.py recon/suite tests/privacy
-uv run pytest tests/privacy -q          # add DATABASE_URL + KEYSTONE_REQUIRE_DB=1 for the purge tests
+
+DATABASE_URL=postgresql://keystone:keystone@localhost:55432/keystone KEYSTONE_REQUIRE_DB=1 \
+  uv run pytest tests/privacy          # 238 passed; no skips and no errors is the shape to expect
 ```
+
+**`DATABASE_URL` is required here, not optional**, and the reason is §3.2's own safety argument.
+`tests/privacy/test_retention_cli.py` installs an autouse fixture that asserts the variable is
+*present in the environment* before any test in the module runs, because an absent `DATABASE_URL` is
+not an unconfigured process: `recon.config.Settings` resolves its `env_file` chain at import time, so
+a process without one silently inherits the repository `.env` and points at the shared development
+database — the exact path that once deleted 37,498 `field_lineage` rows. The fixture errors at setup
+rather than skipping, so running `uv run pytest tests/privacy` bare gives three
+`ERROR tests/privacy/test_retention_cli.py::…` lines, not three skips. "Not configured" is spelled
+`DATABASE_URL=''`, which `database_url()` rejects before an engine can be built; that spelling is
+what `test_a_process_with_no_database_url_exits_two` uses.
 
 `tests/privacy/test_leak_hunt.py` is the one that matters most: it generates a real
 `--profile dev` dataset, emits every record through the logger every way the service emits one —
@@ -481,11 +564,22 @@ gap:
   `entity_links`, their `field_lineage` and their `raw_records` — the mechanics exist (the owner
   principal holds DELETE on all four) but no such function, endpoint or audited workflow is
   implemented, and `entities` deliberately has no time-based window.
-* **No scheduled trigger.** `run_purge` is a job with a transaction-owning caller. Nothing calls
-  it on a schedule yet.
+* **No scheduled trigger.** This entry used to read "nothing calls it" — that half is closed:
+  §3.2's `python -m recon.privacy` is a real entry point with a real transaction, and
+  `tests/privacy/test_retention_cli.py` drives it against a database. What is still missing is a
+  **clock**. `infra/render.yaml`'s three crons are the source sync, the reconcile and the budget
+  sweeper; none of them runs the retention schedule, so in the deployed instance the windows in §2
+  are a policy that an operator must execute, not one that executes itself.
 * **No backup or WAL retention policy.** Purging a row from the live database does not purge it
-  from a base backup or from WAL. Keystone runs on Postgres in `infra/docker-compose.yml` with
-  no configured backup retention, so there is nothing to state here beyond the fact that a
-  production deployment would need this section extended.
+  from a base backup, from WAL, or from a copy-on-write history the storage layer keeps on its own.
+  Locally that residue really is empty: `infra/docker-compose.yml` configures no backups. The
+  **deployed** database is not that one, though — `infra/render.yaml` declares no `databases:` block
+  and names Neon (project `green-wave-67653806`, branch `production`, PostgreSQL 18.6), and Neon
+  keeps an instant-restore history whether this policy asks for one or not. Read off the project
+  today that window is `history_retention_seconds: 21600` — **six hours**. So a row §2's schedule
+  deletes in the deployed instance stays restorable for six hours afterwards, through a mechanism no
+  code in this repository sets, shortens or sweeps. Bounded and small, but it is a property of the
+  provider rather than of this document; closing it would mean owning the branch-retention setting
+  here and asserting it the way §2's windows are asserted. Not done.
 * **No encryption-at-rest statement.** Out of scope for this ticket; it is a deployment
   property, not an application one.
