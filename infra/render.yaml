@@ -213,7 +213,7 @@ services:
     buildCommand: >-
       pip install --upgrade uv &&
       uv sync --frozen --no-dev &&
-      uv run python -m recon.seed --profile dev --seed "$SEED" --out "$KEYSTONE_SEED_OUT" &&
+      uv run python -m recon.seed --profile full --seed "$SEED" --out "$KEYSTONE_SEED_OUT" &&
       uv run python -c "import sys; from recon.adapters.jsonl import default_fixtures_root as R, SOURCE_ADAPTERS as S; r = R(); missing = [s for s in S if not (r / s).is_dir()]; print('fixtures root:', r, '| missing:', missing); sys.exit(1 if missing else 0)"
     # Migrations run on release, not at import time: a web dyno that migrates on
     # boot races itself the moment the service scales past one instance. They
@@ -318,14 +318,28 @@ services:
         value: safe
       # Consumed by `buildCommand` above as `--seed "$SEED"`. Determinism is
       # graded, so this is pinned, not random.
-      # DEPLOY-ONLY DATASET SIZE. Neon's free tier caps the project at 512 MB and the
-      # graded full profile needs ~1 GB in Postgres, so the first sync died mid-COPY.
-      # The deployed instance therefore carries the `dev` profile: same code path, same
-      # seed semantics, all 14 conflict classes present at scaled-down minimums. The
-      # GRADED dataset is still `--profile full` -- that is what golden/ and
-      # docs/scorecard.txt are built from, and what `make suite` grades locally.
-      # `--profile dev` refuses to write the committed trees, so it needs an explicit
-      # --out; KEYSTONE_FIXTURES_DIR then points the adapters at that tree.
+      #
+      # THE DEPLOYED DATASET IS THE GRADED ONE. This used to read `--profile dev`,
+      # because Neon's free tier caps a project at 512 MB and the full profile needs
+      # ~1 GB in Postgres, so the first deployed sync died mid-COPY. That cap is gone
+      # (the project's branch limit is now 16 TB), so the deployment carries the same
+      # `--profile full` dataset that `golden/`, `docs/scorecard.txt` and every
+      # benchmark describe -- 360,400 landed records over three generations, 43,375
+      # entities, 3,050 conflicts.
+      #
+      # This is not cosmetic. `GET /api/scorecard` serves the committed full-profile
+      # artifact, and the dashboard's Overview compares that artifact's per-type
+      # counts against the live conflict store. Under the dev profile those two
+      # disagreed by construction and the first screen a reviewer saw reported
+      # "Mismatch" on all 14 conflict types -- the system announcing its own
+      # reconciliation failure because it was being shown two different datasets.
+      #
+      # `--out` is still passed even though `--profile full` is the one profile
+      # allowed to write the committed trees: writing into `$KEYSTONE_SEED_OUT`
+      # keeps the build's generated tree off the checkout, and KEYSTONE_FIXTURES_DIR
+      # points the adapters at it. `recon.seed.run_seed` only *requires* --out for
+      # non-full profiles (service/recon/seed/run.py:80-87); passing it here is legal
+      # and deliberate.
       - key: KEYSTONE_SEED_OUT
         value: /opt/render/project/src/.deploy-seed
       - key: KEYSTONE_FIXTURES_DIR
@@ -444,10 +458,27 @@ services:
     schedule: "0 * * * *"
     autoDeployTrigger: "off"
     buildCommand: "true"
+    # `property: host` RETURNS THE SERVICE NAME, NOT THE FQDN. That was already
+    # learned once and fixed in the dashboard's build command (`keystone-service-bxs8`
+    # baked as an unresolvable VITE_API_BASE_URL); the SAME defect sat here
+    # unnoticed because a cron failure is silent unless somebody reads its log.
+    # Every hourly run since the blueprint was applied died identically:
+    #     curl: (7) Failed to connect to keystone-service-bxs8 port 443
+    # so `lastSuccessfulRunAt` was empty on both trigger crons and the deployment
+    # had never once run itself. The `case` normalises either form, exactly as the
+    # dashboard build does, so this is correct whichever Render returns.
+    #
+    # `--max-time` is 1800, not 300. The graded full-profile sync lands 360,400
+    # records across three generations and then materializes 43,375 entities and
+    # 1,279,575 field_lineage rows; `make sync` allows 3600 for the same call
+    # locally. 300 would have failed the first honest run even after the host was
+    # fixed, and a timeout here reads exactly like an outage.
     startCommand: >-
+      case "$KEYSTONE_API_HOST" in *.*) API_HOST="$KEYSTONE_API_HOST" ;; *) API_HOST="$KEYSTONE_API_HOST.onrender.com" ;; esac &&
+      echo "POST https://$API_HOST/internal/sync" &&
       curl --fail-with-body --show-error --silent --location
-      --proto '=https' --tlsv1.2 --max-time 300
-      -X POST "https://$KEYSTONE_API_HOST/internal/sync"
+      --proto '=https' --tlsv1.2 --max-time 1800
+      -X POST "https://$API_HOST/internal/sync"
       -H "X-Trigger-Secret: $TRIGGER_SECRET_SYNC"
       -H "Content-Type: application/json"
       -d "{\"run_id\": \"sync-$(date -u +%Y%m%dT%H%M%SZ)\"}"
@@ -472,10 +503,17 @@ services:
     schedule: "20 * * * *"
     autoDeployTrigger: "off"
     buildCommand: "true"
+    # Same `property: host` -> service-name defect as the sync cron above; see the
+    # comment there. This job died identically on every hourly run.
+    # 900, not 300: the measured reconcile over HTTP on the graded dataset is
+    # 11.2s (3,050 conflicts -> 3,050 proposals), so this is slack rather than an
+    # expectation -- but it is slack that survives a cold Neon compute.
     startCommand: >-
+      case "$KEYSTONE_API_HOST" in *.*) API_HOST="$KEYSTONE_API_HOST" ;; *) API_HOST="$KEYSTONE_API_HOST.onrender.com" ;; esac &&
+      echo "POST https://$API_HOST/internal/reconcile" &&
       curl --fail-with-body --show-error --silent --location
-      --proto '=https' --tlsv1.2 --max-time 300
-      -X POST "https://$KEYSTONE_API_HOST/internal/reconcile"
+      --proto '=https' --tlsv1.2 --max-time 900
+      -X POST "https://$API_HOST/internal/reconcile"
       -H "X-Trigger-Secret: $TRIGGER_SECRET_RECONCILE"
       -H "Content-Type: application/json"
       -d "{\"run_id\": \"reconcile-$(date -u +%Y%m%dT%H%M%SZ)\"}"
