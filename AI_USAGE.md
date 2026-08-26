@@ -267,7 +267,7 @@ reproduction):
   against looping) and then asserts the value it ended up with. A run started at
   `PYTHONHASHSEED=random` cannot silently complete with a green manifest.
 - **Canonical JSON everywhere.** `json.dumps(obj, sort_keys=True, ensure_ascii=True,
-  separators=(",", ":"))` — `canonical_json` (`recon/privacy.py:1259`). The same spelling is used
+  separators=(",", ":"))` — `canonical_json` (`recon/privacy.py:1260`). The same spelling is used
   for the proposal's `evidence` column *and* for the rationale prompt, so the prompt for a given
   packet is byte-stable and the reservation's input bound is computed from a stable string.
 - **Pinned seed `20260822`**, in `.env.example`, `infra/render.yaml` and `recon/config.py`.
