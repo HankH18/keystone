@@ -1,0 +1,219 @@
+# Keystone CI for labs.gauntletai.com — the GRADED remote.
+#
+# `git remote -v` puts `origin` at https://labs.gauntletai.com/hankholcomb/keystone.git,
+# and that self-hosted GitLab is the submission target; GitHub is a mirror. Until this
+# file existed, "CI runs tests + linter on every push" was true only on the mirror, so
+# the remote that is actually read ran nothing at all.
+#
+# This is a deliberate mirror of .github/workflows/ci.yml — same two jobs, same steps,
+# same order, same environment — expressed in GitLab syntax. The two files must be kept
+# in step; where GitLab forces a different mechanism, the comment says so.
+
+stages:
+  - test
+
+# One pipeline per change, not two: without this, a push to a branch with an open merge
+# request produces both a branch pipeline and an MR pipeline for the same commit.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+service:
+  stage: test
+  # Python 3.12 exactly: service/pyproject.toml pins `requires-python = ">=3.12,<3.13"`
+  # and service/.python-version says 3.12. uv is installed into the image rather than
+  # pulled from a second registry, so this job needs Docker Hub and PyPI only.
+  image: python:3.12-bookworm
+  # Measured, not guessed — see the long note on `timeout-minutes: 90` in
+  # .github/workflows/ci.yml. The real T-5 suites ingest the full-profile tree (360,400
+  # records) into Postgres and validate ~1.28M field_lineage rows through deferred
+  # provenance triggers. This exact step sequence against a pristine `git archive HEAD`
+  # export, warm local Postgres, gave `4295 passed, 2 skipped in 1472.00s (0:24:31)` for
+  # pytest alone, plus ~1-2 min for sync/migrate/seed. 90 minutes is ~1.4x headroom over
+  # a 2-2.5x-slower shared runner, and still cuts off a hung job.
+  #
+  # NOTE for whoever administers labs.gauntletai.com: a job timeout cannot exceed the
+  # RUNNER's own timeout, so if the runner assigned to this project is capped lower than
+  # this, that cap wins and the job is killed at the cap regardless of the line below.
+  timeout: 90 minutes
+  # The GitLab equivalent of GitHub's `concurrency: cancel-in-progress` — a superseded
+  # pipeline for the same ref can be auto-cancelled instead of holding a runner.
+  interruptible: true
+
+  services:
+    # Reached by its ALIAS on the shared job network, so the host is `postgres` and the
+    # port is the container's own 5432. This is the one place GitLab and GitHub must
+    # differ: the GitHub job runs on the runner VM and reaches its service through a
+    # published port on localhost, whereas this job runs *in* a container alongside the
+    # service. 55432 is purely infra/docker-compose.yml's host mapping and applies to
+    # neither.
+    - name: pgvector/pgvector:pg16
+      alias: postgres
+
+  variables:
+    # Job variables are passed into service containers, which is how the image below
+    # gets its POSTGRES_* settings. (Per-service `variables:` would work on current
+    # GitLab but needlessly narrows the versions this file runs on.)
+    POSTGRES_USER: keystone
+    POSTGRES_PASSWORD: keystone
+    POSTGRES_DB: keystone
+    # Mirrors infra/docker-compose.yml. Text ordering must not vary by host locale:
+    # `locale=C` is what the local database is initialised with, and a CI database on
+    # the image's default collation would sort text differently from every machine this
+    # suite was written on.
+    POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+
+    DATABASE_URL: "postgresql://keystone:keystone@postgres:5432/keystone"
+    # The schema tests skip themselves when DATABASE_URL is unset. That is correct on a
+    # laptop and unacceptable here: it let 76 of 81 tests skip while CI reported success.
+    # This makes a database-less run a hard failure, so a green from this job means the
+    # tests actually executed.
+    KEYSTONE_REQUIRE_DB: "1"
+    # Deterministic, offline defaults: no provider keys exist in CI.
+    LOG_MODE: safe
+    LLM_PROVIDER: mock
+    EMBEDDING_PROVIDER: mock
+    # GitLab can only cache paths inside the project directory.
+    UV_CACHE_DIR: "$CI_PROJECT_DIR/.uv-cache"
+    # Where the seed writes. Deliberately OUTSIDE $CI_PROJECT_DIR: the generator emits
+    # `fixtures/` and `golden/` side by side under its `--out` root, and only the first
+    # of those may reach the checkout. GitHub's equivalent is `${{ runner.temp }}`.
+    SEED_OUT: "/tmp/keystone-seed"
+
+  cache:
+    key:
+      files:
+        - service/uv.lock
+    paths:
+      - .uv-cache
+
+  before_script:
+    - pip install --no-cache-dir --disable-pip-version-check uv
+    - cd service
+
+  script:
+    # `--locked` is the service-side counterpart of the dashboard's
+    # `pnpm install --frozen-lockfile`: a bare `uv sync` will quietly re-resolve and
+    # install a dependency set that is NOT the committed uv.lock, so a green would be a
+    # green for packages nobody reviewed. This fails instead.
+    - uv sync --locked
+
+    - uv run ruff check .
+    - uv run ruff format --check .
+
+    # GitLab services have no health check and this job cannot `docker exec` into the
+    # service container, so both halves of GitHub's "wait for healthy, then run
+    # infra/initdb/01-extensions.sql" are done here over the wire with the same psycopg
+    # driver the application uses. Idempotent; migrations (T-3) also create what they
+    # need, but a database that never came up must fail HERE with a clear message rather
+    # than as a confusing alembic traceback.
+    - |
+      uv run python - <<'PY'
+      import os, sys, time
+      import psycopg
+
+      dsn = os.environ["DATABASE_URL"]
+      deadline = time.monotonic() + 120
+      last = None
+      while time.monotonic() < deadline:
+          try:
+              with psycopg.connect(dsn, connect_timeout=5, autocommit=True) as conn:
+                  conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+                  conn.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
+              print("postgres is up; vector + pgcrypto present")
+              sys.exit(0)
+          except Exception as exc:  # not up yet
+              last = exc
+              time.sleep(2)
+      sys.exit(f"postgres never became reachable at {dsn}: {last}")
+      PY
+
+    # Must precede pytest. Without it every schema test fails on "DATABASE_URL points at
+    # a database with no Keystone schema" — red, but for the wrong reason, and it would
+    # mask a real regression.
+    - uv run alembic upgrade head
+
+    # THE STEP WHOSE ABSENCE KEPT THE GITHUB JOB RED FOR NINE PUSHES; see the long
+    # justification in .github/workflows/ci.yml. In short: `fixtures/` is gitignored, so
+    # a fresh clone has none, and `tests/er/dataset.py:44` resolves the tree as
+    # `REPO_ROOT / "fixtures"` from `__file__` — it reads no environment variable, so
+    # `KEYSTONE_FIXTURES_DIR` cannot redirect it. Without a fixture tree there, 865 tests
+    # error in collection. `--profile full` is forced too: `recon/seed/run.py` refuses to
+    # write a repository tree from any other profile, and `tests/apply/store.py:183`
+    # asserts the graded 3,050-conflict distribution from `golden/conflicts.json`.
+    #
+    # But `golden/` is TRACKED — it IS the grading contract — and a bare
+    # `python -m recon.seed --profile full` writes BOTH trees at the repository root.
+    # That would overwrite `golden/*.json` before pytest read them, leaving
+    # `tests/seed/test_committed_golden.py` comparing the generator against output this
+    # very step produced: trivially green, and blind to the stale committed golden set it
+    # exists to catch. So the seed goes to a scratch tree and ONLY `fixtures/` is staged
+    # back; the scratch `golden/` is discarded unread and the guard below proves the
+    # committed one is untouched. Bound by service/tests/integration/test_ci_workflow.py.
+    - |
+      set -eu
+      uv run python -m recon.seed --profile full --out "$SEED_OUT"
+      mkdir -p ../fixtures
+      find ../fixtures -mindepth 1 -maxdepth 1 ! -name .gitkeep -exec rm -rf {} +
+      cp -R "$SEED_OUT/fixtures/." ../fixtures/
+      test -f ../fixtures/manifest.json
+      git -C .. diff --exit-code -- golden/
+
+    - uv run pytest
+
+dashboard:
+  stage: test
+  # Node 22 + pnpm 9 (dashboard/pnpm-lock.yaml is lockfileVersion 9.0).
+  image: node:22-bookworm
+  # Headroom for the two network-bound steps: `pnpm install` on a cold store, and the
+  # Playwright Chromium download plus its apt system libraries.
+  timeout: 30 minutes
+  interruptible: true
+
+  variables:
+    # GitLab can only cache paths inside the project directory, so both the pnpm store
+    # and the Playwright browser bundle are placed there.
+    PLAYWRIGHT_BROWSERS_PATH: "$CI_PROJECT_DIR/.playwright-browsers"
+    COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+  cache:
+    key:
+      files:
+        - dashboard/pnpm-lock.yaml
+    paths:
+      - .pnpm-store
+      - .playwright-browsers
+
+  before_script:
+    # `pnpm@9` is pinned explicitly: dashboard/pnpm-lock.yaml is lockfileVersion 9.0, and
+    # a bare `corepack enable` on a clean container resolves whatever pnpm is newest,
+    # which is how a lockfile-version mismatch gets into a pipeline.
+    - corepack enable
+    - corepack prepare pnpm@9 --activate
+    - cd dashboard
+
+  script:
+    # `--store-dir` on the command rather than `pnpm config set`: the store only matters
+    # during install, and writing a global .npmrc first is an extra way for the job to
+    # die before it has run anything. Verified against pnpm 9.15.0, which resolves this
+    # to `<path>/v3` — inside the cached directory.
+    - pnpm install --frozen-lockfile --store-dir "$CI_PROJECT_DIR/.pnpm-store"
+    - pnpm lint
+    - pnpm test
+    - pnpm build
+
+    # The a11y gate is R12's evidence, so the browser it needs is installed explicitly.
+    # `pnpm test:a11y` FAILS (it does not skip) when Chromium is absent unless
+    # ALLOW_A11Y_SKIP=1 is set, which CI deliberately does not set — a green
+    # accessibility gate that never ran is worse than a red one.
+    - pnpm exec playwright install --with-deps chromium
+    - pnpm test:a11y
+
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - dashboard/playwright-report

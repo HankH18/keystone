@@ -197,6 +197,19 @@ _ENTRY_POINT_DRIVERS: tuple[tuple[str, str], ...] = (
         "import recon.invariants.__main__ as m\n"
         "try:\n    m.main([])\nexcept SystemExit:\n    pass\n",
     ),
+    (
+        # An argparse REJECTION, deliberately -- never `m.main([])`. The retention
+        # sweep's entry point connects to whatever `DATABASE_URL` resolves to and
+        # commits, and `recon.config` resolves its `.env` chain to absolute paths
+        # at import time, so a subprocess with no `DATABASE_URL` in its
+        # environment does not get an unconfigured process: it gets the
+        # repository's `.env` and a real sweep of the database that names. This
+        # driver exits inside `parse_args`, after `configure_logging_once()`,
+        # which is the only thing it is here to observe.
+        "recon.privacy",
+        "import recon.privacy as m\n"
+        "try:\n    m.main(['--not-a-flag'])\nexcept SystemExit:\n    pass\n",
+    ),
 )
 
 

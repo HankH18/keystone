@@ -133,7 +133,7 @@ SUITE_NOTES: tuple[str, ...] = (
     "full` into scratch directories (KEYSTONE_SUITE_SEED_PROFILE overrides the profile; "
     "at anything but `full` the committed-golden cross-checks do not apply and the row "
     "says so).",
-    "NOT COVERED: browser-side dashboard timing (`bench:dashboard-load-p95` is "
+    "NOT COVERED: browser-side dashboard timing (`bench:dashboard-api-p95` is "
     "service-side only -- see recon/bench/suite.py), a live Anthropic provider (the "
     "graded path is the offline mock; the burst drives the real ledger), any source "
     "other than the three committed JSONL adapters, the deployed Render/Neon "
@@ -249,7 +249,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     # Checks first, then the artifacts, then the benchmarks -- in that order, and
-    # not for tidiness. ``bench:dashboard-load-p95`` replays the Overview route,
+    # not for tidiness. ``bench:dashboard-api-p95`` replays the Overview route,
     # which begins with ``GET /api/scorecard``, and that endpoint serves the
     # artifact written here. Running the benchmarks before the write would
     # measure the endpoint's 503 path on any deployment whose scorecard has not

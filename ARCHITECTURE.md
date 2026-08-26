@@ -5,8 +5,17 @@ resolves identity, runs a committed SQL rule set that emits a per-record verdict
 conflicts into **proposals that no machine may approve**, and lets a human decide. Every mutation of an
 existing canonical row must cite the proposal that authorized it, in the same transaction.
 
-Both diagrams below were drawn from the code as it stands, not from a design doc. Line references are
-live at the current working tree.
+Both diagrams below were drawn from the code as it stands, not from a design doc. Every code citation
+names a symbol, and **what is enforced on every run is the symbol, not the integer**:
+`service/tests/docs/test_doc_citations.py` re-reads every `path:line` reference in this file and goes
+red when the cited file no longer *defines* what the prose names — a rename, a deletion, a move to
+another module — or when a reference has slid onto a mere mention of it (an `__all__` entry, an
+import, a comment). The line numbers themselves are **not** continuously enforced, deliberately: a
+doc test that reddens because an unrelated commit moved a function four lines down is a gate people
+learn to ignore, and this one did exactly that once. They are re-derived from the working tree by
+`cd service && uv run python -m tests.docs.test_doc_citations --write`, which was last run to
+produce the numbers below. So read a line number as *exact as of the last resync*, and the symbol
+beside it as guaranteed.
 
 ---
 
@@ -20,16 +29,16 @@ flowchart TB
     PAY["payments"]
   end
 
-  ADP["ReadOnlyAdapter port — adapters/base.py:279<br/>source_id · generations · read<br/>three members, no write member"]
+  ADP["ReadOnlyAdapter port — adapters/base.py:313<br/>source_id · generations · read<br/>three members, no write member"]
   CRM --> ADP
   APP --> ADP
   PAY --> ADP
 
-  subgraph SYNC["POST /internal/sync — sync_job, 3 pinned stages, api/internal.py:490"]
+  subgraph SYNC["POST /internal/sync — sync_job, 3 pinned stages, api/internal.py:519"]
     ING["stage 1 · ingest_all"]
-    NORM["_materialize — ingest.py:1117<br/>normalizes INLINE, in the SAME transaction as the COPY<br/>imports recon/normalize.py, the R23 shared spec"]
-    RES["stage 2 · resolve.materialize — resolve.py:750<br/>recon.er cascade"]
-    INV["stage 3 · run_invariant_stage — api/internal.py:392<br/>runs rules/NNN_name.vX.sql in filename order"]
+    NORM["_materialize — ingest.py:1127<br/>normalizes INLINE, in the SAME transaction as the COPY<br/>imports recon/normalize.py, the R23 shared spec"]
+    RES["stage 2 · resolve.materialize — resolve.py:818<br/>recon.er cascade"]
+    INV["stage 3 · run_invariant_stage — api/internal.py:421<br/>runs rules/NNN_name.vX.sql in filename order"]
   end
 
   ADP -->|"recon_writer"| ING
@@ -41,21 +50,21 @@ flowchart TB
   RES --> CANON[("entities · entity_links<br/>entity_link_candidates · field_lineage")]
 
   STG -->|"schema owner via OPS_DATABASE_URL<br/>the 3 app roles are denied TEMPORARY by migration 0006"| INV
-  TMP["session TEMP er_* / ref_* — invariants/context.py:613<br/>the ONLY other input a rule has.<br/>No rule reads entities, entity_links, field_lineage or raw_records"]
+  TMP["session TEMP er_* / ref_*, materialized by build_context — invariants/context.py:613<br/>the ONLY other input a rule has.<br/>No rule reads entities, entity_links, field_lineage or raw_records"]
   TMP --> INV
   INV -->|"COPY · one verdict per record per rule"| IRES[("invariant_results")]
   INV -->|"persist_run invariants/runner.py:344<br/>ON CONFLICT fingerprint DO UPDATE last_seen_run"| CONF[("conflicts — the conflict store")]
 
-  subgraph RECON["POST /internal/reconcile — reconcile_job, bound at app.py:282"]
-    RC["reconcile — reconciler.py:1516<br/>score · classify · fix_action · dedup"]
-    RAT["rationale hook — reconciler.py:1358<br/>TEXT ONLY, called after scoring, return value discarded except str"]
+  subgraph RECON["POST /internal/reconcile — reconcile_job, bound in create_app — app.py:193"]
+    RC["reconcile() — reconciler.py:1519<br/>score · classify · fix_action · dedup"]
+    RAT["rationale_hook_for() — reconciler.py:1361<br/>TEXT ONLY, called after scoring, return value discarded except str"]
   end
 
   CONF -->|"recon_writer · ORDER BY fingerprint"| RC
   CANON -.->|"read-only evidence inputs:<br/>entity_link_candidates · field_lineage · entities"| RC
   PROP -.->|"read-only: prior proposals, for R16 dedup"| RC
   RC --> RAT
-  RAT -->|"reserve → call → settle_capped<br/>llm.py:786 / 898 / 919"| CAP[("budget_ledger<br/>budget_reservations")]
+  RAT -->|"generate_rationale() llm.py:684 — reserve() budget.py:1861 → complete() → settle_capped() budget.py:2473"| CAP[("budget_ledger<br/>budget_reservations")]
   RC -->|"born pending or sensitive_hold — never approved"| PROP[("proposals — the pending queue")]
   RC -->|"status · last_seen_run · escalation_reason ONLY"| CONF
 
@@ -66,7 +75,7 @@ flowchart TB
   AP -->|"ONE transaction — the citation"| EV[("proposal_events")]
   AP -->|"UPDATE current, updated_at ONLY"| CANON
 
-  ING --> AUD[("audit_log — logging.py:536 redacting chokepoint")]
+  ING --> AUD[("audit_log — insert_audit_row, logging.py:538<br/>the one redacting chokepoint")]
   RC --> AUD
   DEC --> AUD
   AP --> AUD
@@ -75,12 +84,12 @@ flowchart TB
 Two things this diagram deliberately does **not** show, because the code does not do them:
 
 - **There is no raw → staging → normalized three-step.** `stg_*` *is* the normalized layer.
-  `_materialize` (`ingest.py:1117`) runs inside `_land_records`, in the same transaction as the
+  `_materialize` (`ingest.py:1127`) runs inside `_land_records`, in the same transaction as the
   landing `COPY`, and calls `recon.normalize` directly.
 - **No arrow from `entities` into the invariant engine.** Grepping every `FROM`/`JOIN` in `rules/*.sql`
   returns only `stg_crm_contact`, `stg_crm_deal`, `stg_student`, `stg_enrollment`, `stg_payment` and
-  the session-scoped TEMP `er_*` / `ref_*` tables that `invariants/context.py:613` materializes. No
-  rule references `entities`, `entity_links`, `entity_link_candidates`, `field_lineage` or
+  the session-scoped TEMP `er_*` / `ref_*` tables that `build_context` (`invariants/context.py:613`)
+  materializes. No rule references `entities`, `entity_links`, `entity_link_candidates`, `field_lineage` or
   `raw_records`. The canonical layer feeds the *reconciler*, not the detector.
 
 One label needs a footnote. The three-column `conflicts` grant is what migration
@@ -107,13 +116,19 @@ sequenceDiagram
   participant Prov as LLM provider
   participant Rev as Reviewer
 
+  Note over Cron,PG: BEATS 1-4 ARE A DIFFERENT CRON. keystone-sync fires at 0 past the hour,<br/>keystone-reconcile at 20 past — two schedules in infra/render.yaml, never one call.<br/>So a reconcile cycle opens on a conflict store the sync cron already filled.
+  Cron->>API: POST /internal/sync with X-Trigger-Secret — TRIGGER_SECRET_SYNC, the sync job's own secret
+  API->>PG: sync_job api/internal.py:519 — stage 1 ingest_all COPYs raw_records and _materialize<br/>normalizes into stg_* in the SAME transaction, then stage 2 resolve.materialize rebuilds the canonical layer
+  API->>PG: run_invariant_stage api/internal.py:421 — rules/NNN_name.vX.sql in filename order,<br/>one invariant_results row per in-scope record per rule
+  PG-->>API: persist_run invariants/runner.py:344 writes the surviving verdicts into conflicts —<br/>ON CONFLICT fingerprint DO UPDATE last_seen_run. THIS is beat 4, conflict detected.
+
   Note over Cron,API: hourly at 20 past the hour — infra/render.yaml
   Cron->>API: POST /internal/reconcile with X-Trigger-Secret
   API->>API: trigger_guard, hmac.compare_digest against TRIGGER_SECRET_RECONCILE<br/>per-job secret, no shared-secret fallback, checked before the body is parsed
   API->>PG: claim_run — at-most-once, commits audit trigger.reconcile before the body runs
   API->>PG: provision_run_scope — creates this run's budget scope
   Note right of API: if the scope cannot be provisioned the trigger answers 503<br/>and the job does NOT run: an uncapped run is not allowed
-  API->>Rec: reconcile_job run_id — bound in create_app, app.py:282
+  API->>Rec: reconcile_job run_id — bound in create_app, app.py:193
 
   Rec->>PG: SELECT conflicts ORDER BY fingerprint, prior proposals, candidates,<br/>field_lineage, source_generations — as recon_writer
   loop each conflict, in fingerprint order
@@ -126,7 +141,7 @@ sequenceDiagram
     Note over Rec,Prov: THE SPEND CAP GATES THE RATIONALE TEXT, AND IT GATES IT HERE
     Rec->>Bud: reserve worst case — one atomic INSERT, run scope and daily scope together
     alt cap would be exceeded
-      Bud-->>Rec: SQLSTATE KS006 — cap_hit audit row plus alert, no provider call, rationale NULL
+      Bud-->>Rec: SQLSTATE KS006 — cap_hit audit row plus alert, no provider call, rationale NULL<br/>terminal for THIS call's attempt loop only, the conflict loop continues to the next fingerprint
     else reservation granted
       Rec->>Prov: complete prompt — text only
       Prov-->>Rec: rationale text
@@ -147,21 +162,51 @@ sequenceDiagram
   API->>PG: INSERT audit_log proposal.applied
 ```
 
-**Where this diverges from the brief's beat order, and why the code is right.** The brief lists
+**All nine beats are above, but the first four are not the same HTTP call.** Sync, the invariant
+check and conflict-detected run under `keystone-sync` (`"0 * * * *"`); the five beats from
+`reconciler proposes` onward run under `keystone-reconcile` (`"20 * * * *"`) — both in
+`infra/render.yaml`, and the `Note over` marks the split. A reconcile cycle therefore opens on an
+already-populated conflict store. Drawing them as one call would show a pipeline that does not exist.
+
+**Where the beat *order* diverges, and why the code is right.** The brief lists
 *"reconciler proposes → spend-cap check → write pending"*. In the implementation the cap gates the
-**rationale text**, not the proposal: `reconcile()` calls `_rationale` (`reconciler.py:1613`) and
-only then `_insert_proposal` (`:1614`). The cap check lives inside `recon.llm` as
-`reserve → complete → settle_capped` (`llm.py:786 / 898 / 919`). There is no cap check between the
-proposal and the pending write because **writing a proposal costs nothing** — the only money in the
-cycle is the model call, and it is reserved before it is made. Drawing a separate gate after the
-proposal would show a control that does not exist.
+**rationale text**, not the proposal: `reconcile()` calls `_rationale` (`reconciler.py:1627`) and
+only then `_insert_proposal` (`reconciler.py:1628`) — adjacent statements, in that order. The cap
+check lives inside `recon.llm`'s `generate_rationale` (`llm.py:684`), which takes the reservation
+with `reserve` (`budget.py:1861`), makes the call, and hands the difference back with
+`settle_capped` (`budget.py:2473`). There is no cap check between the proposal and the pending
+write because **writing a proposal costs nothing** — the only money in the cycle is the model call,
+and it is reserved before it is made. Drawing a
+separate gate after the proposal would show a control that does not exist.
 
-The brief's three earlier beats — sync, the invariant check, conflict detected — are absent for the
-same reason: they are not part of this cycle. They run on a **separate hourly cron** (`"0 * * * *"`
-against reconcile's `"20 * * * *"`, `infra/render.yaml`) and appear in diagram 1; a reconcile cycle
-begins at an already-populated conflict store, which is what the code does.
+**What a `KS006` actually does — on every path that can raise one.** One half is the same
+everywhere: the reserve trigger refuses the INSERT, `reserve` raises `BudgetCapExceeded`
+(`budget.py:515`), **nothing is charged and no provider call is made**, and the refusal writes its own
+`cap_hit` audit row and fires the alert (`record_cap_hit`, `budget.py:1739`). Spend is bounded because
+the reservation strictly precedes the request: *no reservation ⇒ no provider call.* **What stops
+besides the spend is the caller's decision, and the two callers differ** — so this says which, rather
+than saying "halt", which is what it used to do while one of the two performed no halt at all:
 
-Note also that under the default `LLM_PROVIDER=mock`, `rationale_hook_for` (`reconciler.py:1358`)
+- **The reconcile cycle degrades and does not halt.** `generate_rationale` (`llm.py:684`) catches it,
+  ends **that one call's** attempt loop — a cap hit is terminal, retrying only produces another
+  `KS006` — and returns a `cap_hit` outcome with `text=None`. Nothing above it is told. `_rationale`
+  (`reconciler.py:1753`) turns that into `None`, the proposal lands with `rationale = NULL`, and the
+  **next** conflict in fingerprint order takes its own reservation and is refused the same way: one
+  `cap_hit` row and one alert per refused attempt, not one per run. No caller in `recon.reconciler`
+  inspects a cap status, breaks the loop, or aborts the run.
+- **The metered batch job halts.** `python -m recon.incidents` lets `BudgetCapExceeded` propagate out
+  of its embedding pass and `main` (`incidents.py:1429`) returns `EXIT_REFUSED` — a non-zero exit,
+  logged and alerted.
+
+The reconcile-side degradation is deliberate, not a gap left open. The LLM is rationale *text* and
+nothing else, so ending a detection run because its nicety budget is gone would drop conflicts the cap
+has nothing to do with; and the obvious alternative — a process-side latch that stops attempting once
+the cap has spoken — is exactly the Python-side cap check `recon.budget` refuses to have, because it
+answers "is there budget?" without asking the database. `recon/budget.py`'s module docstring
+(§*What "stop on cap" actually stops*), `recon/llm.py`'s (§*Every attempt reserves*) and
+`docs/DESIGN.md` §Budget ledger state the same two paths.
+
+Note also that under the default `LLM_PROVIDER=mock`, `rationale_hook_for` (`reconciler.py:1361`)
 returns `no_rationale` — *the identical function object* — so every graded run makes zero model calls,
 reserves nothing, and produces byte-identical proposals. The `alt` branch above is the live-provider
 path.
@@ -170,30 +215,68 @@ path.
 
 ## 3. Rationale
 
-**Adapter boundary.** `ReadOnlyAdapter` (`adapters/base.py:279`) is a `@runtime_checkable` Protocol with
-exactly three members — `source_id`, `generations()`, `read()`. No write method: a source is a snapshot
-you pull. **Proven, not asserted**: `assert_sources_are_unwritable()` (`apply.py:1863`) walks every
-adapter's full MRO **and its instance `__dict__`** — a writer bound at construction lives on no class —
-and returns three class names, zero offenders. It publishes its own limit (`apply.py:1876`):
-`WRITE_NAME_TOKENS` is a substring list, not a decision procedure. It and `source_tree_digest()`
-(`apply.py:1931`, which hashes the whole fixture tree either side of a real committed apply and rollback)
-are reached only from tests; the load-bearing arm is the Protocol's missing write member.
+**Adapter boundary.** `ReadOnlyAdapter` (`adapters/base.py:313`) is a `@runtime_checkable` Protocol
+with exactly three members — `source_id`, `generations()`, `read()`. No write method: a source is a
+snapshot you pull. **Proven, not asserted**:
+`assert_sources_are_unwritable()` (`apply.py:1885`) walks every adapter's full MRO **and its instance
+`__dict__`** — a writer bound at construction lives on no class — and returns three class names, zero
+offenders. The load-bearing arm is the Protocol's missing member; the assertion is a backstop that
+publishes its own limits (Appendix A).
 
-**Holds before writes — enforced where.** An `UPDATE` of `entities.current` is accepted only when, **in
-the same transaction**, a `proposal_events` row names that `canonical_id`, records `before`/`after` as the
-pre- and post-update values (compared by jsonb equality *and* textually), cites an `approved` (or
-applying-in-this-transaction) proposal whose `target_canonical_id` is that entity, and the new value
-equals `OLD.current || action->'set'` exactly. Citations are single-use (partial unique
-indexes); a reversal may only undo the write on top. Beneath that, three roles with column-scoped grants,
-connected as **real logins, never `SET ROLE`** (`db.py:286`): `recon_writer` PROPOSES (born
-`pending`/`sensitive_hold`, no UPDATE on `proposals`), `review_writer` DECIDES
-(`proposals(status, decided_by, decided_at)`), `apply_writer` APPLIES (`entities(current, updated_at)`
-only, no INSERT). What it does **not** guarantee, in the same breath:
+**Holds before writes — enforced where.** In the database, in the same transaction as the write. An
+`UPDATE` of `entities.current` is accepted only when, in that same transaction, a `proposal_events`
+row names that `canonical_id`, records `before`/`after` as the pre- and post-update values (compared
+by jsonb equality *and* textually), cites an `approved` (or applying-in-this-transaction) proposal
+whose `target_canonical_id` is that entity, and the new value equals `OLD.current || action->'set'`
+exactly. Citations are single-use (partial unique indexes); a reversal may only undo the write on top.
+Beneath that, three roles with column-scoped grants, connected as **real logins, never `SET ROLE`** —
+`role_connection` (`db.py:286`): `recon_writer` PROPOSES (rows born `pending`/`sensitive_hold`; it
+holds no UPDATE on `proposals` at all), `review_writer` DECIDES (`proposals(status, decided_by,
+decided_at)`), `apply_writer` APPLIES (`entities(current, updated_at)` only, no INSERT). No code path
+can skip the hold, because no code path holds a role that could. Four things this does **not**
+guarantee — creation is not citation-guarded, the schema owner is not bound — are in Appendix A.
 
-1. **Canonical CREATION is not citation-guarded, by design** — the pipeline may APPEND, only the guarded
-   path may MUTATE. `recon_writer` holds INSERT on `entities`; the INSERT-side check is provenance, not
-   authorization (`KS008`: a canonical row must descend from an `entity_links` row), so fabricating one
-   costs three INSERTs rather than a proposal.
+**The spend cap — why it cannot be bypassed.** It lives in the database, not in Python, and the capped
+party was left **no writable spend column at all**: `recon_writer` holds neither INSERT nor UPDATE on
+`budget_ledger`, and spend moves only under the `budget_reservations` triggers. `reserve` is one
+atomic `INSERT` whose `BEFORE INSERT` trigger locks the ledger row, checks `spent + reserve <= cap`
+and raises `KS006` otherwise — reserved **before** the call, so a burst cannot race post-call
+accounting — and it has **no `scopes` parameter**, so nobody opts out of the daily cap.
+`ck_budget_spent_within_cap` (`0001_initial_schema.py:629`) is the CHECK backstop. On the reconcile
+path a `KS006` ends that call's attempt loop and nothing wider — the proposal still lands, with
+`rationale = NULL`; the metered batch job `python -m recon.incidents` exits non-zero instead. §2 has
+both paths in full. The cap binds spend *before* a call, not the release after one — Appendix B.
+
+**One change to scale 100k → 10M: detect incrementally over a *persisted* ER projection instead of
+rebuilding the whole world in Python every sync.** Stage 3's `build_context`
+(`invariants/context.py:613`) → `load_snapshot` (`invariants/context.py:265`) pulls every row of all
+five `stg_*` tables into Python lists and re-runs the global `recon.er.resolve` cascade in process —
+work stage 2 (`resolve.materialize`, `resolve.py:818` → `resolve_generation`, `resolve.py:441`)
+already did and persisted. One sync runs that cascade **twice**, holding the whole world in RAM both
+times: the wall is memory, not CPU. So: have stage 2 write the `er_*` projection once, persistent
+and generation-keyed; point `invariants/context.py` at it; parameterise the rules on the keys the
+landed generation touched. Measurements, and the 7 rules that cannot be delta-scoped: Appendix C.
+
+---
+
+## 3a. Appendix to the rationale
+
+*Deliberately outside the one-page rationale above, and not a correction of it. This is the part that
+did not fit: the caveats each boundary publishes about itself, and the numbers behind the scaling
+claim. A boundary stated without its limits is a boundary nobody can audit, so none of it is dropped.*
+
+### A. What the adapter and write boundaries do **not** guarantee
+
+`assert_sources_are_unwritable()` publishes its own limit in its own docstring: `WRITE_NAME_TOKENS`
+(`adapters/base.py:93`) is a substring list, not a decision procedure. It and
+`source_tree_digest()` (`apply.py:1971`, which hashes
+the whole fixture tree either side of a real committed apply and rollback) are reached only from
+tests; the load-bearing arm is the Protocol's missing write member, not either of them.
+
+1. **Canonical CREATION is not citation-guarded, by design** — the pipeline may APPEND, only the
+   guarded path may MUTATE. `recon_writer` holds INSERT on `entities`; the INSERT-side check is
+   provenance, not authorization (`KS008`: a canonical row must descend from an `entity_links` row),
+   so fabricating one costs three INSERTs rather than a proposal.
 2. **"Exactly one canonical write" means one write of `current`, not one UPDATE statement** — under an
    evidence-only `{"set": {}}` approval, repeated no-op UPDATEs of other columns satisfy the rule.
 3. **The schema owner is not bound, on either environment.** Locally it is a superuser, so
@@ -206,17 +289,13 @@ only, no INSERT). What it does **not** guarantee, in the same breath:
    `sensitive = false` proposal whose `action->'set'` names any `SENSITIVE_FIELDS` path — but nothing
    verifies the fix is the *right* one for its conflict, only that the write matches the action.
 
-**The spend cap — enforced where.** The cap lives in the database, not in Python. A Python-side cap
-once fell to a red team zeroing `budget_ledger.spent_microusd`, so the capped party was left **no
-writable spend column at all**: `recon_writer` holds no INSERT and no UPDATE on `budget_ledger`, and spend
-moves only under the `budget_reservations` triggers. `reserve` is one atomic `INSERT` whose
-`BEFORE INSERT` trigger locks the ledger row, checks `spent + reserve <= cap` and raises `KS006`
-otherwise — reserved **before** the call, so a burst cannot race post-call accounting — and it has **no
-`scopes` parameter**, so nobody opts out of the daily cap. `ck_budget_spent_within_cap`
-(`0001_initial_schema.py:629`) is the CHECK backstop. Real burst (`docs/scorecard.txt`): **120 contenders,
-6 granted, 114 refused, every refusal `KS006`; cap 81,600 µUSD, reserved-while-open 81,600 = exactly the
-cap; settled 10,782 = 6 × 1,797; ledger violations 0; over-admitted false; retry wave 10 → 0 granted.** A
-cap hit ends the attempt loop.
+### B. The spend cap — measured, and where it stops binding
+
+A Python-side cap once fell to a red team zeroing `budget_ledger.spent_microusd`, which is why the
+capped party ended up with no writable spend column. Real burst (`docs/scorecard.txt`): **120
+contenders, 6 granted, 114 refused, every refusal `KS006`; cap 81,600 µUSD, reserved-while-open
+81,600 = exactly the cap; settled 10,782 = 6 × 1,797; ledger violations 0; over-admitted false; retry
+wave 10 → 0 granted.**
 
 What that does **not** cover: it binds what may be spent **before** a call, not the **release**
 after one. `recon_writer`'s `UPDATE` on `budget_reservations` is column-scoped but carries no row
@@ -227,21 +306,17 @@ touch — `ops_attested_outage` is refused to `recon_writer`, and a `never_sent`
 older than `NEVER_SENT_WINDOW_SECONDS = 60` is refused `KS007` — but not how many, and no trigger can
 tell a truthful pre-send failure from a fabricated one.
 
-**One change to scale 100k → 10M: detect incrementally over a *persisted* ER projection instead of
-rebuilding the whole world in Python every sync.** Stage 3's `build_context` (`invariants/context.py:613`)
-→ `load_snapshot` (`:265`) pulls every row of all five `stg_*` tables into Python lists and re-runs the
-global `recon.er.resolve` cascade in process — work stage 2 (`resolve.materialize`, `resolve.py:750` →
-`resolve_generation`, `:365`) already did and persisted. One sync runs that cascade **twice**, holding the
-whole world in RAM both times, so the wall is memory, not CPU. Measured (`api/internal.py:114-117`;
-dataset `docs/scorecard.txt:4`): first sync 58.3s = 22.3 ingest + 22.1 materialize + 13.8 invariants over
-360,400 records; `bench:invariant-pass` already burns 76% of its `<30s` budget at 3.6% of target volume;
-and 376,000 `invariant_results` rows land per sync (`api/internal.py:92-93`), hourly. So: have
-stage 2 write the `er_*` projection once, persistent and generation-keyed; point `invariants/context.py`
-at it; parameterise the rules on the keys the landed generation touched. Two properties already make that
-safe: `persist_run`'s `ON CONFLICT (fingerprint) DO UPDATE SET last_seen_run`
-(`invariants/runner.py:344`) makes re-detection idempotent, and `ABSENCE_RULES`
-(`invariants/rules.py:44`) names the 7 of 14 rules that fire on a record *not* existing — those cannot be
-delta-scoped and move to a periodic full pass.
+### C. The scaling change — the measurement behind it
+
+Measured (`api/internal.py:114-117`; dataset `docs/scorecard.txt:4`): first sync 58.3s = 22.3 ingest
++ 22.1 materialize + 13.8 invariants over 360,400 records; `bench:detect-persist-reconcile` already burns 76% of
+its `<30s` budget at 3.6% of target volume; and 376,000 `invariant_results` rows land per sync
+(`api/internal.py:92-93`), hourly.
+
+Two properties already make the incremental plan safe: `persist_run`'s `ON CONFLICT (fingerprint) DO
+UPDATE SET last_seen_run` (`invariants/runner.py:344`) makes re-detection idempotent, and
+`ABSENCE_RULES` (`invariants/rules.py:44`) names the 7 of 14 rules that fire on a record *not*
+existing — those cannot be delta-scoped and move to a periodic full pass.
 
 ---
 
@@ -262,7 +337,8 @@ extra steps.
 clamp01(clamp01(base[conflict_type] + sum(positive)) + sum(negative))
 ```
 
-pinned as a literal string at `confidence.yaml:65` and asserted verbatim in the suite. Ordered
+pinned as a literal string in the model's `formula` key (`confidence.yaml:65`) and asserted verbatim
+in the suite. Ordered
 procedure: pin the `decimal` context inside `localcontext()` so a caller cannot reach in; read the
 base; walk `signal_order` accumulating each `weight × value` into the positive or negative half **by
 the sign of the committed weight** (a count signal scoring 0 is still a penalty term, or a zero-valued

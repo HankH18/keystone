@@ -16,6 +16,8 @@ import { getApiClient } from './apiClient'
 import { ApiConfigError } from './api'
 import { guardConflictPage, guardProposalPage } from './filterGuard'
 import type {
+  AuditPage,
+  AuditQuery,
   Conflict,
   ConflictQuery,
   KeystoneApi,
@@ -95,6 +97,35 @@ export function useScorecard(): UseQueryResult<Scorecard> {
   return useQuery({
     queryKey: ['scorecard'],
     queryFn: async ({ signal }) => (await api).getScorecard(signal),
+  })
+}
+
+/**
+ * `GET /api/audit` — R18's action log, the surface Core deliverable #6's "the
+ * log reconciles with the dashboard" is checked on.
+ *
+ * `listAudit` is optional on `KeystoneApi`, so a client that does not implement
+ * it raises `ApiConfigError` **before any request is made** — the same rule
+ * `useDecision` follows for `rollbackProposal`, and for the same reason: a log
+ * this dashboard cannot fetch must not read to a reviewer as a log the service
+ * says is empty. An empty audit page and an unreachable one are different
+ * facts, and the route renders them differently.
+ */
+export function useAudit(query: AuditQuery): UseQueryResult<AuditPage> {
+  const api = useApi()
+  return useQuery({
+    queryKey: ['audit', query],
+    queryFn: async ({ signal }) => {
+      const client = await api
+      if (typeof client.listAudit !== 'function') {
+        throw new ApiConfigError(
+          'This dashboard cannot read the audit log: the API client it is using ' +
+            'exposes no listAudit call, so GET /api/audit was never sent. This is ' +
+            'not an empty log — nothing was asked.',
+        )
+      }
+      return client.listAudit(query, signal)
+    },
   })
 }
 

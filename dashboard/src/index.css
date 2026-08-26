@@ -14,6 +14,11 @@
  *   text 17.4 / 16.4   muted 7.5 / 7.1   link 8.6 / 8.1
  *   positive 6.6 / 6.2  negative 7.8 / 7.3  warning 7.4 / 7.0  hold 8.4 / 7.9
  *   border 3.6 / 3.4 (non-text, AA needs 3.0)
+ *
+ * The focus ring is a non-text UI component and carries the same obligation
+ * (SC 1.4.11, 3:1). It is the one colour in here that is painted over MORE
+ * than one shell, so it is tokenised per shell rather than set once globally —
+ * see --focus-ring below.
  */
 
 @theme {
@@ -39,7 +44,36 @@
   --color-warning: #7a4b00;
   --color-hold: #553c9a;
   --color-header-bg: #1f2937;
+
+  /*
+   * Focus ring (SC 1.4.11, non-text, 3:1).
+   *
+   * The ring is painted 2px OUTSIDE the control's border box, so the colour it
+   * has to contrast with is the SHELL the control sits in, never the control
+   * itself — a focused `.button-primary` shows its ring on the panel behind it,
+   * not on its own green.
+   *
+   * #1543ad measured against every shell a ring can land on:
+   *   bg #ffffff 8.61   surface #f7f8fa 8.11   surface-2 #eef1f5 7.60
+   *   mock-banner #fff4d6 7.86   alert wash #fdeceb 7.54
+   *   header/footer #1f2937 1.70  <-- FAILS, which is why the dark shell
+   *                                   overrides --focus-ring for itself.
+   *
+   * Any surface darker than roughly #7f7f7f must therefore set --focus-ring to
+   * --focus-ring-inverse (#ffffff on #1f2937 is 14.68). This is enforced, not
+   * remembered: e2e/contrast.spec.ts walks the FULL tab cycle of EVERY route
+   * that e2e/routes.ts discovers, and computes the real ratio of each ring
+   * against its real composited backdrop. It refuses to stop early — a walk
+   * that hits its runaway cap without the tab order wrapping fails the test
+   * rather than quietly reporting on the stops it managed to reach — so a new
+   * dark surface that forgets fails the accessibility gate, on whichever route
+   * it was introduced.
+   *
+   * (This claim was previously false: the walk visited /conflicts only, and a
+   * real 1.70:1 ring introduced on /proposals/:id shipped green.)
+   */
   --focus-ring: #1543ad;
+  --focus-ring-inverse: #ffffff;
 }
 
 html,
@@ -84,6 +118,26 @@ body {
   top: 0.5rem;
 }
 
+/*
+ * The skip link is the one control whose ring is NOT painted over its own
+ * ancestors. It is absolutely positioned, so its ring lands on whatever the
+ * page happens to have drawn there — and MEASURED, that is usually the dark
+ * header. The ring's bottom edge is at y=58.69; the header's top edge is at
+ * y=0 whenever the mock banner is absent (i.e. every real deployment), and at
+ * y=38.39 with the banner present at >=1600px wide. Only at exactly 1280px
+ * with the banner does the header start at y=58.78 and clear it, by 0.09px —
+ * coincidence, not design. Uncorrected, most of the ring is #1543ad on
+ * #1f2937 = 1.70:1.
+ *
+ * So paint the page background under the ring and 3px past it: the ring keeps
+ * its 8.61:1 wherever the link lands. The outline is painted AFTER (on top of)
+ * the box-shadow, so this reads outward as bg / ring / bg rather than the
+ * shadow covering the ring.
+ */
+.skip-link:focus-visible {
+  box-shadow: 0 0 0 8px var(--color-bg);
+}
+
 .visually-hidden {
   position: absolute;
   width: 1px;
@@ -103,6 +157,14 @@ body {
   background: var(--color-header-bg);
   color: #ffffff;
   padding: 0.75rem 1.25rem;
+  /*
+   * Dark shell: invert the ring for everything inside it (the footer carries
+   * this class too). #ffffff on #1f2937 is 14.68:1; the default #1543ad would
+   * be 1.70:1. Inheriting the custom property is what makes this hold for
+   * controls added to the header later, including the white `aria-current`
+   * nav pill — its ring is still painted on the header, not on the pill.
+   */
+  --focus-ring: var(--focus-ring-inverse);
 }
 
 .app-header a {
@@ -321,15 +383,45 @@ table.data-table tbody tr:hover {
   font-feature-settings: 'tnum' 1;
 }
 
+/*
+ * `overflow-wrap: break-word`, NOT `word-break: break-all`.
+ *
+ * MEASURED, on the deployed dashboard and again locally: break-all sets a
+ * span's min-content width to ONE CHARACTER, so any auto-layout table column
+ * that gets squeezed shreds whole tokens mid-word. The R24 "Condition" cell on
+ * /proposals/:id rendered `not_sensitive` as `not_sensit` / `ive`; at 1024px
+ * `target_on_allowlist`, `confidence_floor` and `complete_evidence` all split
+ * too, the audit log's actor column broke `system:reconciler` over five lines
+ * at 800px, and even the five-character `R-001` split in two. That is the
+ * opposite of the brief's "legibility over decoration".
+ *
+ * break-word breaks a word ONLY when it cannot fit on a line of its own, and
+ * leaves min-content at the longest word — so a 64-char fingerprint or a dotted
+ * source path still wraps instead of overflowing, while short tokens stay
+ * whole. Content that genuinely cannot fit scrolls rather than escaping,
+ * because every data table sits inside `.table-scroll { overflow-x: auto }`.
+ */
 .ref {
   font-family: var(--font-mono);
   font-size: 0.82rem;
-  word-break: break-all;
+  overflow-wrap: break-word;
 }
 
+/*
+ * The opaque fixed-length identifiers: 64-char digests and 36-char uuids.
+ *
+ * These are the one case where breaking mid-token costs nothing — a hex digest
+ * has no word boundary to preserve — and where refusing to break costs a lot:
+ * under `.ref`'s break-word a 64-char digest sets a 506px min-content floor on
+ * its column, which pushed the reversal-ledger table into horizontal scroll and
+ * tripped axe's `scrollable-region-focusable` (a scrollable region with no
+ * focusable content inside it). `anywhere` lets those columns compress again.
+ * It is NOT applied to `.ref` generally: that is what shredded `not_sensitive`.
+ */
 .truncate-id {
   font-family: var(--font-mono);
   font-size: 0.82rem;
+  overflow-wrap: anywhere;
 }
 
 /* ---- Status badge ------------------------------------------------------- */
@@ -436,6 +528,24 @@ dl.kv dt {
 
 dl.kv dd {
   margin: 0;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * Refs nested inside a definition list keep the dd's `anywhere`, not `.ref`'s
+ * `break-word`.
+ *
+ * MEASURED: a `.kv` grid has no `.table-scroll` to absorb an oversized token,
+ * and its `1fr` column takes its automatic minimum from min-content — so a
+ * 64-char fingerprint under break-word sets a 506px floor, and below ~700px
+ * viewport the whole PAGE went into horizontal scroll (conflict detail and
+ * proposal detail at 600px, 12 and 11 elements painted past the viewport edge).
+ * `dl.kv dd` already declares `anywhere` for exactly this reason; the nested
+ * ref was silently overriding it. `anywhere` still only breaks a token that
+ * cannot otherwise fit, so short tokens stay whole here too.
+ */
+dl.kv dd .ref,
+dl.kv dd.ref {
   overflow-wrap: anywhere;
 }
 

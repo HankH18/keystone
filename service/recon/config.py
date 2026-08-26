@@ -43,17 +43,27 @@ values Vite inlines -- would still be inert in any `.env` file, however
 correctly located. The Makefile exports the repo-root ``.env`` into each
 recipe's environment for exactly that reason. Both halves are needed; this one
 is what makes ``cd service && uv run ...`` work without the Makefile.
+
+Turning the chain off (`env_file_chain_disabled`)
+-------------------------------------------------
+Anchoring the chain to the repository gave the files real reach, and that reach
+has a second edge: a test that clears ``TRIGGER_SECRET_SYNC`` from
+``os.environ`` no longer produces an *unconfigured* setting, because the file
+underneath still supplies one. `env_file_chain_disabled()` is the seam that
+makes "unconfigured" mean unconfigured -- see its docstring for why the test
+suite holds it open for the whole session.
 """
 
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Iterator
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
 from pydantic import Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, PydanticBaseSettingsSource, SettingsConfigDict
 
 #: ``<repo>/service/recon/config.py`` -> ``<repo>``.
 REPO_ROOT: Path = Path(__file__).resolve().parents[2]
@@ -98,6 +108,15 @@ def _env_files() -> tuple[Path, ...]:
     return tuple(ordered)
 
 
+#: Does `Settings` read the `.env` chain, or the process environment alone?
+#:
+#: `True` in every deployed process; there is no environment variable and no
+#: config field that flips it, because a deployment must not be able to lose its
+#: `.env` by accident. Only `env_file_chain_disabled()` moves it, and only for
+#: the duration of its `with` block.
+_ENV_FILE_CHAIN_ENABLED: bool = True
+
+
 class Settings(BaseSettings):
     """Runtime configuration for the `recon` service."""
 
@@ -107,6 +126,35 @@ class Settings(BaseSettings):
         case_sensitive=False,
         extra="ignore",
     )
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """The default source order, minus the files when the chain is off.
+
+        The order itself is pydantic-settings' default and is the precedence
+        documented at the top of this module: earlier sources win, so an
+        explicit constructor argument outranks the real process environment,
+        which outranks the `.env` chain.
+
+        Dropping `dotenv_settings` -- rather than rewriting `model_config` --
+        is what keeps `env_file_chain_disabled()` honest. `model_config` is
+        class state shared by every instance and by anything that introspects
+        it; the source list is rebuilt on each construction. So the chain can be
+        turned off and back on without the declared `env_file` ever being a lie,
+        and `Settings.model_config["env_file"]` still names the files this
+        module resolves.
+        """
+        default = (init_settings, env_settings, dotenv_settings, file_secret_settings)
+        if _ENV_FILE_CHAIN_ENABLED:
+            return default
+        return tuple(source for source in default if source is not dotenv_settings)
 
     # Postgres DSN. Never hardcoded: supplied by the environment in every context.
     database_url: str | None = None
@@ -181,3 +229,51 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Return the process-wide `Settings`, built once and cached."""
     return Settings()
+
+
+@contextlib.contextmanager
+def env_file_chain_disabled() -> Iterator[None]:
+    """Build every `Settings` from the process environment alone, for the duration.
+
+    Why this exists
+    ---------------
+    ``monkeypatch.delenv("TRIGGER_SECRET_SYNC")`` clears the **process
+    environment** and nothing else. Once the chain above was anchored to the
+    repository, the repo-root ``.env`` kept answering underneath it -- so a test
+    that asked for an *unconfigured* secret silently got the placeholder
+    ``TRIGGER_SECRET_SYNC=replace-me-sync-trigger-secret`` that
+    ``cp .env.example .env`` writes, and the fail-closed assertions it was about
+    to make were made against a configured deployment instead.
+
+    That inverts what a green suite means. The four tests that pin R19's
+    fail-closed rule -- an unset trigger secret returns 401, it does not disable
+    the check -- passed only on a machine that had *not* followed the README's
+    step 2, and turned red on one that had. A safety property that is asserted
+    only where nobody set the project up is not asserted.
+
+    So `service/tests/conftest.py` holds this open for the whole session: the
+    suite reads the process environment (which pytest, the Makefile and every
+    documented ``DATABASE_URL=... uv run pytest`` all populate) and never an
+    untracked local file. A suite whose verdict depends on a file that is not in
+    the repository is not reproducible, and `.env` is gitignored by design.
+
+    Not an alternative to `_env_file=None`
+    --------------------------------------
+    ``Settings(_env_file=None)`` does the same thing for **one** construction.
+    It cannot help the four tests, because they never construct `Settings`
+    themselves -- the endpoint under test calls `get_settings()`, deep inside
+    the request. This flips the module, so every construction on every path,
+    cached or not, sees the same environment.
+
+    The cache is cleared on both edges: `get_settings` is `lru_cache`d, so an
+    instance built on either side of the boundary would otherwise outlive it.
+    """
+    global _ENV_FILE_CHAIN_ENABLED
+    previous = _ENV_FILE_CHAIN_ENABLED
+    _ENV_FILE_CHAIN_ENABLED = False
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        _ENV_FILE_CHAIN_ENABLED = previous
+        get_settings.cache_clear()

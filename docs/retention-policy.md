@@ -263,7 +263,7 @@ source against it, so a fifth sink fails the suite on the commit that adds it.
 | sink | chokepoint | covers |
 |---|---|---|
 | structlog event | the `redaction_processor` in the configured chain (`recon.logging.configure_logging`) | every `log.info/warning/error` in the package, including values bound onto a logger and context variables |
-| audit_log row | `recon.logging.audit_row` / `recon.logging.insert_audit_row` | `actor`, `action`, `subject`, `detail` and the three counters — **for the writers marked routed in `recon.logging.AUDIT_WRITERS`; see the gap below** |
+| audit_log row | `recon.logging.audit_row` / `recon.logging.insert_audit_row` | `actor`, `action`, `subject`, `detail` and the three counters — **for every `audit_log` writer in the package; enumerated in `recon.logging.AUDIT_WRITERS`** |
 | direct terminal write | `recon.logging.console` | the `python -m recon.suite` scorecard, and any other human-readable line written straight to stdout/stderr |
 | stdlib logging record | `recon.logging._install_stdlib_bridge` (a `ProcessorFormatter` ending in the *same* `redaction_processor`) and `recon.logging.uvicorn_log_config` | uvicorn's access and error logs, sqlalchemy, alembic, httpx, anthropic, and captured `warnings` |
 
@@ -284,15 +284,29 @@ The last two were real leaks, not hypotheticals:
   those loggers also gets an explicit level, so installing the bridge changes **routing, not
   verbosity** — a privacy fix must not switch on every chatty client library as a side effect.
 
-**The `audit_log` gap, stated rather than hidden.** `audit_row` is the chokepoint, but it has one
-caller. `recon/budget.py` (`_audit`) and `recon/api/internal.py` (`claim_run`) both write
-`INSERT INTO audit_log` directly and bind `actor`, `action` and `subject` **unredacted**,
-redacting only `detail` through `audit_detail`. Those two modules belong to other tickets;
-`recon.logging.AUDIT_WRITERS` records each one, marks it unrouted and carries the exact change
-that routes it, and `tests/privacy/test_sinks.py` fails if a writer is added, or if one changes
-status without the enumeration changing with it. Until they are routed, the honest statement is:
-*every field of an audit row written through `recon.logging` is redacted; two writers elsewhere
-in the package still bind three of their fields raw.*
+**The `audit_log` writers, enumerated rather than assumed.** `audit_row` redacts every bound
+field and `insert_audit_row` issues the one statement (`AUDIT_INSERT_SQL`), so a caller cannot
+route half a row past the redactor by hand-writing SQL of its own. Two writers used to do exactly
+that: `recon/budget.py` (`_audit`) and `recon/api/internal.py` (`claim_run`) each issued an
+`INSERT INTO audit_log` of its own and bound `actor`, `action` and `subject` **unredacted**,
+redacting only `detail`. Both now delegate to `insert_audit_row` and carry neither a statement nor
+a column list of their own. `claim_run` needed its *read* side moved with it — the replay check
+detects a claim by reading `subject` back, so `_CLAIM_LOOKUP` compares `redact(action,
+key='action')` against `redact(run_id, key='subject')`. `redact` is a keyed digest rather than a
+nonce, so redacting both sides is a stable equality, and `tests/ingest/test_claim_run_redaction.py`
+asserts the two sides against each other rather than against a written-down token. A lookup left
+raw would have re-claimed every replayed run id whose value carried a personal shape — and a
+lost replay check looks exactly like a successful run.
+
+Two `INSERT INTO audit_log` statements remain in the package: `recon/logging.py`'s
+`AUDIT_INSERT_SQL`, which is the chokepoint itself, and `run_purge`'s four-column insert in
+`recon/privacy.py`. The second is a second *statement*, not a second redactor — every value it
+binds comes from `audit_row`. What it does keep is its own column list, which is the one place the
+two could drift. `recon.logging.AUDIT_WRITERS` enumerates the writers, and
+`tests/privacy/test_sinks.py` compares that enumeration against the `INSERT INTO audit_log` sites
+it finds in the source, so a writer cannot be added, and cannot change status, without the
+enumeration changing with it. The honest statement is: *every field of every `audit_log` row this
+package writes is bound through `recon.logging.audit_row`.*
 
 **The HTTP response body is a sink too, and it is not on the list above because it is not a log.**
 FastAPI's default `RequestValidationError` handler serialises pydantic's `input` member — for a
@@ -418,8 +432,11 @@ A token is `[pii:<kind>:<digest>:<shape>]`.
   `canonical_id`, `crm_id`, `payment_id`). Contract §1.3 pins `student.id` as a `uuid5` of a
   generator sequence index, never derived from identity fields, so they describe no person — and
   a log that can name no record cannot be debugged.
-* **Two `audit_log` writers are outside the chokepoint** (`recon/budget.py`,
-  `recon/api/internal.py`) and bind `actor`, `action` and `subject` unredacted. See §4.0.
+* **A second `INSERT INTO audit_log` statement exists** — `run_purge`'s, in `recon/privacy.py`.
+  Every value it binds comes from `recon.logging.audit_row`, so it writes nothing unredacted; what
+  it duplicates is the column list, and only `tests/privacy/test_sinks.py` keeps the two from
+  drifting apart. `recon/budget.py` (`_audit`) and `recon/api/internal.py` (`claim_run`) route
+  through `insert_audit_row` and issue no statement of their own. See §4.0.
 * **Four `print` sites are outside the console chokepoint** (`recon/budget.py`,
   `recon/bench/__main__.py`, `recon/seed/run.py`, `recon/seed/__main__.py`). None of them writes a
   source record today; nothing enforces that beyond the declaration in

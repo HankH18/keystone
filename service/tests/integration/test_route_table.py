@@ -97,6 +97,7 @@ ALSO_EXPECTED: dict[tuple[str, str], str] = {
     # reversal a reviewer cannot invoke is neither. Classified here rather than in
     # DESIGN_ENDPOINTS because DESIGN's own list does not name it.
     ("POST", "/api/proposals/{proposal_id}/rollback"): "R24 -- the reversal leg, over HTTP",
+    ("GET", "/api/audit"): "Core #6 -- the action log, admin scope, redacted (recon.api.audit)",
 }
 
 

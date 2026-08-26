@@ -1,7 +1,7 @@
 /**
  * A ~100-line History-API router.
  *
- * Deliberately not a dependency: the dashboard has five routes and needs
+ * Deliberately not a dependency: the dashboard has six routes and needs
  * exactly three things from a router — a pathname, path params, and a query
  * string that survives a reload so filters and page numbers are shareable.
  * A router library would add bundle and API surface without adding any of that.
@@ -36,6 +36,7 @@ export type RouteName =
   | 'conflict-detail'
   | 'proposals'
   | 'proposal-detail'
+  | 'audit'
   | 'not-found'
 
 interface LocationState {
@@ -55,6 +56,7 @@ export function matchRoute(pathname: string): RouteMatch {
   if (path === '/' || path === '/overview') return { name: 'overview', params: {} }
   if (path === '/conflicts') return { name: 'conflicts', params: {} }
   if (path === '/proposals') return { name: 'proposals', params: {} }
+  if (path === '/audit') return { name: 'audit', params: {} }
   const conflict = /^\/conflicts\/([^/]+)$/.exec(path)
   if (conflict) {
     return { name: 'conflict-detail', params: { id: decodeURIComponent(conflict[1]) } }

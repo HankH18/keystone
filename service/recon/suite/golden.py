@@ -16,6 +16,17 @@ because they can fail separately: a detector can be exact on the golden set and
 still smear a conflict's ref list across a neighbour, and the intersection probe
 is the only thing that sees it.
 
+All three refuse to grade nothing
+-----------------------------------
+Each row carries an explicit non-empty floor, because each row's pass predicate
+is satisfied by an empty comparison: ``GoldenDiff.passed`` is *no FN and no FP
+and no mismatch*, ``CleanSampleResult.passed`` is *nothing flagged*, and
+``join-check``'s is *nothing mismatched*. Zero of zero satisfies all three. A
+mis-pathed ``KEYSTONE_GOLDEN_DIR``, a truncated ``golden/`` tree or a deploy that
+shipped without one would otherwise print three green rows over a comparison that
+never happened -- and ``golden-diff`` is the row the whole grading contract hangs
+on, so it is the last one that may be allowed to pass vacuously.
+
 ``join-check`` goes through HTTP on purpose
 --------------------------------------------
 It fetches each of the 25 ``golden/expected-views.json`` entries from
@@ -81,6 +92,21 @@ def check_golden_diff() -> CheckResult:
         f"field-mismatches={len(diff.mismatches)} matched={diff.matched}/{diff.golden_total} "
         f"golden/detected per type [{per_type}] dir={golden_dir()}"
     )
+    # The non-empty floor its two siblings already have, and for the same reason.
+    # `GoldenDiff.passed` is `not (FN or FP or mismatches)`, so an EMPTY golden set
+    # diffed against an empty detection satisfies it perfectly -- a mis-pathed
+    # `KEYSTONE_GOLDEN_DIR`, a truncated `golden/conflicts.json` or a deploy that
+    # shipped without the golden tree would print `PASS ... matched=0/0` on the one
+    # row the whole grading contract hangs on. 0 of 0 is not exactness; it is an
+    # unasked question.
+    if not diff.golden_total:
+        return CheckResult.failed(
+            GOLDEN_DIFF,
+            f"{head} | 0 of 0 golden entries matched is not evidence of anything: "
+            "FN, FP and field-mismatch are all vacuously zero over an empty "
+            f"comparison. {golden_dir() / 'conflicts.json'} is empty or was not "
+            "read; regenerate the golden tree, or point KEYSTONE_GOLDEN_DIR at it",
+        )
     if diff.passed:
         return CheckResult.passed(GOLDEN_DIFF, head)
 

@@ -1896,11 +1896,29 @@ def assert_sources_are_unwritable() -> tuple[str, ...]:
       already enforces on the ingest side.
 
     **``WRITE_NAME_TOKENS`` is a substring list, not a decision procedure**, and
-    this function is exactly as exhaustive as that list is. An adapter with
-    ``def persist(...)``, ``def commit(...)``, ``def flush(...)`` or
-    ``def sync(...)`` carries no listed token and passes here. What makes "never
-    to sources" more than this check is that the port has no write member at all
-    (:class:`recon.adapters.base.ReadOnlyAdapter`) and that
+    this function is exactly as exhaustive as that list is. It now covers the
+    ordinary names for the operation the port forbids -- ``write``, ``insert``,
+    ``update``, ``delete``, ``save``, ``put``, ``patch``, ``post``, ``upsert``,
+    ``truncate``, ``execute``, ``persist``, ``commit``, ``flush``, ``sync``,
+    ``emit``, and ``land``, this codebase's own word for the write -- so an
+    adapter with ``def persist(...)``, ``def commit(...)``, ``def flush(...)``,
+    ``def sync(...)`` or ``def emit(...)`` is caught here rather than passing.
+    ``tests/ingest/test_write_token_widening.py`` builds a connector for each of
+    those verbs and requires this sweep to refuse it, so the coverage is a
+    property of the list rather than a claim about it.
+
+    **What remains uncovered is any write verb not on that list**, and there is no
+    procedure that decides the general case: a source could write through
+    ``def store(...)``, ``def apply(...)``, or a name from a vendor SDK's own
+    vocabulary and carry no listed token. Widening is also bounded by the
+    codebase's read-side vocabulary -- ``emit`` could only be listed once
+    ``recon.adapters.faults.FaultInjectingAdapter``'s read-side counter was
+    renamed from ``emitted`` to ``records_handed_over``, because the match is on
+    substrings. When that collision recurs, rename the read-side attribute; do not
+    drop the token.
+
+    What makes "never to sources" more than this check is that the port has no
+    write member at all (:class:`recon.adapters.base.ReadOnlyAdapter`) and that
     :func:`source_tree_digest` measures the bytes across a real committed apply;
     this one is the cheap structural arm of three, not the guarantee.
 

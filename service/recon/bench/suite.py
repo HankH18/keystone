@@ -9,14 +9,50 @@ Every one of them returns a :class:`~recon.suite.checks.CheckResult`, so a misse
 threshold is a red row and a non-zero exit, not a number in a paragraph. A
 benchmark that only reports is a benchmark nobody notices regressing.
 
+Two rows are named for what they measure, not for the SPEC line
+-----------------------------------------------------------------
+``bench:detect-persist-reconcile`` and ``bench:dashboard-api-p95`` used to be
+called ``bench:invariant-pass`` and ``bench:dashboard-load-p95``. Both names
+claimed more than the clock underneath them covers, and a benchmark row whose
+name overstates its scope is worse than a missing row: it is read as evidence for
+the thing it does not measure.
+
+* **``bench:detect-persist-reconcile``** times detection + persistence +
+  proposal generation. It does **not** time materialization, and materialization
+  is not a rounding error -- so the row **re-measures it in the same run** that
+  prints it (:func:`measure_materialize_floor`) and reports the number it just
+  took. It used to render a module constant, ``MATERIALIZE_SECONDS_MEASURED =
+  31.24``, into every scorecard as "31.24s measured on this dataset", which is a
+  measurement claim about a run in which no measurement happened; re-measured, it
+  was also wrong (see :func:`measure_materialize_floor`). Bringing materialization
+  inside the clock is still rejected on the number rather than on convenience --
+  SPEC's end-to-end "full invariant/reconciliation pass over 100k records" does
+  not fit 30s once the identity layer is built inside it -- but the number that
+  says so is now taken in front of the reader. The exclusion is stated in the
+  row's own detail string, where a reader of the scorecard sees it, rather than
+  in a footnote about the harness.
+* **``bench:dashboard-api-p95``** times the Overview route's fifteen *server*
+  calls. See "What the dashboard number is" below.
+
 Where the numbers come from
 ----------------------------
 Four of the six read measurements the suite has already taken, because taking
 them twice would be slower *and* would let two rows describe two different runs:
-``invariant-pass`` and ``conflict-accuracy`` read
+``detect-persist-reconcile`` and ``conflict-accuracy`` read
 :func:`recon.suite.pipeline.pipeline`, ``spend-cap`` reads the one cached burst
 (:func:`recon.suite.burst.burst_outcome`). The two latency benchmarks and the
-ingestion benchmark do their own measuring, here.
+ingestion benchmark do their own measuring, here. Every number a row prints as
+"measured" is measured somewhere in the same process, on the same dataset, in the
+same run -- there is no constant in this module that a detail string describes as
+a measurement.
+
+Every one of the six can be made to FAIL
+-----------------------------------------
+``tests/suite/test_bench_gates.py`` drives each gate twice against an injected
+measurement -- one sample over its threshold, one under -- because a gate nothing
+has ever pushed past its threshold is a gate whose red branch is unproven. The
+measurement is injected; the decision (the p95 arithmetic, the ``>=`` comparison,
+the exactness predicates) is the real code path.
 
 Percentiles
 ------------
@@ -29,7 +65,7 @@ including it would measure the process, not the query.
 
 What the dashboard number is, and what it is not
 --------------------------------------------------
-``dashboard-load`` replays the **server side of the Overview route** -- the one
+``dashboard-api-p95`` replays the **server side of the Overview route** -- the one
 ``GET /api/scorecard`` plus the fourteen ``GET /api/conflicts?type=..&page_size=1``
 count queries that ``dashboard/src/routes/Overview.tsx`` issues -- through an
 in-process ``TestClient``, and asserts the p95 of their combined wall time.
@@ -39,10 +75,10 @@ and JSON serialisation, against the 100k dataset. It does **not** cover: network
 latency, TLS, uvicorn/worker scheduling, HTTP/2 multiplexing or the browser's own
 request concurrency, JS bundle download and parse, React render, or paint. It is
 a **service-side floor on a browser page load, not a browser page load** -- an
-in-process TestClient number is not a browser number, and this row says so rather
-than letting the threshold imply otherwise. The a11y/Playwright suite in
-``dashboard/`` is where a real browser drives the page; wiring a k6 or Playwright
-timing into this scorecard is future work and is listed as a gap in
+in-process TestClient number is not a browser number, so the row is named for the
+API it measures rather than for the page load it does not. The a11y/Playwright
+suite in ``dashboard/`` is where a real browser drives the page; wiring a k6 or
+Playwright timing into this scorecard is future work and is listed as a gap in
 ``docs/scorecard.txt``.
 """
 
@@ -60,6 +96,7 @@ from recon.db import get_engine
 from recon.ingest import expected_counts_from_manifest, ingest_generation
 from recon.invariants.grading import grade_clean_sample, grade_run
 from recon.logging import get_logger
+from recon.resolve import MaterializeReport, materialize
 from recon.suite.burst import burst_outcome
 from recon.suite.checks import CheckResult
 from recon.suite.golden import expected_views
@@ -69,17 +106,18 @@ from recon.suite.probe import admin_headers, probe_client
 __all__ = [
     "BENCHMARKS",
     "CONFLICT_TYPES",
-    "DASHBOARD_LOAD_P95_SECONDS",
+    "DASHBOARD_API_P95_SECONDS",
+    "DETECT_RECONCILE_SECONDS",
     "INGEST_MIN_RPS",
-    "INVARIANT_PASS_SECONDS",
     "LATENCY_RUNS",
     "QUERY_P95_SECONDS",
     "check_conflict_accuracy",
     "check_cross_source_query",
-    "check_dashboard_load",
+    "check_dashboard_api",
+    "check_detect_persist_reconcile",
     "check_ingestion",
-    "check_invariant_pass",
     "check_spend_cap",
+    "measure_materialize_floor",
     "percentile",
 ]
 
@@ -87,8 +125,8 @@ log = get_logger("recon.bench.suite")
 
 #: SPEC thresholds. Named, not inlined, so the row and the assertion cannot drift.
 QUERY_P95_SECONDS = 1.0
-DASHBOARD_LOAD_P95_SECONDS = 1.0
-INVARIANT_PASS_SECONDS = 30.0
+DASHBOARD_API_P95_SECONDS = 1.0
+DETECT_RECONCILE_SECONDS = 30.0
 INGEST_MIN_RPS = 500.0
 
 #: SPEC pins "20 runs" for the latency benchmarks. One extra is run first and
@@ -100,11 +138,15 @@ LATENCY_RUNS = 20
 CONFLICT_TYPES = tuple(f"C{index}" for index in range(1, 15))
 
 CROSS_SOURCE_QUERY = "bench:cross-source-query-p95"
-INVARIANT_PASS = "bench:invariant-pass"
+#: Named for its three stages, NOT for SPEC's "full invariant/reconciliation
+#: pass": materialization is outside this clock, and how far outside is measured
+#: by :func:`measure_materialize_floor` in the run that prints the row.
+DETECT_PERSIST_RECONCILE = "bench:detect-persist-reconcile"
 INGESTION = "bench:ingestion-rps"
 CONFLICT_ACCURACY = "bench:conflict-accuracy"
 SPEND_CAP = "bench:spend-cap-exact"
-DASHBOARD_LOAD = "bench:dashboard-load-p95"
+#: Named for the API floor it measures, NOT for the browser page load it does not.
+DASHBOARD_API = "bench:dashboard-api-p95"
 
 #: The landing + staging surface the ingestion benchmark empties **inside its own
 #: transaction** and restores by rolling back.
@@ -173,22 +215,108 @@ def check_cross_source_query() -> CheckResult:
 
 
 # ======================================================================================
-# 2. full invariant / reconciliation pass
+# 2. detection + persistence + reconciliation (NOT materialization)
 # ======================================================================================
-def check_invariant_pass() -> CheckResult:
-    """Detection + persistence + proposal generation, under 30s on 100k."""
+def measure_materialize_floor() -> tuple[float, MaterializeReport]:
+    """Time the identity-layer cascade against **this** database, in **this** run.
+
+    Returns ``(seconds, report)`` for one real :func:`recon.resolve.materialize`
+    call with ``persist=False``: it loads the staging snapshots, runs SS4's
+    cascade over the current generation, resolves the lineage generations behind
+    it, and builds every ``entities`` / ``entity_links`` /
+    ``entity_link_candidates`` / ``field_lineage`` row -- and then writes none of
+    them.
+
+    Why this call and not the persisting one
+    -----------------------------------------
+    Because the persisting one **cannot** be re-run here. The identity layer is
+    append-only to ``recon_writer`` (migration 0004), so ``materialize()`` against
+    a database that already holds generation 3 raises rather than re-timing, and
+    the only way to make it runnable would be to destroy the layer the suite's
+    other nine rows stand on. ``persist=False`` is the largest slice of the same
+    work that is safe against a loaded graded database: no ``COPY``, no
+    ``COMMIT``, no privilege beyond the read the pipeline already takes, and
+    nothing for ``mirror-unchanged`` to see.
+
+    So the number is a **floor**, and the row prints it as one. It excludes the
+    ``COPY`` of ~1.9M rows and the ``COMMIT`` where the deferred KS008/KS009
+    provenance triggers run, which is the expensive half.
+
+    What replaced what, and why the constant had to go
+    ---------------------------------------------------
+    This function replaces ``MATERIALIZE_SECONDS_MEASURED = 31.24``, a module
+    constant that every scorecard rendered as "31.24s measured on this dataset,
+    over the 30s budget BY ITSELF". Nothing re-measured it, so each scorecard
+    asserted a measurement that had not happened in that run -- and when it was
+    finally re-measured the strongest half of that claim was simply false.
+
+    The one recorded observation, attributed rather than presented as live: on
+    2026-08-25, on the author's machine (Postgres 16 in Docker, host port 55432),
+    a freshly migrated scratch database was loaded through
+    ``recon.api.internal.sync_job`` -- 360,400 records over 3 generations -- and
+    the **persisting** ``materialize()`` it ran took **27.60s**, commit included,
+    producing 43,375 entities, 120,000 links, 97,980 candidates and 1,712,775
+    lineage rows; ``persist=False`` over the same loaded database took 14.25s and
+    13.90s on two consecutive runs. 27.60s is under the 30s budget, not over it.
+    That single observation is history, on one machine, and it is deliberately not
+    what the row prints: the row prints what it measured itself.
+    """
+    started = time.perf_counter()
+    report = materialize(persist=False)
+    return time.perf_counter() - started, report
+
+
+def check_detect_persist_reconcile() -> CheckResult:
+    """Detection + persistence + proposal generation, under 30s on 100k.
+
+    Deliberately **not** named for SPEC's "full invariant/reconciliation pass".
+    Materialization is outside this clock, and how far outside is re-measured here
+    (:func:`measure_materialize_floor`) rather than quoted from a constant, so the
+    exclusion the row states is backed by a number this run took. The exclusion is
+    carried in the row's own detail string, so a reader of the scorecard cannot
+    take this number for an end-to-end one.
+    """
     run = pipeline()
     total = run.full_pass_seconds
+    materialize_seconds, materialized = measure_materialize_floor()
+    end_to_end = total + materialize_seconds
+
+    # Stated in whichever direction the measurement actually points. A floor that
+    # does not clear the budget establishes nothing, and saying so is the whole
+    # difference between a measurement and a slogan.
+    if end_to_end >= DETECT_RECONCILE_SECONDS:
+        verdict = f"is >={end_to_end:.2f}s and does NOT fit 30s"
+    else:
+        verdict = (
+            f"is >={end_to_end:.2f}s, which this run's floor does NOT put over the "
+            f"{DETECT_RECONCILE_SECONDS:.0f}s budget -- on this run the exclusion is "
+            f"stated, not established by measurement"
+        )
+
     detail = (
         f"{total:.2f}s total = invariants {run.invariants_seconds:.2f}s + persist "
         f"{run.persist_seconds:.2f}s + reconcile {run.reconcile_seconds:.2f}s "
-        f"(threshold <{INVARIANT_PASS_SECONDS:.0f}s); "
+        f"(threshold <{DETECT_RECONCILE_SECONDS:.0f}s); "
         f"{len(run.run_a.conflicts)} conflicts over "
-        f"{sum(run.precondition.landing.values())} landed records"
+        f"{sum(run.precondition.landing.values())} landed records. "
+        f"EXCLUDES MATERIALIZATION -- recon.resolve.materialize was re-run and timed "
+        f"IN THIS RUN at {materialize_seconds:.2f}s (persist=False: resolved generation "
+        f"{materialized.generation}, built {materialized.entities} entities / "
+        f"{materialized.links} links / {materialized.lineage} lineage rows over "
+        f"generations {list(materialized.lineage_generations)}, wrote none of them). "
+        f"That is a FLOOR on the real cost: it excludes the COPY of those rows and the "
+        f"COMMIT where the deferred KS008/KS009 provenance triggers run, and the "
+        f"persisting variant cannot be re-timed against a loaded database because the "
+        f"identity layer is append-only to recon_writer (migration 0004). So SPEC's "
+        f"end-to-end 'full invariant/reconciliation pass' (materialize + these three "
+        f"stages) {verdict}; the identity layer is a precondition of the graded pass "
+        f"(POST /internal/sync), not a stage of it"
     )
-    if total >= INVARIANT_PASS_SECONDS:
-        return CheckResult.failed(INVARIANT_PASS, f"pass took {total:.2f}s | {detail}")
-    return CheckResult.passed(INVARIANT_PASS, detail)
+    if total >= DETECT_RECONCILE_SECONDS:
+        return CheckResult.failed(
+            DETECT_PERSIST_RECONCILE, f"the three stages took {total:.2f}s | {detail}"
+        )
+    return CheckResult.passed(DETECT_PERSIST_RECONCILE, detail)
 
 
 # ======================================================================================
@@ -336,10 +464,15 @@ def check_spend_cap() -> CheckResult:
 
 
 # ======================================================================================
-# 6. dashboard load p95 (service side)
+# 6. dashboard API p95 (service side floor on the Overview route)
 # ======================================================================================
-def check_dashboard_load() -> CheckResult:
-    """The Overview route's fifteen server calls, p95 under 1s. Service side only."""
+def check_dashboard_api() -> CheckResult:
+    """The Overview route's fifteen server calls, p95 under 1s. Service side only.
+
+    Named ``bench:dashboard-api-p95`` and not ``bench:dashboard-load-p95``: an
+    in-process ASGI number is a floor on a page load, never a page load, and the
+    row name has to say which one it is. See the module docstring.
+    """
     run = pipeline()
     headers = admin_headers()
     samples: list[float] = []
@@ -366,33 +499,33 @@ def check_dashboard_load() -> CheckResult:
             ]
             if bad:
                 return CheckResult.failed(
-                    DASHBOARD_LOAD, f"the overview route's calls did not all answer 200: {bad[:3]}"
+                    DASHBOARD_API, f"the overview route's calls did not all answer 200: {bad[:3]}"
                 )
             if index:
                 samples.append(elapsed)
 
     p95 = percentile(samples, 0.95)
     detail = (
-        f"{_latency_summary(samples)} threshold<{DASHBOARD_LOAD_P95_SECONDS:.0f}s; "
-        f"{calls_per_iteration} server calls per load (GET /api/scorecard + "
+        f"{_latency_summary(samples)} threshold<{DASHBOARD_API_P95_SECONDS:.0f}s; "
+        f"{calls_per_iteration} server calls per Overview load (GET /api/scorecard + "
         f"{len(CONFLICT_TYPES)} x GET /api/conflicts?type=..&page_size=1), "
         f"{run.precondition.entities} entities / {len(run.proposals)} proposals; "
         "SERVICE SIDE ONLY -- in-process ASGI, no network, no TLS, no browser, "
         "no JS parse and no render; this is a floor on a page load, not a page load"
     )
-    if p95 >= DASHBOARD_LOAD_P95_SECONDS:
+    if p95 >= DASHBOARD_API_P95_SECONDS:
         return CheckResult.failed(
-            DASHBOARD_LOAD, f"p95 {p95 * 1000:.1f}ms exceeds the 1s budget | {detail}"
+            DASHBOARD_API, f"p95 {p95 * 1000:.1f}ms exceeds the 1s budget | {detail}"
         )
-    return CheckResult.passed(DASHBOARD_LOAD, detail)
+    return CheckResult.passed(DASHBOARD_API, detail)
 
 
 #: Registered in SPEC's order.
 BENCHMARKS = {
     CROSS_SOURCE_QUERY: check_cross_source_query,
-    INVARIANT_PASS: check_invariant_pass,
+    DETECT_PERSIST_RECONCILE: check_detect_persist_reconcile,
     INGESTION: check_ingestion,
     CONFLICT_ACCURACY: check_conflict_accuracy,
     SPEND_CAP: check_spend_cap,
-    DASHBOARD_LOAD: check_dashboard_load,
+    DASHBOARD_API: check_dashboard_api,
 }

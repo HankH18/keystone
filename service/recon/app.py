@@ -9,9 +9,11 @@ owns both its behaviour and its HTTP surface: `/health` lives in `recon.health`
 and R20's per-row scope filter) and `/api/conflicts*` + `/api/proposals*` live
 in `recon.api.review` (R11's reviewer surface and R24's apply path),
 `/api/scorecard` lives in `recon.api.scorecard` (the latest `python -m
-recon.suite` results, which the dashboard's overview reconciles against) and
+recon.suite` results, which the dashboard's overview reconciles against),
 `/api/incidents` lives in `recon.api.incidents` (R25's clustered incidents,
-stretch #8).
+stretch #8) and `/api/audit` lives in `recon.api.audit` (R18's action log --
+the surface Core #6's "the log reconciles with the dashboard" is checked on,
+which had no reader at all until it existed).
 
 **A router that is not mounted here does not exist.** Three of them were built,
 tested and left unreachable, because the tests that covered them imported the
@@ -40,6 +42,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from recon import __version__
+from recon.api.audit import router as audit_router
 from recon.api.auth import install_problem_handler
 from recon.api.entities import router as entities_router
 from recon.api.incidents import router as incidents_router
@@ -266,6 +269,14 @@ def create_app() -> FastAPI:
     # a column the row already carries, and it is less than cross-type semantics;
     # both halves are in the docstring, and neither is claimed away here.
     app.include_router(incidents_router)
+    # `GET /api/audit` (R18, Core deliverable #6). Every action was already
+    # logged -- `recon.logging.insert_audit_row` is the chokepoint and
+    # `audit_log` holds the proposal, the confidence, the tokens, the cost and
+    # the reviewer decision -- but #6's acceptance clause is "the log reconciles
+    # with the dashboard", and there was no surface on which to reconcile it: the
+    # rows were reachable from `psql` and nowhere else. Admin scope, redacted on
+    # the way out as well as on the way in (`recon.api.audit`).
+    app.include_router(audit_router)
     # The sync trigger's body: ingest every generation, materialize the canonical
     # layer, then run the committed invariant rule set over it
     # (`recon.api.internal.sync_job`, `SYNC_STAGES`). Bound to *this app*, not to

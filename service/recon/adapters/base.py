@@ -62,6 +62,34 @@ __all__ = [
 #: Substrings that make an attribute name *look like* a write. The structural test
 #: asserts that no adapter class carries one anywhere in its MRO. Committed here so
 #: the port and its test share one list.
+#:
+#: **The list was narrower than the thing it claims to cover.** It carried eleven
+#: entries and missed `persist`, `commit`, `flush` and `sync` -- the ordinary names
+#: for *exactly* the operation the port forbids. An ORM session writes with
+#: `commit`/`flush`, a client library writes with `persist`, and a two-way
+#: connector writes with `sync`, so a connector that wrote back through any of them
+#: satisfied a check named for catching it. All four are listed now, plus `land`,
+#: which is this codebase's own word for the write (`_land_records`), and `emit`,
+#: for a connector that emits a write downstream.
+#:
+#: **`emit` cost a rename to add, and that is worth recording.** The token matches
+#: on substrings, and `recon.adapters.faults.FaultInjectingAdapter` used to carry
+#: `self.emitted` -- a *read*-side counter of records handed over, not a write --
+#: so listing `emit` would have failed the structural test on a legitimate
+#: attribute. The counter is now `records_handed_over`, named for the read it
+#: counts, which is what let the token be listed. `tests/ingest/test_write_token_widening.py`
+#: asserts both halves: that `emit` is on this list, and that no adapter has
+#: re-introduced a read-side name it collides with. Removing either the token or
+#: the rename turns that test red.
+#:
+#: The general shape of the hazard survives the fix: a substring list can only be
+#: widened as far as the codebase's own vocabulary allows, so a read-side name that
+#: happens to contain a write verb blocks a token until it is renamed. Rename the
+#: attribute; do not drop the token.
+#:
+#: A substring list is a heuristic and stays one: it is the cheap structural arm
+#: of three (`recon.apply` names the other two), never the guarantee. What makes
+#: "no writes to sources" true is that the Protocol has no write member at all.
 WRITE_NAME_TOKENS: tuple[str, ...] = (
     "write",
     "insert",
@@ -74,6 +102,11 @@ WRITE_NAME_TOKENS: tuple[str, ...] = (
     "upsert",
     "truncate",
     "execute",
+    "persist",
+    "commit",
+    "flush",
+    "sync",
+    "land",
 )
 
 #: DESIGN.md: "Timeouts bounded at 10s -> structured error". This is the **stall**

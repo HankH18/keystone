@@ -81,7 +81,7 @@ def test_a_slow_drip_that_never_completes_is_stopped_by_the_load_deadline() -> N
     assert excinfo.value.kind == "source_timeout"
     assert "deadline" in excinfo.value.detail
     assert elapsed < 2.0, f"the drip was not bounded: it took {elapsed:.2f}s"
-    assert adapter.emitted > 0, "the drip really was producing records the whole time"
+    assert adapter.records_handed_over > 0, "the drip really was producing records the whole time"
 
 
 def test_a_midstream_exception_keeps_what_arrived_and_is_never_a_500() -> None:

@@ -424,6 +424,7 @@ ENTRY_POINTS: Final[tuple[str, ...]] = (
     "recon/suite/__main__.py",  # `python -m recon.suite`
     "recon/bench/__main__.py",  # `python -m recon.bench`
     "recon/invariants/__main__.py",  # `python -m recon.invariants`
+    "recon/privacy.py",  # `python -m recon.privacy` -- the retention sweep (R26)
     "migrations/env.py",  # alembic
 )
 
@@ -644,32 +645,19 @@ AUDIT_WRITERS: Final[tuple[AuditWriter, ...]] = (
         routed=True,
         note="run_purge()'s own row: parameters come from audit_row().",
     ),
-    AuditWriter(
-        module="recon/budget.py",
-        routed=False,
-        note=(
-            "_audit() binds actor/action/subject raw and redacts only `detail` via "
-            "audit_detail(). Required change: replace the _INSERT_AUDIT execute with "
-            "recon.logging.insert_audit_row(conn, actor=AUDIT_ACTOR, action=action, "
-            "subject=subject, body=body, tokens_in=..., tokens_out=..., "
-            "cost_microusd=...) and delete _INSERT_AUDIT and _detail_json. Owned by "
-            "another ticket (recon/budget.py is out of this ticket's scope)."
-        ),
-    ),
-    AuditWriter(
-        module="recon/api/internal.py",
-        routed=False,
-        note=(
-            "claim_run() binds actor/action/subject raw and redacts only `detail`. "
-            "Required change: replace the _CLAIM_INSERT execute with "
-            "recon.logging.insert_audit_row(conn, actor=AUDIT_ACTOR, "
-            "action=action, subject=run_id, body={'job': job, 'run_id': run_id}); "
-            "keep _CLAIM_LOCK and _CLAIM_LOOKUP as they are. NOTE the lookup "
-            "compares `subject` against a raw run_id, so it must compare against "
-            "redact(run_id, key='subject') once the insert is routed, or a replay "
-            "stops being detected. Owned by another ticket."
-        ),
-    ),
+    # `recon/budget.py` and `recon/api/internal.py` were declared here as the two
+    # writers OUTSIDE the chokepoint, each carrying the change it needed. Both
+    # changes have since been made — `_audit()` and `claim_run()` now go through
+    # `insert_audit_row()` — so neither module contains an `INSERT INTO audit_log`
+    # any more.
+    #
+    # They are DELETED rather than flipped to `routed=True`, and the distinction
+    # matters: `test_every_audit_log_writer_is_enumerated` compares this tuple
+    # against the modules that literally contain an INSERT site, and asserts
+    # `found == declared`. A `routed=True` entry for a module with no INSERT is
+    # still a declared writer that was not found, so it fails just as loudly as an
+    # undeclared one. The registry names INSERT SITES; it is not a history of
+    # which modules used to have one.
 )
 
 

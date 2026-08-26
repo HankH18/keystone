@@ -16,8 +16,11 @@ form           example                         resolved through
 `person_key`   `1bac7603-...-3feab69810f2`     the `entities` primary key
 `source_ref`   `crm:contact:CRM-0015743`       `entity_links (generation, source_ref)`
 `natural_key`  `CRM-0015743`, `pi_0015202`     the same index, all five ref classes
-`email`        `guardian@example.test`         `stg_crm_contact.email_norm` and the
-                                               `stg_student` guardian addresses
+`email`        `guardian@example.test`         `stg_crm_contact.email_norm`, the
+                                               `stg_student` guardian addresses,
+                                               and `stg_payment.email_norm` --
+                                               all three sources, see
+                                               `_IDS_BY_EMAIL`
 =============  ==============================  =====================================
 
 `canonical_id` and `person_key` are the same value (contract SS4.1), so the UUID
@@ -160,6 +163,27 @@ _IDS_BY_REF = text(
     """
 )
 
+#: Every staging table that holds a normalized address, joined back to the person
+#: through the ref class its rows belong to.
+#:
+#: **Three arms, and the third one is the point.** This read the CRM contact and
+#: the two app-DB guardian addresses and stopped, so the one source that is
+#: definitionally about paying was not searched: a payer with no CRM contact and
+#: no student row -- the generator plants 200 of them per generation, each a
+#: person whose only ref is its own `payments:payment:` ref (SS4.1,
+#: `recon.er`) -- answered **404** to their own address. That is not a missing
+#: feature but a wrong answer: 404 here means "no such person", and the person
+#: exists, is linked, and has a canonical row, so a reviewer holding the address
+#: off the receipt concludes the payment belongs to nobody. It is also the exact
+#: question the brief asks ("did they pay?") asked with the identifier a payment
+#: actually carries.
+#:
+#: Every arm is an index read: `ix_stg_crm_contact_email`, `ix_stg_student_email`
+#: / `ix_stg_student_guardian2` and -- since migration 0001, long before it was
+#: used -- `ix_stg_payment_email` on `(generation, email_norm)`.
+#:
+#: `UNION` rather than `UNION ALL`: one address can reach one person through two
+#: sources, and the caller counts rows to decide between an answer and a 409.
 _IDS_BY_EMAIL = text(
     """
     SELECT DISTINCT el.canonical_id::text AS canonical_id
@@ -177,6 +201,14 @@ _IDS_BY_EMAIL = text(
        AND el.source_ref = 'appdb:student:' || s.student_id
      WHERE s.generation = :generation
        AND (s.email_norm = :email OR s.guardian2_email_norm = :email)
+     UNION
+    SELECT DISTINCT el.canonical_id::text AS canonical_id
+      FROM stg_payment p
+      JOIN entity_links el
+        ON el.generation = p.generation
+       AND el.source_ref = 'payments:payment:' || p.payment_id
+     WHERE p.generation = :generation
+       AND p.email_norm = :email
     """
 )
 

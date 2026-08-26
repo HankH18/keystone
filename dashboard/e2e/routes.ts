@@ -41,6 +41,7 @@ export async function discoverRoutes(page: Page): Promise<RouteUnderTest[]> {
     { name: 'proposals list', path: '/proposals' },
     { name: 'proposals list, filtered', path: '/proposals?status=sensitive_hold' },
     { name: 'proposal detail', path: proposalHref },
+    { name: 'audit log', path: '/audit' },
     { name: 'not found', path: '/no-such-page' },
   ]
 }

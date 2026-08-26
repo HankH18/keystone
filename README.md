@@ -41,25 +41,66 @@ AI tooling disclosure: **[AI_USAGE.md](AI_USAGE.md)**.
 
 - **Dashboard:** <https://keystone-dashboard-2rot.onrender.com>
 - **Service:** <https://keystone-service-bxs8.onrender.com> — `/health`, `/docs`, and the client API
-- **Demo key:** send `X-Api-Key: keystone-demo-admin-8c25e0b71a94f36d` (the dashboard already does)
+- **Demo key:** send `X-Api-Key: keystone-demo-admin-8c25e0b71a94f36d` — committed on purpose and
+  documented in [`.env.example`](.env.example); the dashboard already sends it
 
 Render appends a suffix when a service name is taken globally, which is why the hosts carry
 `-2rot` / `-bxs8` rather than the bare names the blueprint asks for.
 
-> **The deployed instance carries the `dev` dataset, not the graded one.** Neon's free tier caps a
-> project at 512 MB and the graded `--profile full` dataset needs ~1 GB in Postgres, so the first
-> deployed sync died mid-`COPY`. The deployed build therefore seeds `--profile dev`: the same code
-> path and seed semantics, all 14 conflict classes present at scaled-down minimums — **161 conflicts
-> → 161 proposals (139 pending, 22 `sensitive_hold`, 25 escalated for oscillation)**.
-> Everything graded — `golden/`, `docs/scorecard.txt`'s 16/16, and every benchmark — is measured on
-> `--profile full` locally, as the scorecard's own scope note records.
+**The deployed instance carries the graded dataset.** It runs `--profile full`: 360,400 landed
+records across 3 generations, 43,375 entities, 120,000 `entity_links`, 1,279,575 `field_lineage`
+rows, 3,050 conflicts, 3,050 proposals (2,670 `pending` + 380 `sensitive_hold`). All 14 conflict
+types sit at exactly their golden counts on the deployed database — C1 500, C2 200, C3 300, C4 250,
+C5 400, C6 500, C7 300, C8 150, C9 100, C10 50, C11 50, C12 100, C13 100, C14 50. Neon's free-tier
+512 MB cap is what forced the old `dev` fallback; that cap is gone — the project's branch limit is
+now 16 TB — which is why the graded dataset now fits.
 
 The blueprint is committed at [`infra/render.yaml`](infra/render.yaml): a Python web service, a
 static dashboard, and three cron jobs. Two of them — sync and reconcile — trigger over HTTPS with a
 per-job shared-secret header; the third, the budget sweeper, runs `python -m recon.budget sweep`
 directly as the ops principal and carries no trigger secret. The database is **Neon**, named
-explicitly — the blueprint declares no Render Postgres. Migrations run as `preDeployCommand`. Until
-The local quick start below reproduces the graded full-profile dataset.
+explicitly — the blueprint declares no Render Postgres. Migrations run as `preDeployCommand`.
+
+**Both trigger crons were dead until they were fixed.** `fromService … property: host` returns the
+service *name*, not the FQDN. The dashboard build was fixed for that in `f3a67e3`; the same
+substitution was never fixed in the two crons, so every hourly run since the blueprint was applied
+died on `curl: (7) Failed to connect to keystone-service-bxs8 port 443`, and `lastSuccessfulRunAt`
+was empty on both `keystone-sync` and `keystone-reconcile` — the deployment had never once run
+itself. Both crons now normalise either form with the same `case` the dashboard build uses, and echo
+the URL they are about to POST so the next failure is legible in the log. `--max-time` went from
+300 s to 1800 (sync) and 900 (reconcile); 300 could not have completed an honest full-profile sync
+even after the host was fixed. `keystone-reconcile` has since succeeded unattended at
+2026-08-26T04:23:25Z and written all 3,050 proposals — proposal detail pages on the deployed
+dashboard show `Created on run: reconcile-20260826T042010Z`, which is that cron's own run id.
+
+**The one-time canonical build does not fit the 512 MB Render starter web plan.** Ingest is fine —
+all 9 source-generations landed cleanly in ~75 s with 0 rejected — but building 43,375 entities and
+1,279,575 `field_lineage` rows OOM-killed the web dyno (the service log shows uvicorn restarting
+mid-request). Run that build instead as a one-off Render job on a 4 GB plan, where it completed in
+39.5 s:
+
+```bash
+# The service id is positional, not a flag. `plan-srv-010` is the 4 GB job plan.
+# The job inherits the web service's environment, so the role password is already
+# there — but DATABASE_URL is composed in the service's startCommand rather than
+# stored, so a one-off job has to compose it too.
+render jobs create srv-da6iotou01pc7388s8qg --plan-id plan-srv-010 --start-command \
+  'DATABASE_URL="postgresql://recon_writer@$KEYSTONE_DB_HOST:$KEYSTONE_DB_PORT/$KEYSTONE_DB_NAME?sslmode=require" \
+   PGPASSWORD="$RECON_WRITER_PASSWORD" \
+   uv run python -c "import json; from recon.api.internal import sync_job; print(json.dumps(sync_job(\"sync-bootstrap\"), default=str)[:3000])"'
+```
+
+`sync_job` is used rather than `materialize` directly because it is the same
+handler `POST /internal/sync` runs: it skips the generations already landed,
+builds the canonical layer, and then runs the invariant stage — so one job leaves
+the database in exactly the state a completed sync leaves it in.
+
+An operator pays that **once**, for the first sync after a fresh database. Every later sync takes the
+`already_current` path and re-runs detection in Postgres, which is cheap — a full `POST
+/internal/sync` on the deployed service re-detected all 3,050 conflicts and advanced `last_seen_run`,
+with `first_seen_run` preserved and no duplicates. The hourly crons handle everything after that.
+
+The local quick start below reproduces the same full-profile dataset.
 
 ---
 
@@ -165,7 +206,7 @@ outright with `DiskFull` at 95% used. So treat ~1 minute as the floor rather tha
 the per-stage clock the response body prints instead of trusting either figure.
 
 It is a one-time load, not a per-run cost — the detect-and-reconcile pass over those same 360,400
-records is measured at **22.94 s** in `bench:invariant-pass` (invariants 12.94 s + persist 2.72 s +
+records is measured at **22.94 s** in `bench:detect-persist-reconcile` (invariants 12.94 s + persist 2.72 s +
 reconcile 7.29 s).
 
 `make sync` and `make reconcile` are both idempotent per run id, and the claim is keyed on the job as
@@ -449,11 +490,11 @@ the only way to refresh it.
 | `manifest` | **47 / 47** generator self-checks green; Appendix A.4 conflict minimums **14 / 14**; A.5 compound ratio 0.2295. |
 | `spend-cap-burst` | 120 contenders → **6 granted, 114 refused** (`KS006`); reserved-while-open 81,600 µUSD == cap; **0 ledger violations**; 124 `cap_hit` audit rows, 124 alerts; 10 retries, 0 granted. |
 | `bench:cross-source-query-p95` | p50 5.6 ms, **p95 6.3 ms** (threshold < 1 s), n=20. |
-| `bench:invariant-pass` | **22.94 s** total over 360,400 records (threshold < 30 s). |
+| `bench:detect-persist-reconcile` | **22.94 s** total over 360,400 records (threshold < 30 s). |
 | `bench:ingestion-rps` | **13,961 rec/s** sustained over 240,200 records (threshold ≥ 500). |
 | `bench:conflict-accuracy` | **precision 1.000000, recall 1.000000** on 3,050 golden entries (threshold: EXACT). |
 | `bench:spend-cap-exact` | 6/6 of 120 granted, settled spend == 1,797 × 6, over-admitted **False** (threshold: EXACT). |
-| `bench:dashboard-load-p95` | **p95 75.2 ms** (threshold < 1 s) — **service-side only**: in-process ASGI, no network, no browser. A floor on a page load, not a page load. |
+| `bench:dashboard-api-p95` | **p95 75.2 ms** (threshold < 1 s) — **service-side only**: in-process ASGI, no network, no browser. A floor on a page load, not a page load. |
 
 **Scope, stated with the numbers.** Every row except `manifest` and `determinism`'s dataset half
 grades the loaded database. **Not covered:** browser-side dashboard timing, a live Anthropic provider
@@ -507,7 +548,7 @@ trio, every `KEYSTONE_*` override) and the `VITE_*` values Vite inlines. `up`, `
 
 ## HTTP API
 
-16 endpoints — count it off `app.openapi()['paths']` on the running service, not off this table.
+17 endpoints — count it off `app.openapi()['paths']` on the running service, not off this table.
 Contract and rationale: [`docs/DESIGN.md`](docs/DESIGN.md); interactive schema at
 `/docs` on the running service.
 
@@ -524,6 +565,7 @@ Contract and rationale: [`docs/DESIGN.md`](docs/DESIGN.md); interactive schema a
 | `POST` | `/api/proposals/{id}/approve`, `/reject`, `/apply`, `/rollback` | `X-Api-Key` (admin scope) |
 | `GET` | `/api/incidents` | `X-Api-Key` (**admin scope**) — R25 clustered incidents (stretch #8) |
 | `GET` | `/api/scorecard` | `X-Api-Key` (**admin scope**) — the latest `make suite` results |
+| `GET` | `/api/audit` | `X-Api-Key` (**admin scope** — `audit_log` has no tenant column, so R20 gates the operation) — the action log, filterable by actor/action/subject, paged, and re-redacted on the way **out** as well as in |
 
 Malformed or oversized payloads are rejected with a structured RFC 7807 4xx that does **not** echo
 the rejected object back — the rejected record is the one thing a validation error must not repeat

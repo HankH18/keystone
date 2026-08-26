@@ -37,14 +37,15 @@ deterministic text **and deterministic usage numbers**, and those numbers go thr
 spend-cap test exercises the real ledger rather than a simulation of one.
 
 Selecting `anthropic` without a key **raises** `ProviderNotConfigured` and does not fall back to
-the mock (`recon/llm.py:462`, `build_provider`). A whitespace-only key is treated as absent. A
+the mock (`recon/llm.py:475`, `build_provider`). A whitespace-only key is treated as absent. A
 deployment that believes it is calling a model while it serves canned text is a worse outcome
 than a visible error.
 
 **But be precise about where that error surfaces.** `build_provider` raises; the reconciler's
-hook *catches* it. `ProviderNotConfigured` subclasses `ProviderNotSent` → `ProviderError`
-(`recon/llm.py:284`, `:254`, `:243`), and `rationale_hook_for` catches `ProviderError` and
-returns `no_rationale` (`recon/reconciler.py:1410-1420`) — deliberately, so a bad key does not
+hook *catches* it. `ProviderNotConfigured` (`recon/llm.py:297`) subclasses
+`ProviderNotSent` (`recon/llm.py:267`), which subclasses `ProviderError` (`recon/llm.py:256`); and
+`rationale_hook_for` (`recon/reconciler.py:1361`) catches `ProviderError` and returns
+`no_rationale` (`recon/reconciler.py:1324`) — deliberately, so a bad key does not
 500 the hourly cron. So an operator who sets `LLM_PROVIDER=anthropic` and fat-fingers the key
 gets **HTTP 200, a completed run, and every proposal `rationale = NULL`** — the only signal is
 the log event `reconciler.rationale_provider_unavailable`. There is no silent *canned text*
@@ -56,15 +57,15 @@ confirm a live provider is actually wired; do not infer it from a green run.
 ```
 POST /internal/reconcile                 recon/api/internal.py
   -> register_job_handler(JOB_RECONCILE, reconcile_job)   recon/app.py  (create_app)
-  -> reconcile_job(run_id)               recon/reconciler.py:1845
+  -> reconcile_job(run_id)               recon/reconciler.py:1895
   -> reconcile(run_id=..., rationale=rationale_hook_for(run_id))
-  -> rationale_hook_for                  recon/reconciler.py:1358
+  -> rationale_hook_for                  recon/reconciler.py:1361
        LLM_PROVIDER=mock       -> returns `no_rationale` ITSELF (no provider built,
                                   no reservation, no prompt rendered)
        LLM_PROVIDER=anthropic  -> returns a hook calling recon.llm.generate_rationale
 ```
 
-`generate_rationale` (`recon/llm.py:671`) does **reserve → call → settle**: it reserves the
+`generate_rationale` (`recon/llm.py:684`) does **reserve → call → settle**: it reserves the
 worst-case cost on both mandated ledger scopes (`daily` and `run:<run_id>`) *before* the request
 leaves the process, then settles the actual cost from provider-reported `usage` afterwards. The
 idempotency key is derived, never random: `reconcile-rationale:<run_id>:<fingerprint>#attempt<n>`,
@@ -117,7 +118,7 @@ If they come back `NULL` under `anthropic`, the key did not build a provider —
   Anthropic first-party **list** pricing ($5 / $25 per 1M).
 - **Money is `Decimal`, never `float`** (`recon/budget.py`, `from decimal import Decimal`). A
   float cent is a rounding error that compounds across a cap.
-- **Rounding is always UP** — `_ceil_microusd` is `math.ceil` (`recon/budget.py:687`). Rounding
+- **Rounding is always UP** — `_ceil_microusd` is `math.ceil` (`recon/budget.py:844`). Rounding
   can therefore only ever over-charge the ledger. A rounded-*down* fraction on every call is a
   slow leak past a cap that is otherwise exact.
 - **An unpriced model is refused, not defaulted to zero.** `cost_microusd` raises
@@ -159,10 +160,11 @@ flowchart LR
 
 Enforced, not merely intended:
 
-1. **By position.** `recon/reconciler.py:1613` calls the hook only *after* `build_packet` has
-   returned — after detection, after `recon.confidence.score`, after `recon.sensitive.classify`
-   and after the skip/dedup decision. The hook is handed a finished packet and its return value
-   is typed `str | None`. Everything else about it is discarded.
+1. **By position.** `reconcile` (`recon/reconciler.py:1519`) calls the hook only *after*
+   `build_packet` (`recon/reconciler.py:1216`) has returned — after detection, after
+   `recon.confidence.score`, after `recon.sensitive.classify` and after the skip/dedup decision.
+   The hook is handed a finished packet and its return value is typed `str | None`. Everything
+   else about it is discarded.
 2. **By the import graph.** `recon/confidence.py` and `recon/sensitive.py` import nothing from
    `recon.llm`, and `tests/reconciler/test_confidence_model.py:392`
    (`test_confidence_does_not_import_the_llm_module`) walks the parsed **AST** of both files and
@@ -174,20 +176,22 @@ Enforced, not merely intended:
 4. **By the write boundary.** `recon/llm.py` issues no data DML at all — its only database effect
    is `reserve`/`settle` on the append-only spend ledger. Model output reaches exactly two
    places: the `rationale` text column of the proposal, and an `outcome` flag on the audit row —
-   the string `rationale_attached` or `rationale_null` (`recon/reconciler.py:1827`), never the
-   text itself. Canonical writes are gated by three Postgres roles enforced by grants and triggers
+   the string `rationale_attached` or `rationale_null`, written by
+   `_proposal_audit_row` (`recon/reconciler.py:1787`), never the text itself.
+   Canonical writes are gated by three Postgres roles enforced by grants and triggers
    (migrations `0002`, `0004`, `0005`): `recon_writer` proposes, `review_writer` is the only role
    that may approve, `apply_writer` applies. No LLM path holds any of them.
 5. **By failure semantics.** *The rationale is a nicety; the proposal is the product.*
    `generate_rationale` is documented and implemented never to raise — a cap hit, provider error,
-   halted scope or internal fault all return `text=None` with a status. `_rationale`
-   (`recon/reconciler.py:1730`) additionally wraps the hook in `try/except`. In every one of those
-   cases the proposal still lands, with `rationale = NULL`. Nothing downstream branches on it:
+   halted scope or internal fault all return `text=None` with a status.
+   `_rationale` (`recon/reconciler.py:1753`) additionally wraps the hook in `try/except`. In every
+   one of those cases the proposal still lands, with `rationale = NULL`. Nothing downstream
+   branches on it:
    the three occurrences of `rationale` in `recon/apply.py` are a dataclass field, a `SELECT`
    column, and the assignment between them. Auto-apply gates on confidence and sensitivity, never
    on whether a model said something.
-6. **By the prompt itself** (`recon/llm.py:209`, frozen — any byte changed invalidates the cache
-   prefix for every call):
+6. **By the prompt itself** — the frozen `SYSTEM_PROMPT` (`recon/llm.py:222`); any byte changed
+   invalidates the cache prefix for every call:
 
    > "You write one short paragraph explaining, to a human reviewer, why two systems disagree
    > about a record and why the proposed fix is the likely correction. You are describing a
@@ -263,9 +267,9 @@ reproduction):
   against looping) and then asserts the value it ended up with. A run started at
   `PYTHONHASHSEED=random` cannot silently complete with a green manifest.
 - **Canonical JSON everywhere.** `json.dumps(obj, sort_keys=True, ensure_ascii=True,
-  separators=(",", ":"))` — `recon/privacy.py:1240`. The same spelling is used for the proposal's
-  `evidence` column *and* for the rationale prompt, so the prompt for a given packet is
-  byte-stable and the reservation's input bound is computed from a stable string.
+  separators=(",", ":"))` — `canonical_json` (`recon/privacy.py:1259`). The same spelling is used
+  for the proposal's `evidence` column *and* for the rationale prompt, so the prompt for a given
+  packet is byte-stable and the reservation's input bound is computed from a stable string.
 - **Pinned seed `20260822`**, in `.env.example`, `infra/render.yaml` and `recon/config.py`.
   Changing it invalidates `golden/`.
 - Measured (`docs/scorecard.txt`, `determinism` row): `dataset 642d160a46bfdf75 ==

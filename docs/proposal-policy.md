@@ -309,8 +309,18 @@ claims. The write targets `entities` and nothing else (`recon.apply.WRITABLE_TAB
   their MRO **or on the instance** (a writer bound in `__init__` appears on no class).
   `recon.apply.assert_sources_are_unwritable()` checks that on the adapter objects and returns their
   class names. **It is exactly as exhaustive as `WRITE_NAME_TOKENS` is, and that is a substring list,
-  not a decision procedure**: an adapter with `def persist(...)`, `def commit(...)`, `def flush(...)`
-  or `def sync(...)` carries no listed token and passes it. It is the cheap structural arm of three
+  not a decision procedure.** The list now covers the ordinary names for the operation the port
+  forbids — `write`, `insert`, `update`, `delete`, `save`, `put`, `patch`, `post`, `upsert`,
+  `truncate`, `execute`, `persist`, `commit`, `flush`, `sync`, `emit`, and `land` (this codebase's own
+  word for the write) — so an adapter with `def persist(...)`, `def commit(...)`, `def flush(...)`,
+  `def sync(...)` or `def emit(...)` is refused rather than passed, and
+  `tests/ingest/test_write_token_widening.py` builds a connector for each of those verbs and requires
+  the sweep to raise, so that is a property of the list rather than a reading of it. What stays
+  uncovered is any write verb *not* on the list — `def store(...)`, `def apply(...)`, a vendor SDK's
+  own vocabulary — and no list decides that general case. Widening is bounded by the codebase's
+  read-side vocabulary too: `emit` could only be listed once `FaultInjectingAdapter`'s read-side
+  counter was renamed off `emitted`, because the match is on substrings. It is the cheap structural
+  arm of three
   — the port having no write member is the first, `source_tree_digest()` measuring the bytes across a
   real committed apply is the third — and reading it as the guarantee is the same over-claim this
   document has had to withdraw twice. It also no longer *crashes* on a `__slots__` adapter: the
@@ -629,8 +639,9 @@ the same reader just as badly, and because §8's numbering is cited by name from
    real apply run left `fixtures/` byte-identical. If a source were ever backed by something other
    than that tree — a live API, a second root — the measurement would silently cover less than its
    name suggests. Today `recon.adapters.default_fixtures_root()` is the only root any adapter reads.
-   The companion structural check is bounded too: `WRITE_NAME_TOKENS` is a substring list, so
-   `def persist(...)` passes it — see §4's "Never a source".
+   The companion structural check is bounded too: `WRITE_NAME_TOKENS` is a substring list, so it
+   catches exactly the verbs on it — `persist`, `commit`, `flush`, `sync`, `emit` and `land` included
+   — and an unlisted one such as `def store(...)` still passes. See §4's "Never a source".
 
 9. **0012 and 0013 cannot be applied to a database that already holds a violating row, and neither
    repairs one.** They are different failures and both need saying:

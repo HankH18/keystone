@@ -80,6 +80,7 @@ nothing here depends on when it ran.
 from __future__ import annotations
 
 import json
+import os
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -91,7 +92,7 @@ import psycopg
 import structlog
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from sqlalchemy import Connection, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.sql.elements import TextClause
@@ -101,6 +102,8 @@ from recon.adapters import (
     ADAPTER_STALL_TIMEOUT_SECONDS,
     IDENTIFIER_RULE,
     INT32_MAX,
+    KIND_STATUS,
+    MAX_PAYLOAD_BYTES,
     PRIMARY_KEYS,
     SOURCE_ENTITY_TYPES,
     AdapterError,
@@ -132,8 +135,11 @@ from recon.reference import (
 __all__ = [
     "ACCOUNTING_INVARIANT",
     "AUDIT_ACTOR_INGEST",
+    "DEFAULT_MAX_BODY_BYTES",
     "LEDGER_COMPLETE_RULE",
     "LEDGER_SCOPE",
+    "MAX_BODY_BYTES_ENV",
+    "MAX_RECORDS_PER_BATCH",
     "STAGING_INVARIANT",
     "STAGING_TABLES",
     "SYNC_BUDGET_SECONDS",
@@ -143,6 +149,7 @@ __all__ = [
     "Landing",
     "LedgerVerdict",
     "LoadResult",
+    "OversizedBody",
     "RunVerdict",
     "SourceResult",
     "expected_counts_from_manifest",
@@ -151,6 +158,9 @@ __all__ = [
     "ingest_source",
     "ledger_complete",
     "load_key",
+    "max_body_bytes",
+    "oversized_body_problem",
+    "raw_request_body",
     "router",
     "stamp_ledger",
     "stamp_run",
@@ -1958,6 +1968,102 @@ router = APIRouter(prefix="/internal/ingest", tags=["ingest"])
 _TRIGGER_JOB: str = JOB_SYNC
 
 
+# ======================================================================================
+# the REQUEST is bounded, not only the records inside it
+# ======================================================================================
+
+#: Environment variable that overrides :data:`DEFAULT_MAX_BODY_BYTES`. Read at
+#: call time (:func:`max_body_bytes`), so a deploy can tighten the bound without a
+#: rebuild and a test can move it without reaching into module state.
+MAX_BODY_BYTES_ENV: str = "KEYSTONE_MAX_BODY_BYTES"
+
+#: The largest request body `/internal/*` will read, in bytes: **16 MiB**, which
+#: is `64 * MAX_PAYLOAD_BYTES`.
+#:
+#: Sized against real traffic rather than chosen as a round number. This endpoint
+#: takes *a snapshot slice as literal payload strings*, and the largest slice the
+#: committed manifest expects is `crm.contact` at 40,075 records --
+#: `fixtures/crm/gen1/contact.jsonl`, 13,052,723 bytes on disk. A cap under that
+#: would refuse a legitimate load, which is an outage dressed as a control;
+#: `tests/ingest/test_request_size_bound.py` measures both numbers off the
+#: committed tree so a grown dataset fails the test instead of the deploy.
+DEFAULT_MAX_BODY_BYTES: int = 64 * MAX_PAYLOAD_BYTES
+
+#: The most records one batch may carry. Above the largest committed slice
+#: (40,075) for the same reason, and below "however many fit" -- see
+#: `RecordsRequest.records`.
+MAX_RECORDS_PER_BATCH: int = 50_000
+
+
+def max_body_bytes() -> int:
+    """The configured request-body cap, in bytes.
+
+    Read from the environment on every call rather than frozen at import: the
+    process that serves and the process that seeds are the same image, and a cap
+    baked in at import cannot be tightened by a deploy or moved by a test.
+
+    **An unusable value is the default, never "no limit".** `""`, `"   "`,
+    `"many"`, `"0"` and `"-1"` are all operator errors of one kind, and the way
+    this fails must not be the way the bound disappears -- a control that a typo
+    silently removes is worse than no control, because the route table still
+    shows it.
+    """
+    raw = (os.environ.get(MAX_BODY_BYTES_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_MAX_BODY_BYTES
+    try:
+        configured = int(raw)
+    except ValueError:
+        log.warning("ingest.max_body_bytes_unusable", value_length=len(raw), status="default")
+        return DEFAULT_MAX_BODY_BYTES
+    if configured <= 0:
+        log.warning("ingest.max_body_bytes_unusable", value_length=len(raw), status="default")
+        return DEFAULT_MAX_BODY_BYTES
+    return configured
+
+
+class OversizedBody(bytes):
+    """What :func:`raw_request_body` returns instead of a body it refused to read.
+
+    **A `bytes` subclass, deliberately empty.** The dependency's contract stays
+    exactly `bytes`, so the three handlers that take it keep their signatures and
+    a handler that forgets to ask sees an *empty* body -- 422 on an absent
+    envelope -- rather than a truncated one it might parse as if it were whole.
+    Silently parsing a prefix of a refused request is the failure mode a
+    `bytes`-typed sentinel of any other shape would invite.
+
+    `limit` and `bytes_read` are carried for the problem document: "how big may
+    it be" is the actionable half of a 413, and "how much did we take before
+    stopping" is what says the read was abandoned rather than completed.
+    """
+
+    limit: int
+    bytes_read: int
+    declared: int | None
+
+    def __new__(cls, *, limit: int, bytes_read: int, declared: int | None) -> OversizedBody:
+        self = super().__new__(cls)
+        self.limit = limit
+        self.bytes_read = bytes_read
+        self.declared = declared
+        return self
+
+
+def _declared_length(raw: str | None) -> int | None:
+    """`Content-Length` as an int, or `None` when it is absent or unusable.
+
+    Unusable is `None` and not a refusal: a header this service cannot parse is
+    a fact about the header, and the stream bound below is what actually decides.
+    """
+    if raw is None:
+        return None
+    try:
+        declared = int(raw.strip())
+    except ValueError:
+        return None
+    return declared if declared >= 0 else None
+
+
 class RecordsRequest(BaseModel):
     """A snapshot slice as **literal payload strings**.
 
@@ -1975,6 +2081,10 @@ class RecordsRequest(BaseModel):
     source: str
     entity_type: str
     generation: int = Field(ge=1, le=INT32_MAX)
+    #: Bounded by :data:`MAX_RECORDS_PER_BATCH`, in `_records_within_the_batch_cap`
+    #: below. An unbounded `list[str]` accepted a 2,000,000-element batch without
+    #: complaint -- measured -- and every one of those elements is then validated,
+    #: held, and potentially reported in `problems`.
     records: list[str]
     #: Validated by `recon.adapters.identifiers`, the ONE identifier rule -- not
     #: by a copy of it living here. Three modules used to answer this question
@@ -1982,6 +2092,39 @@ class RecordsRequest(BaseModel):
     #: silently-accepted control character; see that module's table.
     run_id: str | None = None
     persist: bool = True
+
+    @field_validator("records")
+    @classmethod
+    def _records_within_the_batch_cap(cls, value: list[str]) -> list[str]:
+        """Refuse a batch of more than :data:`MAX_RECORDS_PER_BATCH` records.
+
+        **A validator rather than a `Field` constraint**, for two unrelated
+        reasons, and the first one is the load-bearing one:
+        `tests/triggers/test_identifier_rule.py` refuses any module outside
+        `recon.adapters.identifiers` that declares a length bound on a model
+        field, because `run_id` once carried half the identifier rule in two
+        envelopes that then disagreed about the other half. A list-length cap on
+        `records` is not an identifier rule, but the check that keeps that
+        property true reads the source, and a rule enforced by reading the source
+        is one you do not get to argue with -- so this is spelled as a check on
+        the value instead of as a constraint on the field. The second reason is
+        that it can say what the bound *is*, which a bare constraint cannot.
+
+        **What this bounds, honestly.** Not peak parse memory: `parse_body` has
+        already run `json.loads` over the whole body by the time any validator
+        fires, so the objects exist. :func:`max_body_bytes` is the bound on
+        *that*, and it is the one to tighten if the concern is the interpreter's
+        heap. This bounds what the endpoint then goes on to **do and retain** --
+        `validate_batch` over every element, a rejection object per failure, and
+        a `problems` array in the response -- which is the term that scales with
+        record count rather than with bytes.
+        """
+        if len(value) > MAX_RECORDS_PER_BATCH:
+            raise ValueError(
+                f"a batch carries at most {MAX_RECORDS_PER_BATCH} records "
+                f"(this one carries {len(value)}); post the slice in several batches"
+            )
+        return value
 
 
 def problem_response(
@@ -2001,7 +2144,8 @@ _problem_response = problem_response
 
 
 async def raw_request_body(request: Request) -> bytes:
-    """The request body, unparsed. **A dependency, so the handler stays sync.**
+    """The request body, unparsed and **bounded**. A dependency, so the handler
+    stays sync.
 
     This is what makes "401 before 422" true rather than approximately true. When
     a route declares a Pydantic body parameter, FastAPI reads and decodes the body
@@ -2012,10 +2156,83 @@ async def raw_request_body(request: Request) -> bytes:
     body field at all: nothing is parsed until the handler has already
     authenticated. Reading the bytes leaks nothing; parsing them does.
 
+    **The cap is enforced while reading, not after.** This used to be
+    `await request.body()`, which buffers whatever arrives: a 256 KiB bound
+    existed per *record* and nothing at all bounded the *request*. Measured
+    against the unbounded version, one 64 MiB POST answered `200` and cost 192
+    MiB of Python heap and 404 MiB RSS -- and because the body is read here,
+    before the handler authenticates, an anonymous caller paid that cost and was
+    then told 401. A check written after `await request.body()` returns the same
+    413 and bounds nothing, so the read itself is what stops: the stream is
+    consumed chunk by chunk and abandoned the moment the total exceeds the cap.
+    A truthful `Content-Length` over the cap is refused before a single chunk is
+    pulled; a lying one is caught by the same running total, so the header is an
+    optimisation and never the decision.
+
+    The verdict is *carried*, not raised: FastAPI renders an `HTTPException` as
+    `{"detail": ...}`, and DESIGN pins RFC7807 for every refusal. The handler
+    turns an :class:`OversizedBody` into that document with
+    :func:`oversized_body_problem`, **after** the 401 check, so the cap is not an
+    oracle an unauthenticated caller can probe.
+
     Async, while the handler stays `def`: the handler runs in the threadpool
     (every write below is blocking), and only this coroutine touches the loop.
     """
-    return await request.body()
+    limit = max_body_bytes()
+    declared = _declared_length(request.headers.get("content-length"))
+    if declared is not None and declared > limit:
+        log.warning(
+            "ingest.body_too_large", limit_bytes=limit, declared_bytes=declared, bytes_read=0
+        )
+        return OversizedBody(limit=limit, bytes_read=0, declared=declared)
+
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > limit:
+            log.warning(
+                "ingest.body_too_large",
+                limit_bytes=limit,
+                declared_bytes=declared,
+                bytes_read=size,
+            )
+            # `chunks` is dropped on return; nothing over the cap is retained,
+            # and the rest of the stream is never pulled.
+            return OversizedBody(limit=limit, bytes_read=size, declared=declared)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def oversized_body_problem(body: bytes) -> JSONResponse | None:
+    """The 413 an over-cap request earns, or `None` when the body is fine.
+
+    413 rather than a new status: `oversized_body` is already the committed name
+    for this breakage and already carries 413 in
+    `recon.seed.malformed.EXPECT_CODES`, which the adapter imports rather than
+    restates. One vocabulary covers a 256 KiB record and a 16 MiB request, so an
+    operator reading the log does not have to learn two.
+
+    The body is never echoed and never even parsed -- a refused request is
+    exactly the place a secret gets pasted by accident, and this document is also
+    what gets logged. Only the two numbers that make the refusal actionable go
+    out.
+    """
+    if not isinstance(body, OversizedBody):
+        return None
+    return problem_response(
+        {
+            "type": "https://keystone.invalid/problems/oversized_body",
+            "title": "request body too large",
+            "detail": (
+                f"the request body exceeds the {body.limit}-byte cap and was not read; "
+                "post the slice in smaller batches "
+                f"(the cap is configurable as {MAX_BODY_BYTES_ENV})"
+            ),
+        },
+        KIND_STATUS["oversized_body"],
+        {"limit_bytes": body.limit},
+    )
 
 
 def parse_body[M: BaseModel](body: bytes, model: type[M]) -> tuple[M | None, JSONResponse | None]:
@@ -2163,11 +2380,18 @@ def ingest_records(
     **Authentication runs first, before the body is looked at.** R19 says a
     request without the header is 401, and it was 422 for anything with a
     malformed envelope -- which also told an unauthenticated caller the shape of
-    the envelope.
+    the envelope. The size verdict sits in the same place and for the same
+    reason: the *bytes* are already refused by :func:`raw_request_body`, which
+    stopped reading, but the *answer* to an unauthenticated caller stays 401 so
+    the cap cannot be probed without the header.
     """
     unauthorized = _authorize(x_trigger_secret)
     if unauthorized is not None:
         return unauthorized
+
+    too_large = oversized_body_problem(body)
+    if too_large is not None:
+        return too_large
 
     payload, invalid = parse_body(body, RecordsRequest)
     if invalid is not None:

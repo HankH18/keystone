@@ -88,7 +88,6 @@ from recon.er import Person, Resolution, Snapshot, resolve
 from recon.logging import get_logger
 from recon.normalize import norm_email, norm_enum, norm_name
 from recon.reference import (
-    COMPARED_FIELD_PATHS,
     anchor_ref,
     canon_value,
     household_key,
@@ -100,6 +99,7 @@ from recon.reference import (
 __all__ = [
     "CURRENT_GENERATION",
     "LINEAGE_PATHS",
+    "LINEAGE_PATH_MAPS",
     "METHOD_ANCHOR",
     "METHOD_MEMBER",
     "SURVIVED_PATHS",
@@ -157,13 +157,76 @@ SURVIVED_PATHS: Final[tuple[str, ...]] = (
     "crm.deal.stage",
 )
 
-#: What `field_lineage.field` may hold: SS2.4's comparison vocabulary (which R16's
-#: A->B->A scan reads) plus the two survived paths that are not compared fields --
-#: `crm.contact.email` and `appdb.enrollment.program`. Both are source-qualified
-#: paths in the same shape; without them the endpoint could show a survived value
-#: whose provenance it cannot name.
+#: Which record column each lineage path reads, per source record class. These maps
+#: are the ONE declaration of field-level lineage: :func:`lineage_rows` writes from
+#: them and :data:`LINEAGE_PATHS` is derived from them, so a path cannot be declared
+#: without being written and cannot be written without being declared.
+_STUDENT_PATHS: Final[dict[str, str]] = {
+    "appdb.student.dob": "dob",
+    "appdb.student.first_name": "first_name",
+    "appdb.student.grade": "grade",
+    "appdb.student.last_name": "last_name",
+    "appdb.student.status": "status",
+}
+_CONTACT_PATHS: Final[dict[str, str]] = {
+    "crm.contact.dob": "dob",
+    "crm.contact.email": "email",
+    "crm.contact.first_name": "first_name",
+    "crm.contact.grade": "grade",
+    "crm.contact.last_name": "last_name",
+    "crm.contact.lifecycle_stage": "lifecycle_stage",
+}
+_ENROLLMENT_PATHS: Final[dict[str, str]] = {
+    "appdb.enrollment.program": "program",
+    "appdb.enrollment.stage": "stage",
+}
+_DEAL_PATHS: Final[dict[str, str]] = {"crm.deal.stage": "stage"}
+#: R1: "every record carries source id, ingest timestamp, and **field-level
+#: lineage**", and payments is one of the three mandated sources -- so the payment
+#: record's own reportable fields are named here in the same source-qualified shape
+#: the other four maps use. `payment_id` is not among them: it is the record's
+#: identity, already carried by `field_lineage.source_ref`, and `metadata` is the
+#: source's nested blob rather than a field.
+_PAYMENT_PATHS: Final[dict[str, str]] = {
+    "payments.payment.amount_cents": "amount_cents",
+    "payments.payment.currency": "currency",
+    "payments.payment.external_ref": "external_ref",
+    "payments.payment.occurred_at": "occurred_at",
+    "payments.payment.payer_email": "payer_email",
+    "payments.payment.payer_name": "payer_name",
+    "payments.payment.status": "status",
+    "payments.payment.type": "type",
+}
+
+#: Every declared map, keyed by the `(source_id, record_class)` pair a fixture tree
+#: names with its `<source>/gen<N>/<record>.jsonl` files. Keying it that way is what
+#: lets a test walk the **fixtures** and ask this registry whether each source it
+#: finds is covered -- a source with no entry here declares nothing and writes
+#: nothing, which is the failure `tests/er/test_materialization.py` reproduces.
+LINEAGE_PATH_MAPS: Final[dict[tuple[str, str], dict[str, str]]] = {
+    ("appdb", "enrollment"): _ENROLLMENT_PATHS,
+    ("appdb", "student"): _STUDENT_PATHS,
+    ("crm", "contact"): _CONTACT_PATHS,
+    ("crm", "deal"): _DEAL_PATHS,
+    ("payments", "payment"): _PAYMENT_PATHS,
+}
+
+#: What `field_lineage.field` may hold: exactly the paths the maps above write.
+#:
+#: **Derived from what is written, never from the comparison vocabulary.** It used
+#: to read `set(COMPARED_FIELD_PATHS) | set(SURVIVED_PATHS)`, which tied the reach of
+#: lineage to the reach of conflict detection: extending lineage to a new source
+#: would have meant extending `COMPARED_FIELD_PATHS`, and that constant is the
+#: vocabulary SS2.4's comparisons name, so a new member there would change which
+#: conflicts exist and break the committed 0-FP/0-FN golden result. The dependency
+#: is severed in the only direction that can do harm -- this module no longer imports
+#: `COMPARED_FIELD_PATHS` at all, so nothing here can add a compared field. The two
+#: containments that must still hold (`COMPARED_FIELD_PATHS` and `SURVIVED_PATHS` are
+#: both covered, so R16's A->B->A scan and the endpoint's `survived` block can name
+#: the provenance of every value they carry) are now real assertions in
+#: `tests/er/test_materialization.py` rather than a tautology of the definition.
 LINEAGE_PATHS: Final[tuple[str, ...]] = tuple(
-    sorted(set(COMPARED_FIELD_PATHS) | set(SURVIVED_PATHS))
+    sorted({path for paths in LINEAGE_PATH_MAPS.values() for path in paths})
 )
 
 #: R20 -- the demo org's tenants. `demo-client` is the label migration 0003 seeded
@@ -227,10 +290,20 @@ _ENROLLMENT_SQL = text(
     """
 )
 
+#: `observed_ts` is `occurred_at` -- the moment the payment processor says the
+#: payment happened, which is the same kind of fact the other four loaders take from
+#: `COALESCE(updated_at, created_at)`. `stg_payment` keeps no `updated_at`
+#: (migration 0001 gave it `occurred_at`/`refunded_at` instead), so the fallback for
+#: a payment that asserts no moment at all is `materialized_at`, the moment it
+#: landed. That is the ONE case in `field_lineage` where `observed_ts` is a write
+#: time rather than a source time, and it beats the alternative: `_observed` would
+#: otherwise refuse the row and the record would carry no lineage, which is the
+#: R1 gap this map exists to close.
 _PAYMENT_SQL = text(
     """
-    SELECT payment_id, payer_email, external_ref, payment_metadata, type, status,
-           amount_cents, occurred_at
+    SELECT payment_id, payer_email, payer_name, external_ref, payment_metadata,
+           type, status, currency, amount_cents, occurred_at,
+           COALESCE(occurred_at, materialized_at) AS observed_ts
       FROM stg_payment
      WHERE generation = :generation
      ORDER BY payment_id
@@ -308,12 +381,15 @@ def load_snapshot(conn: Connection, generation: int) -> Snapshot:
         {
             "payment_id": row.payment_id,
             "payer_email": row.payer_email,
+            "payer_name": row.payer_name,
             "external_ref": row.external_ref,
             "metadata": row.payment_metadata or {},
             "type": row.type,
             "status": row.status,
+            "currency": row.currency,
             "amount_cents": row.amount_cents,
             "occurred_at": row.occurred_at,
+            "observed_ts": row.observed_ts,
         }
         for row in conn.execute(_PAYMENT_SQL, params)
     ]
@@ -567,32 +643,6 @@ def candidate_rows(resolved: ResolvedGeneration) -> list[tuple[Any, ...]]:
     ]
 
 
-#: Which record column each lineage path reads, per source record class. The four
-#: maps together are `LINEAGE_PATHS`, and `tests/er/test_materialization.py` asserts
-#: that they do not drift apart -- a path declared and never written would make the
-#: endpoint's lineage quietly incomplete.
-_STUDENT_PATHS: Final[dict[str, str]] = {
-    "appdb.student.dob": "dob",
-    "appdb.student.first_name": "first_name",
-    "appdb.student.grade": "grade",
-    "appdb.student.last_name": "last_name",
-    "appdb.student.status": "status",
-}
-_CONTACT_PATHS: Final[dict[str, str]] = {
-    "crm.contact.dob": "dob",
-    "crm.contact.email": "email",
-    "crm.contact.first_name": "first_name",
-    "crm.contact.grade": "grade",
-    "crm.contact.last_name": "last_name",
-    "crm.contact.lifecycle_stage": "lifecycle_stage",
-}
-_ENROLLMENT_PATHS: Final[dict[str, str]] = {
-    "appdb.enrollment.program": "program",
-    "appdb.enrollment.stage": "stage",
-}
-_DEAL_PATHS: Final[dict[str, str]] = {"crm.deal.stage": "stage"}
-
-
 def lineage_rows(resolved: ResolvedGeneration) -> list[tuple[Any, ...]]:
     """`field_lineage` rows: what each source said about each path, and when.
 
@@ -602,6 +652,16 @@ def lineage_rows(resolved: ResolvedGeneration) -> list[tuple[Any, ...]]:
     moment this process wrote it down. A row is emitted only when the source
     actually holds that record, so "no row" means "that source never said
     anything", which is a different fact from a null value.
+
+    **Every** payment the person owns is written, not just the survived one.
+    Survivorship (SS4.6) picks one record per *identity* source because a person has
+    one name and one lifecycle stage; a person has as many payments as it has
+    payments, the canonical view lists all of them, and R1 says "every record
+    carries ... field-level lineage". `source_ref` is part of a lineage row's
+    identity, so the rows stay distinguishable, and `person.payment_refs` is already
+    `sorted()` by `recon.er`, so the order is fixed. Every payment belongs to exactly
+    one person -- an unattributable one is its own person (SS5.2) -- so the union
+    over persons is the whole source and no payment is written twice.
     """
     rows: list[tuple[Any, ...]] = []
     generation = resolved.generation
@@ -613,14 +673,22 @@ def lineage_rows(resolved: ResolvedGeneration) -> list[tuple[Any, ...]]:
         enrollment = resolved.survived_enrollment(person)
         deal = resolved.survived_deal(person)
 
-        for record, source_id, source_ref, paths in (
-            (student, "appdb", person.student_ref or "", _STUDENT_PATHS),
-            (contact, "crm", min(person.contact_refs, default=""), _CONTACT_PATHS),
-            (enrollment, "appdb", min(person.enrollment_refs, default=""), _ENROLLMENT_PATHS),
-            (deal, "crm", min(person.deal_refs, default=""), _DEAL_PATHS),
+        for record, source_id, record_class, source_ref in (
+            (student, "appdb", "student", person.student_ref or ""),
+            (contact, "crm", "contact", min(person.contact_refs, default="")),
+            (enrollment, "appdb", "enrollment", min(person.enrollment_refs, default="")),
+            (deal, "crm", "deal", min(person.deal_refs, default="")),
+            *(
+                (resolved.payments.get(ref), "payments", "payment", ref)
+                for ref in person.payment_refs
+            ),
         ):
             if record is None:
                 continue
+            # Read through the registry rather than a local name, so a source class
+            # dropped from `LINEAGE_PATH_MAPS` stops being written as well as stops
+            # being declared -- one declaration, not two that can drift.
+            paths = LINEAGE_PATH_MAPS[source_id, record_class]
             observed = _observed(record.get("observed_ts"))
             for path, column in sorted(paths.items()):
                 rows.append(

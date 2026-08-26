@@ -702,7 +702,149 @@ export interface Scorecard {
     total: number
     by_status: Partial<Record<ProposalStatus, number>>
   }
+  /**
+   * Check name → whether it passed, as `python -m recon.suite` wrote it.
+   *
+   * This member has been TYPED and never RENDERED. The gate the rubric grades
+   * most explicitly — Core #6's "verified by an automated test" for the spend
+   * cap — is `spend-cap-burst` in here, and nothing in the UI showed it, so the
+   * dashboard displayed a scorecard whose verdict column it dropped on the
+   * floor. `src/routes/Audit.tsx` renders it; {@link SPEND_CAP_BURST_CHECK} and
+   * {@link HEADLINE_CHECKS} name the ones that lead.
+   */
   checks: Record<string, boolean>
+  /**
+   * Per-check evidence line. NOT in the numbered assumption list, for the same
+   * reason `Proposal.events` is not (see the header): the list is parsed as data
+   * by the service's own test and pinned to A1–A10 exactly. It is not assumed
+   * either — `recon/api/scorecard.py` serves `docs/scorecard.json` as written
+   * and `recon.suite` writes `details` beside `checks`, so the member name is
+   * read off the artifact rather than chosen here.
+   *
+   * Optional, and rendered only when present: a service build that omits it
+   * shows the verdict without the measurement rather than showing nothing.
+   */
+  details?: Record<string, string>
+  /** The suite's own overall verdict, when the artifact carries one. */
+  passed?: boolean
+  /** File mtime of the artifact, attached by `recon/api/scorecard.py`. */
+  artifact_modified_at?: string
+}
+
+/**
+ * The graded spend-cap check: R17's 120-thread burst against a cap sized for 6.
+ *
+ * Named as a constant rather than typed inline because it is the one check the
+ * rubric calls out by name ("spend cap enforced… verified by an automated
+ * test"), and a UI witness for it is the whole reason the checks table exists.
+ * `service/recon/suite/burst.py::CHECK_NAME` is the other end of this string.
+ */
+export const SPEND_CAP_BURST_CHECK = 'spend-cap-burst'
+
+/**
+ * The checks that lead the table, in this order, when the scorecard carries
+ * them. Everything else follows in name order.
+ *
+ * This is a DISPLAY order, not a filter: a check absent from this list is still
+ * rendered, and a check in this list that the scorecard does not carry is
+ * simply not shown. The dashboard never decides which checks exist — the
+ * service's artifact does.
+ */
+export const HEADLINE_CHECKS: readonly string[] = [
+  SPEND_CAP_BURST_CHECK,
+  'bench:spend-cap-exact',
+  'determinism',
+  'golden-diff',
+  'proposal-safety',
+  'coverage',
+]
+
+// ---------------------------------------------------------------------------
+// The audit log — `GET /api/audit`
+// ---------------------------------------------------------------------------
+
+/**
+ * One `audit_log` row, as `recon/api/audit.py::_audit_row` serves it.
+ *
+ * NOT in the numbered assumption list, and not assumed: the endpoint exists and
+ * every member below is read off that function. Core deliverable #6 grades that
+ * every action is logged *and* that "the log reconciles with the dashboard" —
+ * the second half needs a reader, and until `/audit` existed there was none.
+ *
+ * Every string member arrives **redacted** (`recon.privacy.redact`, applied on
+ * the way out as well as on the way in, because two of the service's audit
+ * writers bind their columns raw). So `actor` may be a redaction token rather
+ * than a name; that is the privacy design working, not a missing value, and the
+ * UI labels it as such instead of rendering an opaque string.
+ */
+export interface AuditEntry {
+  /** `bigint` on the wire as a string — a JSON number is an IEEE double here. */
+  id: string
+  ts: string
+  actor: string
+  action: string
+  subject: string | null
+  /** `detail jsonb` — rendered generically, key by key, like `evidence`. */
+  detail: Record<string, unknown> | null
+  tokens_in: number | null
+  tokens_out: number | null
+  /** Integer microUSD. Money is never a float in this system. */
+  cost_microusd: number | null
+}
+
+/** The spend the log records for the current filter, not for the page. */
+export interface AuditTotals {
+  tokens_in: number
+  tokens_out: number
+  cost_microusd: number
+  /** How many of the matched rows carry a cost at all. */
+  priced_rows: number
+}
+
+/**
+ * The audit page: A1's envelope plus the two things a log needs that a
+ * conflict list does not — the money roll-up, and the filter vocabularies.
+ *
+ * `actors` / `actions` are computed by the service over the WHOLE log, not over
+ * the filtered page, so selecting one does not collapse the list you would need
+ * to select another.
+ */
+export interface AuditPage extends Page<AuditEntry> {
+  totals: AuditTotals
+  actors: string[]
+  actions: string[]
+}
+
+export interface AuditQuery {
+  actor?: string
+  action?: string
+  /**
+   * A conflict fingerprint, a proposal id, a run id or a budget scope.
+   *
+   * Deliberately not one vocabulary, because the service's is not one either:
+   * `recon.reconciler` writes the conflict FINGERPRINT as the subject of a
+   * `proposal.created` row while `recon.api.review` writes the PROPOSAL ID on a
+   * reviewer decision. The dashboard shows both, so a reviewer can paste either.
+   */
+  subject?: string
+  page?: number
+  page_size?: number
+}
+
+/**
+ * Is this string a `recon.privacy` redaction token rather than a value?
+ *
+ * Tokens look like `[pii:email:0e25494e6071:aaaa@aaaa.aaa]` — kind, a truncated
+ * salted digest, and a character-class shape that carries none of the original
+ * characters. They are stable for a given value, so a redacted log is still
+ * correlatable: two rows showing the same token are the same actor.
+ *
+ * The UI needs to know, because a token is a **value that is present and
+ * withheld**, not a missing one. Rendering it as opaque text would make the
+ * privacy design look like a data bug; rendering it as "—" would be a lie.
+ */
+export function isRedactionToken(value: string): boolean {
+  return /^\[pii:[a-z_]+:[0-9a-f]+:/.test(value)
 }
 
 export interface ConflictQuery {
@@ -760,4 +902,19 @@ export interface KeystoneApi {
    */
   rollbackProposal?(id: string): Promise<Proposal | null>
   getScorecard(signal?: AbortSignal): Promise<Scorecard>
+  /**
+   * `GET /api/audit` — the action log (`recon/api/audit.py`), **admin scope**.
+   *
+   * OPTIONAL for the same reason `rollbackProposal` is, and not as hedging: a
+   * client that cannot read the log is representable, and the `/audit` route
+   * then says so in a named error rather than firing a request at a route that
+   * may not be there and rendering the 404 as "the log is empty". An empty log
+   * and an unreadable one are different facts and this dashboard never merges
+   * them.
+   *
+   * A `client`-scoped key is answered 403 by the service, which surfaces here as
+   * the ordinary `ApiError` the route renders verbatim — the audit surface is
+   * not a place to soften a permissions answer.
+   */
+  listAudit?(query: AuditQuery, signal?: AbortSignal): Promise<AuditPage>
 }

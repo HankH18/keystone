@@ -61,6 +61,42 @@ function MatchCell({ matches }: { matches: boolean }) {
   )
 }
 
+/**
+ * The proposal-mix verdict, which needs a third state that the conflict table
+ * does not.
+ *
+ * A conflict count only moves when detection re-runs, so scorecard-vs-live can
+ * only differ because something is wrong. A proposal STATUS count moves every
+ * time a reviewer decides — approving one proposal takes `pending` from 2,670 to
+ * 2,669 against a scorecard artifact that still says 2,670. Scoring that as
+ * "Mismatch" would mean the dashboard reports a fault the moment anyone uses it
+ * for its intended purpose, and a reviewer who is told they broke something when
+ * they did not will stop believing the indicator that matters.
+ *
+ * So the row distinguishes the two. If the mix moved but the TOTAL is still the
+ * scorecard's total, no proposal has appeared or vanished — only its state
+ * changed, which is review working. That is reported as review activity, not as
+ * a discrepancy. A total that has itself moved is a real discrepancy and is
+ * still called one.
+ */
+function MixCell({
+  matches,
+  reviewMoved,
+}: {
+  matches: boolean
+  reviewMoved: boolean
+}) {
+  if (matches) return <MatchCell matches />
+  if (reviewMoved) {
+    return (
+      <span>
+        <StatusIcon name="dot" /> Moved by review
+      </span>
+    )
+  }
+  return <MatchCell matches={false} />
+}
+
 export function OverviewRoute() {
   const api = useApi()
   const scorecard = useScorecard()
@@ -82,6 +118,76 @@ export function OverviewRoute() {
   })
 
   const card = scorecard.data
+
+  // Core #6's acceptance clause is "the log reconciles with the dashboard", and
+  // Core #4's is "every dashboard figure reconciles with the raw ingestion,
+  // invariant, and proposal logs". The conflicts table below has always been
+  // fetched twice and compared; the proposal mix was NOT — it was rendered
+  // straight off the scorecard artifact and captioned "as reported by the
+  // scorecard", sitting immediately under a table whose whole point is that it
+  // reconciles. A reviewer had no way to tell that one of the two tables was
+  // asserting agreement and the other was quoting a file. Now both are fetched
+  // twice from independent surfaces and compared the same way.
+  //
+  // The status list comes from the scorecard, so it is empty until the card
+  // loads. `useQueries` accepts a varying-length array, and hooks stay
+  // unconditional because this is computed above the early return, not inside it.
+  // Only statuses this build KNOWS are queried. `statusMixRows` deliberately
+  // also returns any status the service reports that the contract does not
+  // pin, so that an unknown state renders as "unknown" instead of being
+  // dropped — but an unknown state is not a value `listProposals` will accept,
+  // and inventing a cast to send it anyway would turn a rendering nicety into a
+  // 422 from the service. Those rows keep their scorecard figure and show no
+  // live count, which is the honest answer for a status this build cannot ask
+  // about.
+  const proposalStatuses: ProposalStatus[] = card
+    ? statusMixRows(card.proposals.by_status)
+        .map((row) => row.status)
+        .filter((status): status is ProposalStatus =>
+          (PROPOSAL_STATUSES as readonly string[]).includes(status),
+        )
+    : []
+  const proposalCounts = useQueries({
+    queries: proposalStatuses.map((status) => ({
+      queryKey: ['proposals-count', status],
+      queryFn: async ({ signal }: { signal: AbortSignal }) => {
+        const page = await (await api).listProposals(
+          { status, page: 1, page_size: 1 },
+          signal,
+        )
+        return page.total
+      },
+    })),
+  })
+
+  // A mix that moved while the TOTAL held is review activity, not drift. See
+  // `MixCell`.
+  //
+  // The total is fetched UNFILTERED rather than summed from the per-status rows
+  // above, and that is not a stylistic choice — summing them is wrong. The row
+  // list comes from the scorecard's `by_status`, so a decision that moves a
+  // proposal into a status the scorecard never recorded (the first `approved`
+  // against an all-pending artifact) lands in no row at all, and the sum reads
+  // one short of the truth. That under-count would then be reported as a
+  // vanished proposal, which is precisely the false alarm `MixCell` exists to
+  // avoid. One unfiltered count cannot miss a status it has never heard of.
+  const liveTotal = useQueries({
+    queries: [
+      {
+        queryKey: ['proposals-count', '*all*'],
+        queryFn: async ({ signal }: { signal: AbortSignal }) => {
+          const page = await (await api).listProposals(
+            { page: 1, page_size: 1 },
+            signal,
+          )
+          return page.total
+        },
+      },
+    ],
+  })[0]
+  const proposalTotalHolds =
+    liveTotal.isSuccess && liveTotal.data === card?.proposals.total
+
   const allCountsLoaded = counts.every((query) => query.isSuccess)
   const mismatches =
     card && allCountsLoaded
@@ -111,8 +217,16 @@ export function OverviewRoute() {
         that does not match is a real discrepancy, not a rounding artefact.
       </p>
 
+      {/*
+        These were two links joined by a single space, which rendered as the
+        run-on "Go to conflicts Go to proposals" — one phrase to the eye, with
+        no boundary between two separate destinations. A `nav` with a list
+        gives the boundary structurally rather than typographically, so it is
+        also announced as a two-item navigation instead of a line of prose.
+      */}
       <p>
-        <Link to="/conflicts">Go to conflicts</Link>{' '}
+        <Link to="/conflicts">Go to conflicts</Link>
+        <span aria-hidden="true"> · </span>
         <Link to="/proposals">Go to proposals</Link>
       </p>
 
@@ -216,40 +330,70 @@ export function OverviewRoute() {
             >
               <table className="data-table">
                 <caption>
-                  Proposals by status, as reported by the scorecard for this run.
-                  Every state is shown in the reviewer&rsquo;s vocabulary, with
-                  its icon and its meaning — a hold for human review is a
-                  deliberate safety state, not a failure, and it is labelled that
-                  way here exactly as it is everywhere else.
+                  Proposals by status — the scorecard figure against the
+                  proposals endpoint&rsquo;s own total for the same filter, the
+                  same way the conflict table above is reconciled. Every state is
+                  shown in the reviewer&rsquo;s vocabulary, with its icon and its
+                  meaning — a hold for human review is a deliberate safety state,
+                  not a failure, and it is labelled that way here exactly as it
+                  is everywhere else.
                 </caption>
                 <thead>
                   <tr>
                     <th scope="col">Status</th>
                     <th scope="col">What it means</th>
-                    <th scope="col">Proposals</th>
+                    <th scope="col">Scorecard</th>
+                    <th scope="col">/api/proposals total</th>
+                    <th scope="col">Reconciles</th>
                   </tr>
                 </thead>
                 <tbody>
                   {statusMixRows(card.proposals.by_status).map(
-                    ({ status, count }) => (
-                      <tr key={status}>
-                        {/*
-                          The LABEL, never the raw enum key: a reviewer reads
-                          "Held for human review", not `sensitive_hold`. The raw
-                          value stays where it belongs — in the query string of
-                          the link, which is the service's vocabulary.
-                        */}
-                        <th scope="row">
-                          <Link to={`/proposals?status=${encodeURIComponent(status)}`}>
-                            <StatusBadge status={status} kind="proposal" />
-                          </Link>
-                        </th>
-                        <td>
-                          {statusMeta(status, PROPOSAL_STATUS_META).description}
-                        </td>
-                        <td className="num">{count}</td>
-                      </tr>
-                    ),
+                    ({ status, count }) => {
+                      // Keyed by STATUS, never by row index: the row list can
+                      // contain statuses that were filtered out of the query
+                      // list above, so index alignment between the two is not a
+                      // property that holds.
+                      const queryIndex = proposalStatuses.indexOf(
+                        status as ProposalStatus,
+                      )
+                      const live =
+                        queryIndex === -1 ? undefined : proposalCounts[queryIndex]
+                      return (
+                        <tr key={status}>
+                          {/*
+                            The LABEL, never the raw enum key: a reviewer reads
+                            "Held for human review", not `sensitive_hold`. The raw
+                            value stays where it belongs — in the query string of
+                            the link, which is the service's vocabulary.
+                          */}
+                          <th scope="row">
+                            <Link to={`/proposals?status=${encodeURIComponent(status)}`}>
+                              <StatusBadge status={status} kind="proposal" />
+                            </Link>
+                          </th>
+                          <td>
+                            {statusMeta(status, PROPOSAL_STATUS_META).description}
+                          </td>
+                          <td className="num">{count}</td>
+                          <td className="num">
+                            {live?.isSuccess ? live.data : '…'}
+                          </td>
+                          <td>
+                            {live?.isSuccess ? (
+                              <MixCell
+                                matches={count === live.data}
+                                reviewMoved={proposalTotalHolds}
+                              />
+                            ) : live?.isError ? (
+                              'Count failed'
+                            ) : (
+                              'Counting…'
+                            )}
+                          </td>
+                        </tr>
+                      )
+                    },
                   )}
                 </tbody>
               </table>

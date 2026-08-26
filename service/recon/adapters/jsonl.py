@@ -32,8 +32,9 @@ from __future__ import annotations
 import os
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Protocol
 
-from recon.adapters.base import MAX_PAYLOAD_BYTES, AdapterError, RawRecord
+from recon.adapters.base import MAX_PAYLOAD_BYTES, AdapterError, RawRecord, ReadOnlyAdapter
 from recon.adapters.models import SOURCE_ENTITY_TYPES
 from recon.adapters.validation import validate_batch, validate_payload
 
@@ -43,6 +44,7 @@ __all__ = [
     "CrmAdapter",
     "JsonlSnapshotAdapter",
     "PaymentsAdapter",
+    "SourceAdapterFactory",
     "build_adapters",
     "default_fixtures_root",
 ]
@@ -262,8 +264,38 @@ class PaymentsAdapter(JsonlSnapshotAdapter):
     entity_types = SOURCE_ENTITY_TYPES["payments"]
 
 
+class SourceAdapterFactory(Protocol):
+    """Anything that can be called to produce a :class:`ReadOnlyAdapter`.
+
+    The registry's value type, and it is a Protocol rather than
+    ``type[JsonlSnapshotAdapter]`` on purpose. All three shipped sources happen to
+    be JSONL classes today, but *that is an accident of the fixtures*, and naming
+    it in the type made the accident the contract: a HubSpot connector -- the very
+    substitution the module docstring promises works -- was not a
+    ``JsonlSnapshotAdapter``, so it could not be registered without a cast, and
+    every consumer that reads this registry to enumerate "the adapters" (the
+    structural no-write sweep in :func:`recon.apply.assert_sources_untouched`
+    among them) was enumerating a JSONL-shaped set rather than *the* set. The
+    check that proves sources are never written to must be over whatever is
+    actually registered.
+
+    ``type[ReadOnlyAdapter]`` would be the shorter spelling and is the wrong one:
+    a Protocol class cannot be instantiated, and what the registry holds is not
+    "a subclass of the port" but "something you can call to get one" -- a factory
+    function is a legitimate entry and this admits it.
+    """
+
+    def __call__(
+        self,
+        root: Path | str | None = None,
+        *,
+        on_reject: Callable[[AdapterError], None] | None = None,
+        max_payload_bytes: int = MAX_PAYLOAD_BYTES,
+    ) -> ReadOnlyAdapter: ...
+
+
 #: Source id -> implementation. The registry ingestion and `/health` iterate.
-SOURCE_ADAPTERS: dict[str, type[JsonlSnapshotAdapter]] = {
+SOURCE_ADAPTERS: dict[str, SourceAdapterFactory] = {
     "crm": CrmAdapter,
     "appdb": AppDbAdapter,
     "payments": PaymentsAdapter,
@@ -275,9 +307,15 @@ def build_adapters(
     *,
     on_reject: Callable[[AdapterError], None] | None = None,
     max_payload_bytes: int = MAX_PAYLOAD_BYTES,
-) -> dict[str, JsonlSnapshotAdapter]:
-    """One adapter per source, all reading the same injected tree."""
+) -> dict[str, ReadOnlyAdapter]:
+    """One adapter per registered source, all reading the same injected tree.
+
+    Returns the **port**, not the implementation: a caller that needed a
+    JSONL-specific member (``path_for``) off this mapping would be a caller the
+    swap breaks, and the return type is where that gets caught rather than on the
+    day the connector changes.
+    """
     return {
-        source_id: adapter_class(root, on_reject=on_reject, max_payload_bytes=max_payload_bytes)
-        for source_id, adapter_class in SOURCE_ADAPTERS.items()
+        source_id: factory(root, on_reject=on_reject, max_payload_bytes=max_payload_bytes)
+        for source_id, factory in SOURCE_ADAPTERS.items()
     }

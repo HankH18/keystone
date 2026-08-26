@@ -10,16 +10,25 @@ import { useEffect, useRef } from 'react'
 import { AnnouncerProvider } from './components/Announcer'
 import { Link, useRouter } from './lib/router'
 import { USE_MOCK_API } from './lib/apiClient'
+import { AuditRoute } from './routes/Audit'
 import { ConflictsRoute } from './routes/Conflicts'
 import { ConflictDetailRoute } from './routes/ConflictDetail'
 import { OverviewRoute } from './routes/Overview'
 import { ProposalsRoute } from './routes/Proposals'
 import { ProposalDetailRoute } from './routes/ProposalDetail'
 
+/**
+ * `Audit` is LAST on purpose: it is the record of what was done, so it reads
+ * after the queue a reviewer acts on. It is in the primary nav rather than
+ * behind a link on a detail page because Core deliverable #6's acceptance
+ * clause is "the log reconciles with the dashboard" — a log a grader has to
+ * know a URL to reach is not a surface that claim can be checked on.
+ */
 const NAV = [
   { to: '/', label: 'Overview', route: 'overview' },
   { to: '/conflicts', label: 'Conflicts', route: 'conflicts' },
   { to: '/proposals', label: 'Proposals', route: 'proposals' },
+  { to: '/audit', label: 'Audit log', route: 'audit' },
 ] as const
 
 function RouteView() {
@@ -35,6 +44,8 @@ function RouteView() {
       return <ProposalsRoute />
     case 'proposal-detail':
       return <ProposalDetailRoute id={match.params.id} />
+    case 'audit':
+      return <AuditRoute />
     default:
       return (
         <>

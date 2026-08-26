@@ -186,8 +186,18 @@ export function DisagreeingFields({
                   ? `${formatScalar(observed[row.left])} ≠ ${formatScalar(observed[row.right])}`
                   : '—'}
               </td>
+              {/*
+                This cell used to render `left / right` as one bare string, so a
+                reviewer read "auto-apply eligible / sensitive" with nothing
+                saying WHICH side was the sensitive one. Sensitivity is the
+                safety property this whole table exists to surface -- a reader
+                who takes the first half at face value draws exactly the wrong
+                conclusion about whether the fix may be automated. Each side now
+                names its own source.
+              */}
               <td>
-                {fieldClassification(row.left)} / {fieldClassification(row.right)}
+                <div>CRM — {fieldClassification(row.left)}</div>
+                <div>App DB — {fieldClassification(row.right)}</div>
               </td>
             </tr>
           ))}

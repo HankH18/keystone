@@ -11,6 +11,8 @@ import { guardConflictPage, guardProposalPage } from './filterGuard'
 import {
   MAX_PAGE_SIZE,
   type ApplyMode,
+  type AuditPage,
+  type AuditQuery,
   type Conflict,
   type KeystoneApi,
   type Page,
@@ -48,7 +50,7 @@ function asProposal(body: unknown): Proposal | null {
  * straight at.
  */
 export const httpClient: KeystoneApi &
-  Required<Pick<KeystoneApi, 'rollbackProposal'>> = {
+  Required<Pick<KeystoneApi, 'rollbackProposal' | 'listAudit'>> = {
   async listConflicts(query, signal) {
     // ASSUMED A1: page / page_size params and the {items,...} envelope.
     const page = await apiFetch<Page<Conflict>>('/api/conflicts', {
@@ -171,5 +173,32 @@ export const httpClient: KeystoneApi &
   getScorecard(signal) {
     // ASSUMED A4 for the body shape.
     return apiFetch<Scorecard>('/api/scorecard', { signal })
+  },
+
+  /**
+   * `GET /api/audit` — `recon/api/audit.py`. Admin scope; a `client` key is
+   * answered 403 and that 403 reaches the route as an ordinary `ApiError`.
+   *
+   * No `filterGuard` equivalent runs here, and that is a real difference rather
+   * than an omission. filterGuard exists because `/api/proposals` is asked to
+   * filter on `source` and `type`, which are not columns of `proposals` (A8) —
+   * so a service could serve 200 with an unfiltered page. `actor`, `action` and
+   * `subject` ARE columns of `audit_log`, and every row the endpoint returns
+   * carries the value it was filtered on, so the guard is the render itself:
+   * `Audit.tsx` shows the actor and action of every row it draws, next to the
+   * filter that is supposed to have selected them. An ignored filter is visible
+   * on screen, not merely warned about.
+   */
+  listAudit(query: AuditQuery, signal?: AbortSignal) {
+    return apiFetch<AuditPage>('/api/audit', {
+      query: {
+        actor: query.actor,
+        action: query.action,
+        subject: query.subject,
+        page: query.page,
+        page_size: clampPageSize(query.page_size),
+      },
+      signal,
+    })
   },
 }

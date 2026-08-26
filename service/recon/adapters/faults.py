@@ -93,7 +93,14 @@ class FaultInjectingAdapter:
         self.fail_after = fail_after
         self.upstream_status = upstream_status
         #: Records actually handed over, so a test can assert a *partial* read.
-        self.emitted = 0
+        #:
+        #: Named for the read it counts, not for "emit". `emit` is a write-shaped
+        #: verb on `recon.adapters.base.WRITE_NAME_TOKENS`, which matches on
+        #: *substrings*, so an attribute called `emitted` would be read by the
+        #: structural no-write check as a write on a source. It is not one -- it
+        #: counts records this adapter gave to its caller -- and keeping the two
+        #: apart is what let the token be listed at all.
+        self.records_handed_over = 0
 
     def generations(self) -> list[int]:
         return list(self.available_generations)
@@ -116,7 +123,7 @@ class FaultInjectingAdapter:
                 record = self.records[index % len(self.records)] if self.records else None
                 if record is None:
                     continue
-                self.emitted += 1
+                self.records_handed_over += 1
                 index += 1
                 yield record
         for index, record in enumerate(self.records):
@@ -127,7 +134,7 @@ class FaultInjectingAdapter:
                         upstream_status=self.upstream_status,
                     )
                 raise RuntimeError(f"{self.source_id} broke after {index} records")
-            self.emitted += 1
+            self.records_handed_over += 1
             yield record
         if self.mode in {"midstream_error", "http_5xx"} and self.fail_after >= len(self.records):
             if self.mode == "http_5xx":

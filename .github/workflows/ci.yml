@@ -16,7 +16,27 @@ jobs:
   service:
     name: service (python 3.12)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20 minutes could never have worked, and the number below is measured, not
+    # guessed. `uv run pytest` drives the real T-5 suites: they ingest the
+    # full-profile fixture tree (360,400 records over three generations) into
+    # Postgres and validate ~1.28M field_lineage rows through deferred
+    # provenance triggers at COMMIT.
+    #
+    # Measured by running THIS job's exact step sequence against a pristine
+    # `git archive HEAD` export on an Apple-silicon laptop with a warm local
+    # Postgres: `uv run pytest` alone is
+    #
+    #     4295 passed, 2 skipped in 1472.00s (0:24:31)
+    #
+    # and `uv sync` + `alembic upgrade head` + the seed (26.7 s) add ~1-2 min on
+    # top. That is the FLOOR: a 4-vCPU GitHub runner sharing itself with the
+    # Postgres service container runs this workload perhaps 2-2.5x slower, which
+    # puts a realistic CI wall clock around 55-65 minutes. 90 leaves ~1.4x
+    # headroom over that upper bound -- enough that a slow runner does not
+    # produce a red X that means nothing -- and is still far short of GitHub's
+    # 6-hour ceiling, so a genuinely hung job is cut off rather than billed for
+    # an afternoon.
+    timeout-minutes: 90
     defaults:
       run:
         working-directory: service
@@ -28,6 +48,11 @@ jobs:
           POSTGRES_USER: keystone
           POSTGRES_PASSWORD: keystone
           POSTGRES_DB: keystone
+          # Mirrors infra/docker-compose.yml. Text ordering must not vary by
+          # host locale: `locale=C` is what the local database is initialised
+          # with, and a CI database on the image's default collation would sort
+          # text differently from every machine this suite was written on.
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
         ports:
           - 5432:5432
         options: >-
@@ -75,8 +100,12 @@ jobs:
             -c "CREATE EXTENSION IF NOT EXISTS vector;" \
             -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
 
-      - name: uv sync
-        run: uv sync
+      # `--locked` is the service-side counterpart of the dashboard's
+      # `pnpm install --frozen-lockfile`: a bare `uv sync` will quietly re-resolve
+      # and install a dependency set that is NOT the committed uv.lock, so a
+      # green would be a green for packages nobody reviewed. This fails instead.
+      - name: uv sync --locked
+        run: uv sync --locked
 
       - name: ruff check
         run: uv run ruff check .
@@ -90,13 +119,87 @@ jobs:
       - name: alembic upgrade head
         run: uv run alembic upgrade head
 
+      # ---------------------------------------------------------------------
+      # THE STEP WHOSE ABSENCE KEPT THIS JOB RED FOR NINE PUSHES — and whose
+      # FIRST form silently destroyed the repo's only stale-golden guard.
+      #
+      # WHY THE STEP EXISTS. `fixtures/` is gitignored by design (.gitignore:
+      # `fixtures/*`, with an explicit `!fixtures/.gitkeep`), so a fresh
+      # checkout has an empty `fixtures/`. Every T-5-derived suite resolves the
+      # tree through `tests/er/dataset.py:44`
+      #
+      #     FIXTURES = REPO_ROOT / "fixtures"
+      #
+      # and hard-fails collection with "no committed fixture tree at
+      # <workspace>/fixtures: run `make seed` ..." when `manifest.json` is
+      # absent. That single cause produced all 865 errors of run 32828859047,
+      # plus the three genuine failures downstream of it: with no fixtures all
+      # three adapters probe "down" and `/health` rolls that up to 503, which is
+      # what broke `tests/ingest/test_health.py::test_the_endpoint_serves_the_
+      # report` and `tests/test_smoke.py::test_health_reports_real_per_source_
+      # and_database_checks`, while `source_tree_digest()` over an empty tree is
+      # what broke `tests/apply/test_merge_shape.py::test_the_fixture_tree_
+      # digest_names_every_source_file`.
+      #
+      # WHY `--profile full`. `recon/seed/run.py` REFUSES to write a repository
+      # tree from any non-full profile ("only `--profile full` may overwrite the
+      # committed fixtures/ and golden/ trees"), and `tests/apply/store.py:183`
+      # asserts the detected conflict distribution equals
+      # `golden/conflicts.json`'s — the graded 3,050 — so a scaled-down tree
+      # would fail there even if it could be placed.
+      #
+      # WHY `--out`, AND WHY ONLY `fixtures/` IS STAGED BACK. `golden/` is
+      # TRACKED: it is the grading contract, and
+      # `tests/seed/test_committed_golden.py` exists to prove the COMMITTED
+      # bytes are what the committed generator produces at `--profile full
+      # --seed 20260822`. A bare `python -m recon.seed --profile full` writes
+      # BOTH trees at the repository root (`recon/seed/run.py`: `root =
+      # Path(__file__).resolve().parents[3]`), so it would overwrite
+      # `golden/*.json` before pytest ever read them — and that test would then
+      # be comparing the generator against itself. Trivially green, and blind to
+      # exactly the stale or hand-edited golden set it was written to catch. A
+      # step that regenerates the grading contract before checking it has
+      # removed the check. So: seed into a scratch tree, copy ONLY `fixtures/`
+      # into the workspace, discard the scratch `golden/` unread, and let pytest
+      # compare against the bytes that are in git.
+      #
+      # `KEYSTONE_FIXTURES_DIR` cannot replace the copy: it steers only
+      # `recon.adapters.jsonl.default_fixtures_root`, while `tests/er/dataset.py`
+      # computes its constant from `__file__` and reads no environment at all.
+      #
+      # This shape — both files, both jobs — is bound by
+      # `service/tests/integration/test_ci_workflow.py`, which parses this YAML.
+      # ---------------------------------------------------------------------
+      - name: seed the graded dataset into a scratch tree, stage fixtures/ only
+        env:
+          SEED_OUT: ${{ runner.temp }}/keystone-seed
+        run: |
+          set -euo pipefail
+          uv run python -m recon.seed --profile full --out "$SEED_OUT"
+          # Stage the generated fixture tree where tests/er/dataset.py looks for
+          # it. `.gitkeep` is tracked repository content and is left alone; a
+          # shrinking dataset must not leave stale files behind, hence the sweep.
+          mkdir -p ../fixtures
+          find ../fixtures -mindepth 1 -maxdepth 1 ! -name .gitkeep -exec rm -rf {} +
+          cp -R "$SEED_OUT/fixtures/." ../fixtures/
+          test -f ../fixtures/manifest.json
+          # The scratch golden/ tree is deliberately NOT copied. Prove it: the
+          # tracked grading contract must be byte-for-byte what was checked out,
+          # or tests/seed/test_committed_golden.py is checking CI's own output.
+          git -C .. diff --exit-code -- golden/
+
       - name: pytest
         run: uv run pytest
 
   dashboard:
     name: dashboard (node 22)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Raised from 20 for headroom on the two variable steps: `pnpm install` on a
+    # cold pnpm store, and `playwright install --with-deps chromium`, which
+    # downloads a browser build and apt-installs its system libraries. Neither
+    # is slow in the normal case; both are network-bound and neither should be
+    # able to turn a slow morning into a red build.
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: dashboard

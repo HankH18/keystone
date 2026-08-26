@@ -74,7 +74,7 @@ test.describe('keyboard-only reviewer walkthrough', () => {
     // Record what the next few tabs land on and assert it is the document
     // order (nav links, then the filter controls), never a jump.
     const order: string[] = []
-    for (let i = 0; i < 7; i += 1) {
+    for (let i = 0; i < 8; i += 1) {
       await page.keyboard.press('Tab')
       const current = await focusDescriptor(page)
       order.push(current.name)
@@ -86,6 +86,7 @@ test.describe('keyboard-only reviewer walkthrough', () => {
       'Overview',
       'Conflicts',
       'Proposals',
+      'Audit log',
       'Source',
       'Conflict type',
       'Status',

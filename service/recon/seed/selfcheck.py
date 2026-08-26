@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -48,9 +49,148 @@ from .plan import Plan
 from .rng import Rng
 from .sweep import SweepResult, World, _seconds, run_sweep
 
-__all__ = ["CheckResult", "SelfCheckReport", "run_self_check"]
+__all__ = [
+    "MALFORMED_PK_FIELDS",
+    "TIMESTAMP_DIRT_BAND",
+    "TIMESTAMP_DIRT_RATE",
+    "CheckResult",
+    "SelfCheckReport",
+    "declared_primary_keys",
+    "fixture_primary_keys",
+    "malformed_pk_collisions",
+    "run_self_check",
+    "timestamp_dirt_problems",
+]
 
 _MASK_FLOOR = GRADE_ORDER[ENROLLMENT_GRADE_FLOOR]
+
+# ---------------------------------------------------------------------------------------
+# G26 -- the A.3 out-of-order-timestamp rate
+# ---------------------------------------------------------------------------------------
+
+#: A.3: `updated_at < created_at` on **~0.5%** of records, per entity type. This is the
+#: rate `recon.seed.build._apply_timestamp_dirt` draws at, and the number A.3 asks for.
+TIMESTAMP_DIRT_RATE: float = 0.005
+
+#: The band `sc_timestamp_dirt_spread` asserts, and the reason it is a band rather than
+#: the rate itself.
+#:
+#: The generator skews `int(len(records) * 0.005)` records, so the achieved rate is
+#: `0.005` minus at most one record's worth of flooring -- which at `dev` volumes is
+#: visible (`crm.deal`: 3/753 = 0.398%). Enrollments come in lower again on purpose:
+#: their pool excludes every enrollment whose student holds a refunded payment, so that
+#: C13 clause (c) -- the single permitted read of `updated_at` by any rule -- stays
+#: dirt-free, while this rate is measured against *all* enrollments.
+#:
+#: `[0.3%, 0.7%]` is 0.5% +/- 0.2pp. Measured at seed 20260822 the widest excursions are
+#: `dev crm.deal` at 0.398% and `appdb.student` at 0.500%, so both profiles sit inside it
+#: with margin -- and a bucket that lost its dirt entirely (0%) or gained ten times too
+#: much (5%) is outside it, which the assertion this replaced (`count > 0`) was not.
+TIMESTAMP_DIRT_BAND: tuple[float, float] = (0.003, 0.007)
+
+
+def _pct(fraction: float) -> str:
+    return f"{fraction * 100:.1f}%"
+
+
+def timestamp_dirt_problems(skewed: Mapping[str, int], totals: Mapping[str, int]) -> list[str]:
+    """Entity types whose out-of-order-timestamp rate is outside :data:`TIMESTAMP_DIRT_BAND`.
+
+    Split out of the check so the band can be exercised directly against counts the
+    generator did not produce: a rule that has only ever been shown its own happy path
+    is not known to be able to fail.
+    """
+    low, high = TIMESTAMP_DIRT_BAND
+    problems: list[str] = []
+    for label in sorted(skewed):
+        total = totals.get(label, 0)
+        if total <= 0:
+            problems.append(f"{label}: no records at all")
+            continue
+        rate = skewed[label] / total
+        if not low <= rate <= high:
+            problems.append(
+                f"{label}: {skewed[label]}/{total} = {_pct(rate)} out-of-order timestamps, "
+                f"outside A.3's {_pct(low)}-{_pct(high)} band"
+            )
+    return problems
+
+
+# ---------------------------------------------------------------------------------------
+# G27 -- malformed-corpus isolation
+# ---------------------------------------------------------------------------------------
+
+#: SS7 -- the field each source's payload declares its primary key under. The malformed
+#: corpus keys itself in a 9,000,000 band (`CRM-90000NN`, `DEAL-90000NN`, `pi_90000NN`,
+#: `6d9f0d2c-0000-5000-8000-0000000000NN`) precisely so a rejected payload can never name
+#: a record the generator emitted; :func:`malformed_pk_collisions` is what holds that.
+MALFORMED_PK_FIELDS: Mapping[str, str] = {
+    "contact": "crm_id",
+    "deal": "deal_id",
+    "student": "id",
+    "enrollment": "id",
+    "payment": "payment_id",
+}
+
+
+def declared_primary_keys(case: Mapping[str, Any]) -> list[str]:
+    """The primary-key values a malformed payload declares, in payload order.
+
+    Read with a regex rather than `json.loads`, because **most of this corpus does not
+    parse** -- that is what makes it the malformed corpus. A truncated body
+    (`MAL-012`), a trailing comma (`MAL-015`) and a non-object line (`MAL-021`) all
+    still have to be searched, and a parser gives up on the first two and returns no
+    mapping for the third.
+
+    Only the key's own field is read. The deal cases deliberately carry a **real**
+    `associated_contact_ids` (`CRM-0000001`) so the payload is realistic apart from the
+    one thing that is broken about it, and that is a foreign key on a record the adapter
+    rejects before it can land -- not a claim to be that record. Searching the whole raw
+    string for any fixture id, which is what the guard here was originally shaped like,
+    would flag those three cases on every run.
+    """
+    field = MALFORMED_PK_FIELDS.get(str(case.get("entity_type", "")))
+    if field is None:
+        return []
+    pattern = rf'"{re.escape(field)}"\s*:\s*"([^"]*)"'
+    return re.findall(pattern, str(case.get("raw", "")))
+
+
+def fixture_primary_keys(dataset: Dataset) -> dict[str, frozenset[str]]:
+    """Every primary key the generator emitted, by entity type."""
+    return {
+        "contact": frozenset(str(row["crm_id"]) for row in dataset.contacts),
+        "deal": frozenset(str(row["deal_id"]) for row in dataset.deals),
+        "student": frozenset(str(row["id"]) for row in dataset.students),
+        "enrollment": frozenset(str(row["id"]) for row in dataset.enrollments),
+        "payment": frozenset(str(row["payment_id"]) for row in dataset.payments),
+    }
+
+
+def malformed_pk_collisions(
+    fixture_keys: Mapping[str, frozenset[str]],
+    malformed: Sequence[Mapping[str, Any]],
+) -> list[str]:
+    """Malformed cases whose own primary key is a key the generator also emitted.
+
+    `G27`'s isolation clause. SS7's corpus exists to prove the adapter boundary rejects
+    a structurally broken payload; a case that claimed a *real* record's primary key
+    would stop being a boundary test and become a collision with the dataset -- and
+    `MAL-019`/`MAL-020`, the pair whose whole purpose is to produce a `409` against each
+    other, would produce it against a generated contact instead.
+
+    Deterministic: the result is built by walking `malformed` in its committed order and
+    each payload left to right. `fixture_keys` is only ever membership-tested, never
+    iterated, so no set ordering reaches the output.
+    """
+    collisions: list[str] = []
+    for case in malformed:
+        entity = str(case.get("entity_type", ""))
+        known = fixture_keys.get(entity, frozenset())
+        for value in declared_primary_keys(case):
+            if value in known:
+                collisions.append(f"{case.get('case_id')} reuses {entity} PK {value!r}")
+    return collisions
 
 
 @dataclass(frozen=True)
@@ -1051,13 +1191,14 @@ class _Checker:
             if any(p["status"] == "refunded" for p in child.payments)
         }
         skewed: dict[str, int] = {}
+        totals: dict[str, int] = {}
         dirty_refund_enrollments = 0
-        for label, records, key in (
-            ("crm.contact", dataset.contacts, "crm_id"),
-            ("crm.deal", dataset.deals, "deal_id"),
-            ("appdb.student", dataset.students, "id"),
-            ("payments.payment", dataset.payments, "payment_id"),
-            ("appdb.enrollment", dataset.enrollments, "id"),
+        for label, records in (
+            ("crm.contact", dataset.contacts),
+            ("crm.deal", dataset.deals),
+            ("appdb.student", dataset.students),
+            ("payments.payment", dataset.payments),
+            ("appdb.enrollment", dataset.enrollments),
         ):
             count = 0
             for record in records:
@@ -1068,16 +1209,27 @@ class _Checker:
                     ):
                         dirty_refund_enrollments += 1
             skewed[label] = count
-            del key
+            totals[label] = len(records)
         self.fact("out_of_order_timestamps", dict(sorted(skewed.items())))
+        self.fact(
+            "out_of_order_timestamp_rates",
+            {label: round(skewed[label] / totals[label], 5) for label in sorted(skewed)},
+        )
+        timestamp_problems = timestamp_dirt_problems(skewed, totals)
+        if dirty_refund_enrollments:
+            timestamp_problems.append(
+                f"{dirty_refund_enrollments} refund enrollments carry timestamp dirt"
+            )
         self.check(
             "sc_timestamp_dirt_spread",
             "G26",
-            all(count > 0 for count in skewed.values()) and dirty_refund_enrollments == 0,
-            "updated_at < created_at on ~0.5% of each entity type, and on no enrollment "
-            "whose student holds a refunded payment (C13 clause (c) stays dirt-free)"
-            if dirty_refund_enrollments == 0
-            else f"{dirty_refund_enrollments} refund enrollments carry timestamp dirt",
+            not timestamp_problems,
+            f"updated_at < created_at on {_pct(TIMESTAMP_DIRT_BAND[0])}-"
+            f"{_pct(TIMESTAMP_DIRT_BAND[1])} of each entity type (A.3 asks ~0.5%), and on "
+            "no enrollment whose student holds a refunded payment (C13 clause (c) stays "
+            "dirt-free)"
+            if not timestamp_problems
+            else "; ".join(timestamp_problems),
         )
 
         malformed_problems: list[str] = []
@@ -1089,14 +1241,11 @@ class _Checker:
             malformed_problems.append("oversized case is not exactly MAX_PAYLOAD_BYTES + 1 bytes")
         if any(case["entity_type"] != "contact" for case in duplicates):
             malformed_problems.append("duplicate PK exercised outside crm.contact")
-        fixture_ids = {str(row["crm_id"]) for row in dataset.contacts}
-        if any(
-            str(case.get("raw", "")).find(f'"{crm_id}"') >= 0
-            for case in self.malformed
-            for crm_id in ()
-        ):  # pragma: no cover - explicit guard, cheap
-            malformed_problems.append("a malformed case reuses a fixture PK")
-        del fixture_ids
+        collisions = malformed_pk_collisions(fixture_primary_keys(dataset), self.malformed)
+        if collisions:
+            malformed_problems.append(
+                f"{len(collisions)} malformed cases reuse a fixture PK, first: {collisions[0]}"
+            )
         self.check(
             "sc_malformed_isolation",
             "G27",

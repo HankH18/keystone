@@ -148,11 +148,12 @@ from recon.ingest import (
     expected_counts_from_manifest,
     identifier_problem,
     ingest_all,
+    oversized_body_problem,
     parse_body,
     raw_request_body,
 )
-from recon.logging import audit_detail, get_logger
-from recon.privacy import canonical_json
+from recon.logging import get_logger, insert_audit_row
+from recon.privacy import redact
 from recon.resolve import CURRENT_GENERATION, is_materialized, materialize
 
 __all__ = [
@@ -271,10 +272,6 @@ def _default_run_id(job: str) -> str:
 
 _CLAIM_LOCK = text("SELECT pg_advisory_xact_lock(hashtext(:key))")
 _CLAIM_LOOKUP = text("SELECT count(*) FROM audit_log WHERE action = :action AND subject = :subject")
-_CLAIM_INSERT = text(
-    "INSERT INTO audit_log (actor, action, subject, detail) "
-    "VALUES (:actor, :action, :subject, CAST(:detail AS jsonb))"
-)
 
 
 def claim_run(job: str, run_id: str) -> bool:
@@ -283,23 +280,55 @@ def claim_run(job: str, run_id: str) -> bool:
     The advisory lock is transaction-scoped, so it is released by the commit
     that makes the claim durable -- there is no window between "I hold the lock"
     and "the row is visible" for a second caller to slip through.
+
+    **The row goes through the redacting chokepoint.** This used to bind
+    ``actor``, ``action`` and ``subject`` into an ``audit_log`` insert of its own
+    and redact only ``detail``, which made it one of the writers
+    :data:`recon.logging.AUDIT_WRITERS` had to declare as unrouted. ``run_id`` is
+    **client-supplied** -- it arrives in the request body -- so ``subject`` is a
+    value a caller chooses, and ``sync-S-123456`` landed in the audit table
+    verbatim. :func:`recon.logging.insert_audit_row` binds every column through
+    :func:`recon.privacy.redact` instead, so a personal shape in a run id is
+    scrubbed to a token on the way in.
+
+    **The lookup is redacted on the same side of the comparison.** The claim is
+    detected by reading ``subject`` back, so the moment the insert is redacted an
+    un-redacted lookup stops matching and every replay of a run id carrying a
+    personal shape would be claimed *again* -- re-running the job, which is
+    exactly what the idempotency exists to prevent. ``redact`` is a pure function
+    of the value (a keyed digest, not a nonce), so redacting both sides is a
+    stable equality rather than a coincidence, and
+    ``tests/ingest/test_claim_run_redaction.py`` asserts the two sides against
+    each other rather than against a written-down token.
     """
     action = trigger_action(job)
     with role_connection(ROLE_RECON_WRITER) as conn:
         conn.execute(_CLAIM_LOCK, {"key": f"keystone:trigger:{job}:{run_id}"})
-        already = conn.execute(_CLAIM_LOOKUP, {"action": action, "subject": run_id}).scalar_one()
+        already = conn.execute(
+            _CLAIM_LOOKUP,
+            {"action": redact(action, key="action"), "subject": _claim_subject(run_id)},
+        ).scalar_one()
         if already:
             return False
-        conn.execute(
-            _CLAIM_INSERT,
-            {
-                "actor": AUDIT_ACTOR,
-                "action": action,
-                "subject": run_id,
-                "detail": canonical_json(audit_detail({"job": job, "run_id": run_id})),
-            },
+        insert_audit_row(
+            conn,
+            actor=AUDIT_ACTOR,
+            action=action,
+            subject=run_id,
+            body={"job": job, "run_id": run_id},
         )
     return True
+
+
+def _claim_subject(run_id: str) -> str:
+    """``run_id`` exactly as :func:`recon.logging.audit_row` binds ``subject``.
+
+    Named rather than inlined so the read side of the claim states, in one place,
+    that it is reading a *redacted* column -- the failure a silent mismatch
+    produces is not an error but a **lost replay check**, and a lost replay check
+    looks exactly like a successful run.
+    """
+    return str(redact(run_id, key="subject"))
 
 
 #: ``sync``'s stages, in the only order they can run in (module docstring).
@@ -639,10 +668,19 @@ def _trigger(job: str, body: bytes, presented: str | None, app: Any | None = Non
     handler, so the envelope was judged before the credential was. The body now
     arrives as bytes (:func:`recon.ingest.raw_request_body`) and nothing is
     parsed until the guard has said yes.
+
+    The size verdict rides the same dependency and sits in the same place: these
+    two endpoints take a body of at most a run id, so an over-cap request here is
+    never a legitimate load, and it is refused with the identical 413 document
+    ``/internal/ingest/records`` renders rather than a second spelling of it.
     """
     denied = trigger_guard(job, presented)
     if denied is not None:
         return denied
+
+    too_large = oversized_body_problem(body)
+    if too_large is not None:
+        return too_large
 
     payload, invalid = parse_body(body, TriggerRequest)
     if invalid is not None:

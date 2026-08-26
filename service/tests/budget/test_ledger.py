@@ -361,7 +361,7 @@ def test_settling_more_than_was_reserved_is_refused_by_the_database(
     assert reservations(owner_engine, scope) == [("open", RESERVE_AMOUNT, None)]
 
 
-def test_settle_capped_halts_the_run_instead_of_absorbing_the_overspend(
+def test_settle_capped_halts_the_scope_instead_of_absorbing_the_overspend(
     owner_engine: Engine, make_scope: ScopeFactory
 ) -> None:
     """An actual above the reservation is a CAP-RELEVANT EVENT, not a rounding detail.
@@ -375,8 +375,14 @@ def test_settle_capped_halts_the_run_instead_of_absorbing_the_overspend(
     Absorbing that difference and returning a successful settlement is the
     behaviour a red-team run used to charge 13,925 microusd against 30,000,000
     reported -- 29,986,075 uncharged, status ``ok``. So the settlement lands at
-    the reservation, the shortfall is audited **and alerted**, and the run halts
-    with :class:`BudgetOverspend`.
+    the reservation, the shortfall is audited **and alerted**, and every SCOPE
+    the reservation touched is halted before :class:`BudgetOverspend` is raised.
+
+    The scope is what this asserts, and it is deliberately not "the run". Whether
+    a *run* ends on that exception is the caller's: ``python -m recon.incidents``
+    exits ``EXIT_REFUSED``, while ``recon.llm.generate_rationale`` reports
+    ``status="overspend"`` and carries on -- which is exactly why the halt had to
+    move into the ledger, and is what the second half of this test proves.
     """
     scope = make_scope(RESERVE_AMOUNT * 2)
     reservation = _reserve(scope, unique("overflow"))

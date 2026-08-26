@@ -198,9 +198,11 @@ provenance floor is verifiable only inside the landing window.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import re
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -238,7 +240,10 @@ __all__ = [
     "default_redactor",
     "is_token",
     "known_values",
+    "main",
     "redact",
+    "render_sweep",
+    "render_target",
     "retention_rule",
     "run_purge",
     "scrub_text",
@@ -428,6 +433,15 @@ SAFE_KEYS: Final[frozenset[str]] = frozenset(
         # digest the apply captured. A claim about two hashes, never a value --
         # the digests themselves are already here as `before_digest`/`after_digest`.
         "byte_identical",
+        # Two integer counters from the request-size bound in `recon/ingest.py`:
+        # `bytes_read` is how many bytes of a body had been consumed when the limit
+        # was hit (it sits beside `limit_bytes`/`declared_bytes`, which the `_bytes`
+        # suffix already covers), and `value_length` is `len()` of the *environment
+        # variable* `MAX_BODY_BYTES` when it will not parse. Neither is derived from
+        # a record. Added deliberately rather than by widening `SAFE_KEY_SUFFIXES`
+        # with `_read`/`_length`, which would allow-list any future key ending that
+        # way sight unseen.
+        "bytes_read",
         "complete",
         "confidence",
         "conflict_type",
@@ -518,6 +532,8 @@ SAFE_KEYS: Final[frozenset[str]] = frozenset(
         "unchecked_fields",
         "upstream_status",
         "usage",
+        # see `bytes_read` above: `len()` of an unparseable MAX_BODY_BYTES setting
+        "value_length",
         "verdict",
         "version",
         "wanted_status",
@@ -1768,3 +1784,240 @@ def _audit_body(moment: datetime, results: Sequence[PurgeResult]) -> dict[str, A
             if r.disposition != "retain"
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# the entry point: `python -m recon.privacy`
+# ---------------------------------------------------------------------------
+
+
+def render_sweep(results: Sequence[PurgeResult], *, dry_run: bool = False) -> str:
+    """The sweep report, one line per rule, in execution order.
+
+    Counts only. A retention report that quoted a purged value would be a copy of
+    the thing the sweep just removed -- so a line names the table, the disposition,
+    the window and how many rows, and nothing else. It still goes through
+    :func:`recon.logging.console` at the call site, because "no value can appear
+    here" is a property of this function and the chokepoint is what makes it a
+    property of the *output*.
+    """
+    header = "would sweep (dry run)" if dry_run else "swept"
+    lines = [f"retention {header}: {len(results)} rules"]
+    for result in results:
+        window = "--" if result.window_days is None else f"{result.window_days}d"
+        columns = f"  [{', '.join(result.details)}]" if result.details else ""
+        lines.append(
+            (
+                f"  {result.table:<24} {result.disposition:<9} {window:>5} "
+                f"rows={result.rows:<8}{columns}"
+            ).rstrip()
+        )
+    total = sum(result.rows for result in results)
+    lines.append(f"  {'total':<24} {'':<9} {'':>5} rows={total}")
+    return "\n".join(lines)
+
+
+def render_target(url: Any, *, apply: bool) -> str:
+    """Name the database this run is pointed at, **before** it touches it.
+
+    A destructive tool that does not say what it is pointed at is how a retention
+    sweep deleted 37,498 rows out of this project's shared development database:
+    the process that ran it had no ``DATABASE_URL`` of its own, inherited the
+    repository's ``.env``, and printed a report that named tables and row counts
+    and never once named the database they came out of. So every run prints this,
+    dry or not, and prints it before the first statement rather than beside the
+    result.
+
+    **No password, ever** -- the fields are read off the URL one at a time and
+    ``url.password`` is not one of them, which is stronger than rendering the DSN
+    with a masking flag that a later refactor could drop.
+
+    **The ``key=value`` spelling is load-bearing, not cosmetic.** This line goes
+    through :func:`recon.logging.console`, so :func:`scrub_text` reads it: the
+    obvious ``user@host:port/database`` rendering is *email-shaped* on any real
+    deployment host, and comes out as ``[pii:email:...]`` with the hostname and
+    the database name inside the token. A report that redacts the identity of the
+    database it is about to empty is worse than no report. Written as
+    ``host=<host>``, the same string survives the scrubber intact, because
+    ``host``/``database``/``user`` are not PII key names.
+    """
+    mode = "APPLY -- rows WILL be deleted and rewritten" if apply else "dry run -- writes nothing"
+    return (
+        f"retention target: database={url.database} host={url.host or '-'} "
+        f"port={url.port or '-'} user={url.username or '-'} mode={mode}"
+    )
+
+
+def _confirm(target: str) -> bool:
+    """Ask an interactive operator to confirm a destructive sweep.
+
+    Only on a terminal. ``--apply`` is the gate that matters, and it is the whole
+    gate for a cron entry or a CI job, where there is nobody to ask and a prompt
+    would hang; ``sys.stdin.isatty()`` is what tells the two apart. A human at a
+    keyboard gets one more chance to read which database is named on the line
+    above -- which is the failure mode this whole change exists to close.
+    """
+    from recon.logging import console  # local: `recon.logging` imports THIS module
+
+    if not sys.stdin.isatty():
+        return True
+    # The prompt itself goes through `console`, and `input` is called bare, so the
+    # only text this function puts on the terminal is on the chokepoint
+    # `tests/privacy/test_sinks.py` enumerates.
+    console(
+        f"about to APPLY the retention schedule to: {target}\n"
+        "type 'apply' to delete and rewrite rows, anything else to abort:"
+    )
+    answer = input()
+    return answer.strip() == "apply"
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python -m recon.privacy`` -- report, and on request run, the retention schedule.
+
+    This is ``docs/retention-policy.md`` §3.2's body with a transaction, an exit
+    status and a mode flag around it, and nothing else: the schedule, the windows,
+    the dispositions and the order all come from :data:`RETENTION`, which the
+    policy document mirrors row for row. **It is not a scheduler.** §3.3 puts the
+    sweep on the ops/migration principal named by ``DATABASE_URL`` -- the same one
+    that runs ``alembic upgrade`` -- precisely because no application role holds
+    DELETE on a retention-bearing table, and :func:`assert_purge_principal`
+    refuses rather than issuing DELETEs a grant will reject halfway through.
+
+    **Counting is the default; deleting is opt-in.** ``main([])`` -- the CLI with
+    no arguments, which is what a stray ``python -m recon.privacy``, a test, or a
+    misconfigured cron entry actually runs -- names the target, reports every row
+    it *would* remove, rolls back and exits 0. Nothing is deleted without
+    ``--apply``. That is not defensiveness: the previous default was to sweep, and
+    it emptied 180 days out of this project's shared development database, from a
+    process that thought it was unconfigured (see :func:`render_target`). A
+    destructive default turns every mistake about *which database* into permanent
+    data loss, and the schedule is not urgent enough to be worth that.
+
+    **An apply says what it is about to do first.** ``--apply`` runs the counting
+    pass and prints it, then runs the real schedule, both inside one transaction
+    and against one pinned ``now`` so the two agree. The preview costs a second
+    pass of ``SELECT count(*)`` and buys a report that exists even if the DELETEs
+    then fail.
+
+    The caller owns the transaction, which is what §3.2 means by "a sweep can be
+    inspected and rolled back": a refusal, an abort or an exception rolls back the
+    whole schedule rather than leaving it half-applied.
+
+    Exit status: ``0`` swept, or counted; ``1`` refused, because the connected
+    principal is an application writer role; ``2`` misconfigured (argparse, or no
+    ``DATABASE_URL``); ``3`` aborted by the operator at the confirmation prompt.
+    """
+    # One of the ways a Keystone process starts (`recon.logging.ENTRY_POINTS`), so
+    # the redaction chain is installed before anything can be emitted -- and the
+    # report below goes through `console`, the same chokepoint the scorecard uses.
+    # Both imports are local: `recon.logging` imports THIS module, and `recon.db`
+    # must not be imported by a process that only wants the redactor.
+    from recon.logging import configure_logging_once, console
+
+    configure_logging_once()
+
+    parser = argparse.ArgumentParser(
+        prog="recon.privacy",
+        description=(
+            "Report the committed retention schedule against the database DATABASE_URL "
+            "names (docs/retention-policy.md §2). COUNTS ONLY unless --apply is given. "
+            "Connects as the principal named by DATABASE_URL, which must be the "
+            "ops/migration principal, not an application writer role."
+        ),
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "THE DEFAULT, and accepted so it can be written down explicitly: count "
+            "the rows in scope and write nothing. For a table with dependents this "
+            "is a LOWER bound (policy §3.2) -- a parent still blocked by a child "
+            "this same sweep would delete is reported as not-in-scope."
+        ),
+    )
+    mode.add_argument(
+        "--apply",
+        action="store_true",
+        help=(
+            "actually DELETE and rewrite the rows outside their windows, and commit. "
+            "Irreversible. The target database is named on the first line of output, "
+            "and the rows that will go are reported before they go."
+        ),
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="with --apply, skip the confirmation prompt shown on an interactive terminal.",
+    )
+    args = parser.parse_args(argv)
+    # Anything that is not an explicit --apply counts and rolls back. `--dry-run`
+    # sets no separate mode; it is the name of the default, so that a script that
+    # spells it out and a script that forgets to behave identically.
+    applying: bool = args.apply
+
+    from recon.db import DatabaseNotConfigured, database_url, get_engine
+
+    try:
+        url = database_url()
+        # `get_engine` is process-wide and lru_cached, so it is not disposed here:
+        # the sweep is a one-shot job and the process owns the pool's lifetime.
+        engine = get_engine()
+    except DatabaseNotConfigured as failure:
+        parser.error(str(failure))
+
+    target = render_target(url, apply=applying)
+    console(target)
+
+    # One moment for both passes: a preview taken against a cutoff a few
+    # milliseconds older than the DELETE's would report counts the sweep then
+    # disagrees with, and the report is evidence or it is decoration.
+    moment = datetime.now(UTC)
+
+    with engine.connect() as conn:
+        transaction = conn.begin()
+        try:
+            preview = run_purge(conn, now=moment, dry_run=True, audit=False)
+        except PurgeNotPermitted as refusal:
+            transaction.rollback()
+            console(f"retention sweep refused: {refusal}", stream=sys.stderr)
+            return 1
+        except BaseException:
+            transaction.rollback()
+            raise
+        console(render_sweep(preview, dry_run=True))
+
+        if not applying:
+            transaction.rollback()
+            console(
+                "retention: nothing was written. Re-run with --apply to delete and "
+                "rewrite the rows counted above."
+            )
+            return 0
+
+        if not (args.yes or _confirm(target)):
+            transaction.rollback()
+            console("retention sweep aborted: nothing was written.", stream=sys.stderr)
+            return 3
+
+        try:
+            results = run_purge(conn, now=moment, dry_run=False)
+        except PurgeNotPermitted as refusal:  # pragma: no cover - the preview refuses first
+            transaction.rollback()
+            console(f"retention sweep refused: {refusal}", stream=sys.stderr)
+            return 1
+        except BaseException:
+            # A schedule that stopped halfway would leave the dependents of a rule
+            # that has not run yet already deleted. It is all or nothing.
+            transaction.rollback()
+            raise
+        transaction.commit()
+
+    console(render_sweep(results, dry_run=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

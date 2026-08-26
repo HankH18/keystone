@@ -12,7 +12,9 @@ all**. Spend moves only under the triggers on the append-only
 * **RESERVE** is one atomic ``INSERT``. Its ``BEFORE INSERT`` trigger takes the
   ledger row lock (``SELECT ... FOR UPDATE``), checks ``spent + reserve <=
   cap``, and either increments spend or raises SQLSTATE ``KS006``. A raise
-  means: halt the run.
+  means: **the spend stops**. What else stops -- and what deliberately does not
+  -- is spelled out under `What "stop on cap" actually stops`_ below, because
+  three documents used to claim a run-level halt that no caller performed.
 * **SETTLE** is ``UPDATE(actual_microusd, state, settled_at, settle_evidence,
   settle_proof, usage_*)``, ``open -> settled``, exactly once, and -- since
   migration 0010 -- at an amount the settle trigger **derives from the row
@@ -28,10 +30,99 @@ So there is deliberately **no Python-side cap check anywhere in this file**. A
 second check could disagree with the database, and the moment it disagrees the
 database is right and the Python is a bug that reads like a safeguard. What
 Python adds is the four things SQL cannot do: pricing a call from the committed
-table, spanning both scopes atomically, turning ``KS006`` into a halt plus a
-``cap_hit`` audit row plus an alert, and -- the part no trigger can see --
+table, spanning both scopes atomically, turning ``KS006`` into a logged refusal
+with a ``cap_hit`` audit row and an alert, and -- the part no trigger can see --
 deciding *which* evidence a call produced. What the release is worth, given that
 evidence, is the database's arithmetic and no longer this module's.
+
+The daily cap is a DAY, and something has to roll it
+----------------------------------------------------
+R17 mandates a *daily* cap, so the ledger row that carries it is keyed on the
+**UTC date**: ``daily:2026-08-25`` (:func:`daily_scope`, :func:`daily_scope_for`).
+It used to be the fixed string ``daily``, and nothing anywhere rolled it -- which
+made the "daily" cap a **lifetime** cap. Measured, in
+``recon.incidents._daily_cap_for``'s own note: one bare ``python -m
+recon.incidents`` pass over the golden set costs 56,487 microusd of it, so the
+seeded 5 USD budget was spent for good after ~88 hand runs and every metered call
+in the service was refused from then on, with no date on which that recovered.
+
+A date-keyed scope rolls by **naming a different row**, which is the only form of
+rolling this schema can express honestly: ``spent_microusd`` is writable by
+nobody (migration 0005 deleted the write grants rather than guarding them), so
+"reset the day" cannot mean zeroing a counter -- zeroing the spend is the exact
+red-team move the schema exists to refuse. Yesterday's row keeps yesterday's
+reservations and yesterday's spend for ever, and today's cap is a fresh row.
+
+The new day's row is therefore **provisioned by ops**, like every other ledger
+row (:func:`provision_scope`; ``recon_writer`` holds no INSERT on
+``budget_ledger`` at all).
+
+**And ops opens it by itself, the first time a reservation looks for it**
+(:func:`_open_todays_daily_scope`). That is not a convenience. Keying the scope
+on the date means the row the deployment had -- the bare string ``daily`` --
+stops being the row the code asks for the moment the change ships, so a version
+that waited for a cron would refuse **every** metered call in the live service,
+hourly reconcile included, from the deploy until a human added the cron *and* ran
+it once by hand. A change that takes the service down until somebody notices is
+not a fix, whatever its own tests say. So :func:`reserve` catches
+:class:`LedgerScopeMissing` for exactly one scope name -- ``daily:<today in
+UTC>``, which it computed rather than accepted -- opens it on the ops principal
+at the deployment's configured cap, and retries once.
+
+What that deliberately is *not* is a way to obtain budget. The name is not a
+parameter, an override (:data:`DAILY_SCOPE_ENV`) is never opened this way, the
+cap is :data:`DAILY_CAP_USD_ENV` parsed exactly as migration 0005 parses it,
+``ON CONFLICT DO NOTHING`` means an existing day is never widened or re-zeroed,
+and the INSERT still runs on :func:`ops_engine` -- so a process configured *as*
+the capped party gets a permission error, no row, and the original refusal. Every
+other scope, including yesterday's and a stand-in an override names, still raises
+:class:`LedgerScopeMissing`: a loud configuration fault, and never a quiet charge
+to somebody else's budget.
+
+``python -m recon.budget roll`` stays, because opening a day *ahead* of time, at
+a stated cap, or re-opening one the deployment missed is a real ops action. It is
+no longer a cron the deployment depends on to serve traffic.
+
+.. _What "stop on cap" actually stops:
+
+What "stop on cap" actually stops
+---------------------------------
+``KS006`` stops the SPEND, for every caller, with no way past it: the trigger
+refuses the reservation, nothing is charged, no provider call happens without a
+live reservation, and a retry is a fresh trip through the same trigger rather
+than a second use of a refused one. Every refusal logs, writes a ``cap_hit``
+audit row and fires the alert (:func:`record_cap_hit`).
+
+What happens to the *run* is the caller's decision, and the two callers differ.
+Both are stated here rather than in one word, because "``KS006`` ⇒ halt run" was
+written in this docstring, in :mod:`recon.llm` and in ``docs/DESIGN.md`` while
+no caller performed a run-level halt at all:
+
+* **the metered batch job halts.** ``python -m recon.incidents`` lets
+  :class:`BudgetCapExceeded` propagate out of its embedding pass
+  (:func:`recon.incidents.embed_descriptors`, whose ``except BudgetError: raise``
+  is there precisely so it does) and exits ``EXIT_REFUSED`` from
+  :func:`recon.incidents.main`, whose ``except (IncidentError, BudgetError,
+  ValueError)`` catches **every** class in this module's hierarchy. Stop, logged,
+  alerted, non-zero exit;
+* **the reconcile path degrades, and does not halt.**
+  :func:`recon.llm.generate_rationale` returns ``status="cap_hit"`` with
+  ``text=None``; ``recon.reconciler``'s rationale hook turns that into ``None``
+  and the proposal lands with ``rationale NULL``. The run continues. Every later
+  conflict makes its own reservation and meets the same refusal, so the audit log
+  carries one ``cap_hit`` row and one alert per refused attempt, not one per run.
+
+The degradation is deliberate, and it is not a gap left open. The LLM is
+rationale *text* and nothing else -- it never detects, never scores, never writes
+-- so ending a detection run because its nicety budget is gone would drop
+conflicts that the cap has nothing to do with. And the obvious "fix" (a
+process-side latch that stops attempting once the cap has spoken) is exactly the
+Python-side cap check this module refuses to have: it answers "is there budget?"
+without asking the database. The committed ``spend-cap-burst`` scorecard row is
+the measurement that the answer always comes from the trigger -- 120 contenders,
+6 granted, 114 refused, **every** refusal carrying ``KS006``, 124 ``cap_hit``
+rows and 124 alerts -- and a latch would replace 114 database refusals with 113
+Python guesses.
 
 Both scopes, one transaction, and no way to ask for fewer
 ----------------------------------------------------------
@@ -137,7 +228,10 @@ Two consequences follow, both correct, both stated here rather than discovered:
 
 * **a retry after a post-send failure pays the worst case twice.** That is the
   honest price of not knowing where a failure happened, and it is why a failure
-  storm now walks into the cap and halts instead of refunding itself forever;
+  storm now walks into the cap and is **refused** there -- ``KS006``, every
+  attempt, until the day rolls -- instead of refunding itself forever against a
+  ledger that never moves. What the refusal does to the *run* is the caller's,
+  and both answers are above;
 * **an abandoned reservation consumes its budget permanently.** A dead lease is
   evidence the *holder* died. It is not evidence the *call* did not happen -- a
   child process that completed a paid call and was then ``SIGKILL``ed used to
@@ -178,7 +272,7 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from functools import lru_cache
@@ -191,7 +285,7 @@ from sqlalchemy.engine import Connection
 from sqlalchemy.exc import DBAPIError
 
 from recon.db import ROLE_RECON_WRITER, get_engine, role_connection
-from recon.logging import audit_detail, get_logger
+from recon.logging import get_logger, insert_audit_row
 
 __all__ = [
     "ALERT_CAP_HIT",
@@ -206,8 +300,11 @@ __all__ = [
     "AUDIT_SCOPE_RESUMED",
     "AUDIT_SETTLE_OVERFLOW",
     "AUDIT_SWEEP_CHARGED",
+    "DAILY_CAP_USD_ENV",
     "DAILY_SCOPE",
     "DAILY_SCOPE_ENV",
+    "DAILY_SCOPE_SEPARATOR",
+    "DEFAULT_DAILY_CAP_USD",
     "DEFAULT_LEASE_SECONDS",
     "DEFAULT_SWEEP_GRACE_SECONDS",
     "KS_CAP_EXCEEDED",
@@ -243,6 +340,7 @@ __all__ = [
     "cap_microusd_from_env",
     "cost_microusd",
     "daily_scope",
+    "daily_scope_for",
     "degenerate_usage_reason",
     "fire_alert",
     "halt_scope",
@@ -261,6 +359,7 @@ __all__ = [
     "register_alert_sink",
     "reserve",
     "resume_scope",
+    "roll_daily_scope",
     "run_scope",
     "scope_key",
     "settle",
@@ -268,6 +367,7 @@ __all__ = [
     "settle_failed_call",
     "sweep_expired_reservations",
     "unregister_alert_sink",
+    "utc_today",
     "worst_case_input_tokens",
     "worst_case_microusd",
 ]
@@ -289,14 +389,24 @@ SQLSTATE_UNIQUE_VIOLATION: Final = "23505"
 
 MICROUSD_PER_USD: Final = 1_000_000
 
-#: The hard daily scope, spelled exactly as migration 0005 seeds it and as
-#: DESIGN pins it. See :func:`provision_scope` for the operational note on
-#: rolling it.
+#: The **family** the hard daily cap's ledger rows belong to. One row per UTC
+#: day, named ``daily:<YYYY-MM-DD>`` by :func:`daily_scope_for`; this bare string
+#: is the row migration 0005 seeds and is no longer charged by anything, because
+#: a cap that never rolls is a lifetime cap. See :func:`daily_scope`.
 DAILY_SCOPE: Final = "daily"
+
+#: Separates the family from the UTC day in a daily scope name.
+DAILY_SCOPE_SEPARATOR: Final = ":"
 
 #: Points the mandated daily cap at a stand-in ledger row. Deployment
 #: configuration, never a caller's argument -- see :func:`daily_scope`.
 DAILY_SCOPE_ENV: Final = "KEYSTONE_DAILY_SCOPE"
+
+#: The day's cap, read exactly as migration 0005 reads it (same variable, same
+#: default, same :func:`cap_microusd_from_env` parse), so the row ``roll``
+#: provisions for a new day carries the cap the migration would have seeded.
+DAILY_CAP_USD_ENV: Final = "DAILY_CAP_USD"
+DEFAULT_DAILY_CAP_USD: Final = "5.00"
 
 #: The **ops** principal's DSN, when the process's own ``DATABASE_URL`` is not
 #: it. See :func:`ops_engine`.
@@ -403,7 +513,34 @@ class UnknownModelError(BudgetError):
 
 
 class BudgetCapExceeded(BudgetError):
-    """The database refused a reservation with ``KS006``: halt the run.
+    """The database refused a reservation with ``KS006``. **The spend stops here.**
+
+    What stops is the spend, in the trigger, for every caller and with no way
+    past it: nothing was charged, no provider call happens without a live
+    reservation, and a retry is a fresh trip through the same trigger rather than
+    a second use of a refused one.
+
+    **What stops besides the spend depends on the caller, and this docstring used
+    to name the wrong one.** It said "halt the run", which was true of neither
+    caller at the time it was written -- the same claim the module docstring and
+    ``docs/DESIGN.md`` carried while no code performed a run-level halt at all.
+    The two real behaviours are:
+
+    * ``python -m recon.incidents`` **does** halt. It lets this propagate out of
+      :func:`recon.incidents.embed_descriptors` and exits ``EXIT_REFUSED`` from
+      :func:`recon.incidents.main`, which catches :class:`BudgetError`. Non-zero
+      exit, nothing further attempted;
+    * the **reconcile path degrades and keeps going**.
+      :func:`recon.llm.generate_rationale` turns this into ``status="cap_hit"``
+      with ``text=None``, the proposal lands with ``rationale NULL``, and the run
+      continues -- so every later conflict makes its own reservation, meets the
+      same refusal, and writes its own ``cap_hit`` row and alert.
+
+    Both are deliberate and the module docstring's `What "stop on cap" actually
+    stops`_ has the reasoning: the LLM is rationale text only, so ending a
+    detection run because its nicety budget is gone would drop conflicts the cap
+    has nothing to do with, and a process-side latch to make "the run halts" true
+    would be the Python cap check this module refuses to have.
 
     Carries the scope that refused, so a caller can tell "this run is done" from
     "the whole day is done" without re-reading the ledger.
@@ -424,6 +561,14 @@ class LedgerScopeMissing(BudgetError):
     a :class:`BudgetCapExceeded`: recording it as one would write false
     ``cap_hit`` rows into the audit log the dashboard reconciles against (R18)
     and page someone about a budget that was never reached.
+
+    **One scope is exempt and only one**: ``daily:<today in UTC>``, which
+    :func:`reserve` opens on the ops principal and retries once
+    (:func:`_open_todays_daily_scope`), because a date-keyed daily cap whose row
+    nothing opened would refuse the whole live service on the day it shipped.
+    Reaching this for any *other* scope -- a ``run:`` scope, a stand-in an
+    override names, a past day -- still means exactly what it says, and reaching
+    it for today's own row means the ops principal could not open it either.
     """
 
     def __init__(self, scope: str, detail: str) -> None:
@@ -463,9 +608,19 @@ class BudgetOverspend(BudgetError):
     A cap-relevant event, not a rounding detail. The reservation settles at its
     full reserved amount (the database refuses more, correctly), the shortfall
     -- the part of the reported cost the ledger structurally cannot hold -- is
-    audited and alerted, and this is raised so the run **halts**. Absorbing the
-    difference and reporting success is how 29,986,075 microusd went uncharged
-    in a red-team run.
+    audited and alerted, and **every scope the reservation touched is halted**
+    before this is raised. Absorbing the difference and reporting success is how
+    29,986,075 microusd went uncharged in a red-team run.
+
+    The halt this guarantees is the **scope's**, and it is durable: it lives in
+    ``audit_log``, :func:`reserve` refuses a halted scope with
+    :class:`BudgetScopeHalted` from then on, and only ops lifts it
+    (:func:`resume_scope`). Whether the *run* also ends is the caller's, exactly
+    as it is for :class:`BudgetCapExceeded`: ``python -m recon.incidents`` exits
+    ``EXIT_REFUSED``, while :func:`recon.llm.generate_rationale` reports
+    ``status="overspend"`` and the reconcile run carries on -- meeting
+    :class:`BudgetScopeHalted` on its very next reservation, which is why the
+    halt was moved into the ledger and out of a return value nobody read.
     """
 
     def __init__(self, settlement: Settlement) -> None:
@@ -473,7 +628,9 @@ class BudgetOverspend(BudgetError):
             f"settlement for {settlement.idempotency_key!r} reported "
             f"{settlement.reported_microusd} microusd against a reservation of "
             f"{settlement.reserve_microusd}: {settlement.shortfall_microusd} microusd "
-            "cannot be charged to the ledger. Halting the run."
+            "cannot be charged to the ledger. Every scope this reservation touched "
+            "is HALTED and will refuse further reservations until ops reconciles "
+            "the ledger and calls recon.budget.resume_scope."
         )
         self.settlement = settlement
         self.idempotency_key = settlement.idempotency_key
@@ -1119,10 +1276,20 @@ def provision_scope(scope: str, cap_microusd: int) -> bool:
     ``ON CONFLICT DO NOTHING``: an existing cap is never widened here. Raising a
     cap is a deliberate ops action, not a side effect of starting a run.
 
-    Note on ``daily``: migration 0005 seeds one row spelled exactly ``daily``,
-    which DESIGN pins, and nothing in the schema rolls it at midnight. Rolling
-    or resetting the daily scope is an ops action against this function's
-    principal; the capped party structurally cannot do it.
+    Note on the daily cap: it lives in one row **per UTC day**
+    (``daily:<YYYY-MM-DD>``, :func:`daily_scope_for`), so rolling the day means
+    creating the next day's row -- :func:`roll_daily_scope`, which is this
+    function under a name that says what it opens. Nothing in the schema does it
+    at midnight and nothing can: ``spent_microusd`` is writable by nobody, so a
+    day is rolled by naming a new row and never by resetting a counter. It is an
+    ops action against this function's principal; the capped party structurally
+    cannot perform it.
+
+    Which is why the day's row opens **itself** on first use rather than waiting
+    for an operator: :func:`_open_todays_daily_scope` reaches this function, on
+    this principal, for exactly one computed scope name. Nothing about the
+    boundary moves -- the caller of ``reserve`` still cannot reach it, and cannot
+    name a scope or a cap if it did.
     """
     if cap_microusd < 0:
         raise ValueError("a cap cannot be negative")
@@ -1145,6 +1312,66 @@ def provision_run_scope(run_id: str, cap_microusd: int | None = None) -> bool:
         else cap_microusd_from_env("PER_RUN_CAP_USD", "1.00")
     )
     return provision_scope(run_scope(run_id), cap)
+
+
+def roll_daily_scope(
+    day: date | None = None, cap_microusd: int | None = None
+) -> tuple[str, int, bool]:
+    """Open the hard daily cap's ledger row for ``day``. Returns ``(scope, cap, created)``.
+
+    **This is what makes the daily cap daily.** R17's cap is a *day's* budget;
+    the scope that carried it was a fixed string that nothing rolled, so it was a
+    lifetime budget that ~88 hand runs exhausted for good.
+
+    Two callers, one of which is not a person. :func:`_open_todays_daily_scope`
+    calls this the first time a reservation finds today's row missing, which is
+    what lets the deployment serve traffic on a day nobody opened; ``python -m
+    recon.budget roll`` calls it when an operator wants a day opened *ahead* of
+    time, at a stated cap, or wants to re-open one. The second is an ops
+    convenience now, not something the service waits for.
+
+    A day is rolled by **naming the next row**, not by resetting a counter --
+    ``spent_microusd`` is writable by nobody, and an ops principal that zeroed it
+    would be re-inventing the red-team move migration 0005 deleted the column's
+    write grants to stop. Yesterday's row keeps yesterday's reservations and
+    yesterday's spend, permanently and legibly.
+
+    Idempotent, through :func:`provision_scope`'s ``ON CONFLICT DO NOTHING``: an
+    operator running it twice, a retry, or fifty concurrent requests all opening
+    the day at once do **not** widen a cap or clear a day's spend. ``created``
+    says which happened, and the returned cap is the row's *actual* cap read back
+    -- so a second run reports the cap that is really in force rather than the
+    one it would have set.
+
+    The default cap is :data:`DAILY_CAP_USD_ENV` parsed exactly as migration 0005
+    parses it, so a rolled day and a freshly migrated database agree.
+    """
+    scope = daily_scope_for(day if day is not None else utc_today())
+    cap = (
+        cap_microusd
+        if cap_microusd is not None
+        else cap_microusd_from_env(DAILY_CAP_USD_ENV, DEFAULT_DAILY_CAP_USD)
+    )
+    created = provision_scope(scope, cap)
+    row = ledger_row(scope)
+    if row is None:  # pragma: no cover - the row was just provisioned or existed
+        raise BudgetError(
+            f"the daily scope {scope!r} is absent immediately after provisioning it; "
+            "the ops principal's INSERT was rolled back or another writer removed the row"
+        )
+    log.info(
+        "budget.daily_scope_rolled",
+        scope=scope,
+        cap_microusd=row.cap_microusd,
+        spent_microusd=row.spent_microusd,
+        # `outcome` and not `created`: every key this package logs has to be on
+        # the committed vocabulary in `recon.privacy`, or default-deny emits it
+        # as an opaque token and the ops line stops being readable
+        # (`tests/privacy/test_logging_installed.py`). Widening that allow-list
+        # is another ticket's file; naming the key from it is free.
+        outcome="opened" if created else "already open",
+    )
+    return scope, row.cap_microusd, created
 
 
 @dataclass(frozen=True)
@@ -1170,9 +1397,127 @@ def ledger_row(scope: str) -> LedgerRow | None:
     return None if row is None else LedgerRow(row.scope, row.cap_microusd, row.spent_microusd)
 
 
+def _open_todays_daily_scope(scope: str) -> bool:
+    """Open **today's own** daily row on demand. Says whether it now exists.
+
+    This is what makes the date-keyed daily cap *deployable*. The row a running
+    deployment has is the row the previous code asked for; the moment the scope
+    became ``daily:<YYYY-MM-DD>`` the name changed under it, so without this the
+    first request after a deploy -- and every request after that, on a service
+    reconciling thousands of conflicts an hour -- is refused
+    :class:`LedgerScopeMissing` until a human adds a cron and runs it once by
+    hand. Waiting for that is a live outage with a scheduled fix.
+
+    Every property that made ledger provisioning an ops action survives, because
+    this does not add a new way to provision one -- it calls the same
+    :func:`roll_daily_scope` the cron does, on the same principal:
+
+    * **the name is computed, never accepted.** The argument is checked for
+      equality against ``daily_scope_for(utc_today())`` and the function returns
+      ``False`` for anything else -- yesterday's row, a ``run:`` scope, and in
+      particular whatever :data:`DAILY_SCOPE_ENV` names. That last one is
+      load-bearing: :func:`daily_scope` promises that redirecting the mandated
+      cap "cannot buy budget that was not already provisioned", and following the
+      *resolved* scope here instead of today's own row would make a stand-in name
+      mint a fresh row with a fresh day's cap;
+    * **the cap is the deployment's**, :data:`DAILY_CAP_USD_ENV` parsed exactly
+      as migration 0005 parses it. No caller names it;
+    * **an existing day is untouched.** :func:`provision_scope` is ``ON CONFLICT
+      DO NOTHING``, so the concurrent requests that all take this path on a cold
+      morning open one row between them, and none of them widens a cap or clears
+      a spend;
+    * **the grant is still the boundary.** The INSERT runs on
+      :func:`ops_engine`, and ``recon_writer`` holds no INSERT on
+      ``budget_ledger`` at all (migration 0005). A process configured as the
+      capped party gets a permission error here, which is caught, logged and
+      answered ``False`` -- so the caller raises its original
+      :class:`LedgerScopeMissing` rather than proceeding as though a row existed.
+
+    Any failure is swallowed into ``False`` for that last reason: the fallback is
+    the refusal that was already on its way, and losing it behind a secondary
+    exception would replace an honest "nobody opened today" with whatever the
+    ops connection happened to say.
+    """
+    day = utc_today()
+    if scope != daily_scope_for(day):
+        return False
+    try:
+        opened, cap_microusd, created = roll_daily_scope(day)
+    except Exception as exc:
+        log.error(
+            "budget.daily_scope_open_refused",
+            scope=scope,
+            outcome="refused",
+            detail=(
+                f"{type(exc).__name__}: {exc}. The day's ledger row could not be "
+                "opened by the ops principal, so the reservation that needed it "
+                "stays refused."
+            ),
+        )
+        return False
+    log.info(
+        "budget.daily_scope_opened_on_demand",
+        scope=opened,
+        cap_microusd=cap_microusd,
+        outcome="opened" if created else "already open",
+    )
+    return True
+
+
 # ===========================================================================
 # reserve
 # ===========================================================================
+def _utc_now() -> datetime:
+    """The wall clock, in UTC. The **one** place the daily cap reads the time.
+
+    A function rather than an inline ``datetime.now(tz=UTC)`` so a test can prove
+    that the scope rolls across a UTC date boundary by moving the clock instead
+    of by waiting for one -- ``tests/budget/test_daily_roll.py`` does exactly
+    that. Nothing graded depends on this value: the ledger scope name is not part
+    of any dataset, conflict set or confidence vector.
+    """
+    return datetime.now(tz=UTC)
+
+
+def utc_today(now: datetime | None = None) -> date:
+    """The UTC calendar day of ``now`` (default: the wall clock).
+
+    **UTC, deliberately, and a naive datetime is refused.** A "daily" cap whose
+    day depends on the host's timezone rolls at a different instant on every
+    machine that runs the cron, which means two rows are live at once for one
+    stretch of every day and neither of them is the day's budget. The refusal is
+    the guard: a naive value is a clock whose zone nobody stated.
+    """
+    moment = now if now is not None else _utc_now()
+    if moment.tzinfo is None:
+        raise ValueError(
+            "a naive datetime cannot name a UTC day: the daily cap rolls at "
+            "00:00 UTC, so the moment it is asked about must say which zone it is in"
+        )
+    return moment.astimezone(UTC).date()
+
+
+def daily_scope_for(day: date) -> str:
+    """The ledger row that carries the hard daily cap for UTC ``day``.
+
+    ``daily:2026-08-25``. One row per day is how the cap rolls: ``spent_microusd``
+    is writable by nobody, so a new day is a new row and never a reset counter.
+    Pure and total -- the row this names is opened by
+    :func:`_open_todays_daily_scope` on first use or by ``python -m recon.budget
+    roll`` ahead of time, and :func:`daily_scope` names the row for today.
+    """
+    if isinstance(day, datetime) or not isinstance(day, date):
+        # `datetime` is a subclass of `date`, and its `isoformat()` carries a
+        # time -- so accepting one would name `daily:2026-08-25T09:00:00+00:00`,
+        # a row nobody provisions, once an hour. Convert through `utc_today`,
+        # which is the function that has to decide the zone.
+        raise TypeError(
+            "a daily scope is named after a calendar day (datetime.date), not "
+            f"{type(day).__name__}; call utc_today(moment) to get one"
+        )
+    return f"{DAILY_SCOPE}{DAILY_SCOPE_SEPARATOR}{day.isoformat()}"
+
+
 def daily_scope() -> str:
     """The ledger scope that carries R17's hard daily cap. **Not a parameter.**
 
@@ -1197,12 +1542,29 @@ def daily_scope() -> str:
     not define it. An override is logged loudly every time it is honoured, and
     whatever it names is still an ops-provisioned row with an ops-set cap, so
     redirecting it cannot buy budget that was not already provisioned.
+
+    **The default rolls.** With no override this is ``daily:<today in UTC>`` --
+    one row per day, opened on first use by :func:`_open_todays_daily_scope` --
+    and not the fixed string ``daily``, which nothing rolled and which therefore
+    capped the deployment's *lifetime* rather than its day. Yesterday's spend sits
+    on yesterday's row and cannot refuse today's call; today's cap cannot be
+    reached by spending it yesterday.
+
+    On-demand opening applies to **that computed name only**, never to an
+    override. Both halves of the promise above depend on it: a stand-in that
+    minted its own ledger row on first use would be exactly the "buy budget
+    nobody provisioned" this paragraph says it is not.
+
+    Both spellings of the production row are refused to a test process: the bare
+    family name, and today's actual row. Neither can be smuggled in through the
+    override.
     """
     override = (os.environ.get(DAILY_SCOPE_ENV) or "").strip()
-    if not override or override == DAILY_SCOPE:
+    today = daily_scope_for(utc_today())
+    if not override or override in (DAILY_SCOPE, today):
         if _in_test_process():
-            raise RealDailyScopeRefused((DAILY_SCOPE,))
-        return DAILY_SCOPE
+            raise RealDailyScopeRefused((DAILY_SCOPE, today))
+        return today
     log.warning(
         "budget.daily_scope_overridden",
         scope=override,
@@ -1299,15 +1661,14 @@ _INSERT_RESERVATION = text(
     "RETURNING id"
 )
 
-_INSERT_AUDIT = text(
-    "INSERT INTO audit_log (actor, action, subject, detail, tokens_in, tokens_out, cost_microusd) "
-    "VALUES (:actor, :action, :subject, CAST(:detail AS jsonb), :tokens_in, :tokens_out, "
-    ":cost_microusd)"
-)
-
 
 def _sqlstate(error: BaseException) -> str | None:
     return getattr(getattr(error, "orig", None), "sqlstate", None)
+
+
+#: The key ``audit_log.subject`` is redacted under. Named once because the WRITE
+#: and every LOOKUP have to use the same one; see :func:`_audit_subject`.
+_SUBJECT_KEY: Final = "subject"
 
 
 def _audit(
@@ -1321,26 +1682,58 @@ def _audit(
     cost_microusd: int | None = None,
     actor: str = AUDIT_ACTOR,
 ) -> None:
-    """Append one ``audit_log`` row through the privacy-safe detail builder."""
-    conn.execute(
-        _INSERT_AUDIT,
-        {
-            "actor": actor,
-            "action": action,
-            "subject": subject,
-            "detail": _detail_json(body),
-            "tokens_in": tokens_in,
-            "tokens_out": tokens_out,
-            "cost_microusd": cost_microusd,
-        },
+    """Append one ``audit_log`` row through the **redacting chokepoint**.
+
+    This used to bind ``actor``, ``action`` and ``subject`` straight into its own
+    ``INSERT`` and redact only ``detail`` -- so the one field of a budget audit
+    row that carries a caller-chosen string (``subject``: a ledger scope, or a
+    reservation's idempotency key, both of which are built from a ``run_id`` this
+    module never validated) went to the database exactly as it arrived.
+    :func:`recon.logging.insert_audit_row` binds every column through the
+    committed redactor instead, which is why this module no longer issues that
+    statement itself -- the chokepoint owns the SQL as well as the redaction, so
+    there is no second column list here to drift out of step with it.
+
+    ``actor``/``action``/``subject`` are on the redactor's allow-list, so they are
+    **scrubbed rather than tokenised**: an embedded email, student number, ISO
+    date or ``key=value`` pair is removed and the reference itself survives. That
+    is required, not incidental -- migration 0004's ``KS003`` matches ``actor``
+    against ``^system:``, and a tokenised subject would make ``audit_log``
+    unqueryable for R15/R18. Anything a lookup compares against ``subject`` must
+    go through :func:`_audit_subject`.
+    """
+    insert_audit_row(
+        conn,
+        actor=actor,
+        action=action,
+        subject=subject,
+        body=body,
+        tokens_in=tokens_in,
+        tokens_out=tokens_out,
+        cost_microusd=cost_microusd,
     )
 
 
-def _detail_json(body: Any) -> str:
-    """Canonical JSON for an ``audit_log.detail`` bind, redacted in safe mode."""
-    from recon.privacy import canonical_json  # local: avoids a module-level cycle
+def _audit_subject(scope: str) -> str:
+    """What ``scope`` looks like in ``audit_log.subject`` once it has been written.
 
-    return canonical_json(audit_detail(body))
+    The redaction has to be applied on **both** sides or the halt lookup silently
+    stops finding halts: :func:`_halted_scopes` asks "is there a
+    ``budget_scope_halted`` row for this scope?", and it is asking about a row
+    whose ``subject`` went through :func:`recon.logging.audit_row`.
+
+    Every scope name this module builds -- ``daily:2026-08-25``, ``run:<id>`` --
+    is returned unchanged by the redactor today, so this is the identity for
+    them. It is here for the scope name that is *not*: a ``run_id`` is an
+    arbitrary caller-supplied string, and one carrying something the scrubber
+    recognises would be stored scrubbed and, without this, looked up raw. The
+    same function on both sides makes the two agree by construction rather than
+    by luck.
+    """
+    from recon.privacy import redact  # local: mirrors this module's other privacy imports
+
+    redacted = redact(scope, key=_SUBJECT_KEY)
+    return redacted if isinstance(redacted, str) else scope
 
 
 def record_cap_hit(
@@ -1400,16 +1793,24 @@ def _halted_scopes(conn: Connection, scopes: Sequence[str]) -> tuple[str, ...]:
     (R18), rather than a second piece of state that can disagree with it. A halt
     is durable across processes and deploys, which is the point: an in-memory
     flag would be cleared by the next restart of the very run that overspent.
+
+    The scopes are matched **as an audit row stores them** -- through
+    :func:`_audit_subject`, the same transform :func:`_audit` applies on the way
+    in. A lookup that compared raw names against redacted subjects would answer
+    "not halted" for a halted scope, and that is the direction that keeps
+    spending. What comes back is the caller's own spelling, mapped back from the
+    stored form, so nothing downstream has to know the transform happened.
     """
+    stored = {_audit_subject(scope): scope for scope in scopes}
     rows = conn.execute(
         _LATEST_SCOPE_STATE,
         {
             "actions": [AUDIT_SCOPE_HALTED, AUDIT_SCOPE_RESUMED],
-            "scopes": list(scopes),
+            "scopes": list(stored),
             "halted": AUDIT_SCOPE_HALTED,
         },
     ).fetchall()
-    return tuple(sorted(row.subject for row in rows))
+    return tuple(sorted(stored.get(row.subject, row.subject) for row in rows))
 
 
 def halt_scope(scope: str, *, reason: str, detail: Mapping[str, Any] | None = None) -> None:
@@ -1441,17 +1842,12 @@ def resume_scope(scope: str, *, reason: str) -> None:
     if not reason.strip():
         raise ValueError("resuming a halted scope requires a stated reason")
     with ops_engine().begin() as conn:
-        conn.execute(
-            _INSERT_AUDIT,
-            {
-                "actor": AUDIT_ACTOR_OPS,
-                "action": AUDIT_SCOPE_RESUMED,
-                "subject": scope,
-                "detail": _detail_json({"scope": scope, "reason": reason}),
-                "tokens_in": None,
-                "tokens_out": None,
-                "cost_microusd": None,
-            },
+        _audit(
+            conn,
+            action=AUDIT_SCOPE_RESUMED,
+            subject=scope,
+            body={"scope": scope, "reason": reason},
+            actor=AUDIT_ACTOR_OPS,
         )
     log.warning("budget.scope_resumed", scope=scope, reason=reason)
 
@@ -1493,9 +1889,14 @@ def reserve(
     * ``KS006`` from any scope -- the whole transaction is rolled back by
       Postgres (so no scope is charged for a call that will not happen), a
       ``cap_hit`` audit row is written on a fresh connection, the stubbed alert
-      fires, and :class:`BudgetCapExceeded` is raised. **The caller halts the
-      run; it does not retry past this.** A retry that wanted to try anyway
-      would have to call this function again, and would meet the same trigger;
+      fires, and :class:`BudgetCapExceeded` is raised. **The spend stops here and
+      nothing retries past it inside this function**: an attempt that wants to
+      try anyway has to call this again and meets the same trigger, with the same
+      refusal, and pays another ``cap_hit`` row for the privilege. Whether the
+      *run* ends is the caller's -- ``recon.incidents`` lets this propagate and
+      exits non-zero, ``recon.llm.generate_rationale`` reports ``cap_hit`` and
+      the reconcile run continues with ``rationale NULL``. The module docstring's
+      `What "stop on cap" actually stops`_ says why the second one is deliberate;
     * ``23505`` -- the key is already present. A replayed idempotency key is an
       **idempotent no-op**, which is the entire point of an idempotency key:
       nothing is charged (the duplicate INSERT aborts the transaction, so no
@@ -1508,6 +1909,66 @@ def reserve(
     * a worst case of zero -- :class:`ZeroReservationRefused`, before any
       statement runs. A reservation that reserves nothing is a call the cap
       cannot see.
+
+    One retry, for one scope, and it is not a retry past a cap
+    ---------------------------------------------------------
+    :class:`LedgerScopeMissing` for ``daily:<today in UTC>`` is answered by
+    opening that day's row on the ops principal and attempting **once** more
+    (:func:`_open_todays_daily_scope`); everything else about that refusal is
+    unchanged, and every other scope raises it as before. This is what makes the
+    date-keyed daily cap survive its own deploy -- see the module docstring's
+    `The daily cap is a DAY, and something has to roll it`_ -- and it is not a
+    way past the cap: the row it opens starts at zero spend against the
+    deployment's own cap, an existing row is never widened, and a ``KS006`` that
+    is a real cap hit is not retried at all.
+    """
+    try:
+        return _reserve_once(
+            idempotency_key=idempotency_key,
+            model=model,
+            max_output_tokens=max_output_tokens,
+            max_input_tokens=max_input_tokens,
+            run_id=run_id,
+            table=table,
+            lease_seconds=lease_seconds,
+            now=now,
+        )
+    except LedgerScopeMissing as missing:
+        if not _open_todays_daily_scope(missing.scope):
+            raise
+    # Exactly one retry, outside the `except` so the second attempt is not
+    # nested in the first one's context. A second `LedgerScopeMissing` -- the row
+    # removed again between the two, or the run scope missing as well --
+    # propagates, so this cannot loop.
+    return _reserve_once(
+        idempotency_key=idempotency_key,
+        model=model,
+        max_output_tokens=max_output_tokens,
+        max_input_tokens=max_input_tokens,
+        run_id=run_id,
+        table=table,
+        lease_seconds=lease_seconds,
+        now=now,
+    )
+
+
+def _reserve_once(
+    *,
+    idempotency_key: str,
+    model: str,
+    max_output_tokens: int,
+    max_input_tokens: int,
+    run_id: str,
+    table: PriceTable | None,
+    lease_seconds: int,
+    now: datetime | None,
+) -> Reservation:
+    """One attempt at :func:`reserve`. Every rule that function documents is here.
+
+    Split out only so "open today's ledger row and try again" is a single, once,
+    outside-the-transaction retry rather than a flag threaded through the body --
+    a private param on :func:`reserve` would read like the ``scopes`` escape
+    hatch this module spent three rounds removing.
     """
     resolved = _resolve_scopes(run_id)
     amount = worst_case_microusd(
@@ -1740,8 +2201,10 @@ class Settlement:
     usage: Usage
     #: True when the provider reported more spend than the reservation could
     #: absorb. The reservation settles at its full reserved amount, the
-    #: difference is audited and alerted, the scope is HALTED, and the run
-    #: halts -- never silently dropped, and never reported as success.
+    #: difference is audited and alerted, the scope is HALTED in the ledger, and
+    #: :class:`BudgetOverspend` is raised -- never silently dropped, and never
+    #: reported as success. Whether the caller's *run* ends on that exception is
+    #: the caller's; the scope's refusal is not (see :class:`BudgetOverspend`).
     overflowed: bool = False
     reported_microusd: int | None = None
     #: :attr:`SpendEvidence.kind` of the value that closed it.
@@ -2307,7 +2770,7 @@ def _refuse_capped_principal(conn: Connection) -> None:
 
 
 # ===========================================================================
-# `python -m recon.budget sweep` -- the wiring for the ops cron
+# `python -m recon.budget sweep|roll|resume` -- the wiring for the ops cron
 # ===========================================================================
 def main(argv: Sequence[str] | None = None) -> int:
     """Ops entry point for the budget ledger (``infra/render.yaml``).
@@ -2317,6 +2780,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     reservation whose process died stayed ``open`` for ever. It runs here rather
     than inside the web service on purpose -- it must connect as the ops
     principal, and the web service does not.
+
+    ``roll`` opens a UTC day's ledger row (:func:`roll_daily_scope`) -- ahead of
+    time, at a stated ``--cap-usd``, or after the fact for a day an operator
+    wants open. It runs here rather than in the web service for the same reason
+    ``sweep`` does: it provisions a ``budget_ledger`` row, and the capped party
+    holds no INSERT on that table at all. Idempotent, so running it twice is
+    harmless.
+
+    **It is deliberately not a cron the deployment depends on.** Today's row
+    opens itself the first time a reservation looks for it
+    (:func:`_open_todays_daily_scope`, on this same ops principal), because a
+    date-keyed cap that waited for a scheduled job would refuse every metered
+    call in the live service between the deploy and the operator noticing. What
+    ``roll`` adds is control of *which* day and *what* cap, which nothing on the
+    request path can express.
 
     ``resume`` lifts an overspend halt after ops has reconciled the ledger. It is
     here, on the ops principal, because the capped party must not be able to
@@ -2331,7 +2809,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prog="python -m recon.budget",
         description="Keystone budget ledger operations (ops principal).",
     )
-    parser.add_argument("command", choices=("sweep", "resume"), help="the operation to run")
+    parser.add_argument("command", choices=("sweep", "roll", "resume"), help="the operation to run")
     parser.add_argument(
         "--grace-seconds",
         type=int,
@@ -2364,7 +2842,52 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--scope", default=None, help="the ledger scope, for `resume`")
     parser.add_argument("--reason", default=None, help="why the halt is being lifted")
+    parser.add_argument(
+        "--day",
+        default=None,
+        metavar="YYYY-MM-DD",
+        help=(
+            "the UTC day to roll, for `roll` (default: today in UTC). Any day is "
+            "allowed -- tomorrow, to open it at a chosen cap before it starts, or "
+            "a past one; it never moves spend, because a day is a row and rolling "
+            "one only creates it. Today's own row needs no run of this at all: it "
+            "opens on first use."
+        ),
+    )
+    parser.add_argument(
+        "--cap-usd",
+        default=None,
+        metavar="USD",
+        help=(
+            f"the new day's cap, for `roll` (default: ${DAILY_CAP_USD_ENV}, or "
+            f"{DEFAULT_DAILY_CAP_USD} -- exactly what migration 0005 seeds). "
+            "Ignored when the row already exists: raising a cap is a deliberate "
+            "ops action against an existing row, never a side effect of rolling."
+        ),
+    )
     args = parser.parse_args(argv)
+
+    if args.command == "roll":
+        if args.day is not None:
+            try:
+                day = date.fromisoformat(args.day)
+            except ValueError:
+                parser.error(f"--day must be an ISO calendar date (YYYY-MM-DD), got {args.day!r}")
+        else:
+            day = utc_today()
+        cap = None
+        if args.cap_usd is not None:
+            try:
+                usd = Decimal(args.cap_usd)
+            except (InvalidOperation, ValueError):
+                parser.error(f"--cap-usd must be a decimal number of USD, got {args.cap_usd!r}")
+            if usd < 0:
+                parser.error("--cap-usd cannot be negative")
+            cap = int((usd * MICROUSD_PER_USD).to_integral_value())
+        scope, cap_microusd, created = roll_daily_scope(day, cap)
+        state = "opened" if created else "already open"
+        print(f"{state}: {scope} cap={cap_microusd} microusd")
+        return 0
 
     if args.command == "resume":
         if not args.scope or not args.reason:

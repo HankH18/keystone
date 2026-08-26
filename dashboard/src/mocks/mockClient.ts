@@ -62,14 +62,37 @@
  *      filters with no JOIN — and it keeps the `unverifiable` arm exercised
  *      (`src/routes/filterHonesty.test.tsx`). The verified arm is covered by
  *      `src/lib/filterGuardA8.test.ts` with rows that do carry them.
+ *   4. `listAudit` DERIVES a log from the proposals in this dataset rather than
+ *      standing in for a real `audit_log`. The entries, the actors, the token
+ *      counts and the money are MOCK-ONLY — see `mockAuditLog()`.
  * Anything driven by a REAL service body lives in
  * `src/routes/serviceShape.test.tsx`, which uses no mock at all.
+ *
+ * ===========================================================================
+ * THE ONE THING THIS MOCK WILL NOT INVENT: A VERIFICATION VERDICT.
+ * ===========================================================================
+ * `getScorecard().checks` serves the SEED GENERATOR's self-checks, from the
+ * committed `golden/manifest-summary.json`, because that is the artifact this
+ * mock is seeded from. It does NOT carry `spend-cap-burst`, and it does not
+ * pretend to: that check is `python -m recon.suite`'s verdict on R17's
+ * 120-thread burst against the real budget ledger, and no in-browser stand-in
+ * has run it. `src/routes/Audit.tsx` therefore reports it as *not reported*
+ * under the mock, naming the command that would report it.
+ *
+ * That line is not the same line as the MOCK-ONLY one above, and the difference
+ * matters. Data this mock must invent to be usable — a confidence, a status
+ * mix, a token count — is invented and labelled. A claim about whether a SAFETY
+ * CONTROL WAS VERIFIED is not data: fabricating one would make the demo assert
+ * something about the system that nobody measured.
  */
 import {
   AUTO_APPLY_ELIGIBLE,
   COMPARED_FIELDS,
   SENSITIVE_FIELDS,
   type ApplyMode,
+  type AuditEntry,
+  type AuditPage,
+  type AuditQuery,
   type AutoApplyCheck,
   type AutoApplyVerdict,
   type Conflict,
@@ -575,6 +598,134 @@ function paginate<T>(rows: T[], page = 1, pageSize = 25): Page<T> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// The audit log — MOCK-ONLY, derived from the proposals in this dataset
+// ---------------------------------------------------------------------------
+
+/**
+ * MOCK-ONLY: a deterministic `audit_log` derived from the mock's own proposals.
+ *
+ * The real rows are written by `recon.logging.insert_audit_row` as the pipeline
+ * runs. Nothing in the browser runs that pipeline, so this DERIVES the log a run
+ * would have left, from the proposals this dataset already holds — the same
+ * relationship the mock's proposals have to the golden conflicts.
+ *
+ * Faithful to the service's shapes, because those are knowable:
+ *   - `proposal.created` carries the conflict FINGERPRINT as its subject, not
+ *     the proposal id (`recon.reconciler._proposal_audit_row`); a reviewer
+ *     decision carries the proposal id (`recon.api.review::_decide`). Getting
+ *     this backwards is exactly what the service's own test suite caught, and a
+ *     mock that got it backwards would teach the UI the wrong filter.
+ *   - `detail` is the chokepoint's envelope, `{mode, body_sha256, body}`.
+ *   - a reviewer's `actor` arrives as a REDACTION TOKEN, because the service
+ *     redacts an email-shaped actor on the way in and again on the way out. The
+ *     mock emits a token so the "redacted" rendering is exercised in the demo
+ *     rather than only against a live service.
+ *
+ * MOCK-ONLY and marked as such on screen by the app's mock banner: the token
+ * counts, the money, the timestamps, and the fact that a log exists at all.
+ */
+export function mockAuditLog(data: MockDataset): AuditEntry[] {
+  const entries: AuditEntry[] = []
+  const at = (index: number) =>
+    new Date(Date.UTC(2026, 7, 22, 9, 0, 0) + index * 1000).toISOString()
+  const token = (seed: string) =>
+    `[pii:email:${fnv1a(seed).toString(16).padStart(8, '0')}abcd:aaaaaaaa@aaaaaaa.aaaaaaa]`
+
+  const push = (entry: Omit<AuditEntry, 'id' | 'ts'>) => {
+    entries.push({ ...entry, id: String(entries.length + 1), ts: at(entries.length) })
+  }
+  const envelope = (body: Record<string, unknown>, seed: string) => ({
+    mode: 'safe',
+    body_sha256: fnv1a(seed).toString(16).padStart(8, '0').repeat(8),
+    body,
+  })
+
+  for (const proposal of data.proposals) {
+    const conflict = data.conflictById.get(proposal.conflict_id)
+    push({
+      actor: 'system:reconciler',
+      action: 'proposal.created',
+      subject: proposal.fingerprint,
+      detail: envelope(
+        {
+          proposal_id: proposal.id,
+          conflict_id: proposal.conflict_id,
+          fingerprint: proposal.fingerprint,
+          type: conflict?.type ?? null,
+          status: proposal.status,
+          sensitive: proposal.sensitive,
+          // A STRING, as `recon.reconciler` writes it: the decimal is exact
+          // rather than a float re-render of itself.
+          confidence: proposal.confidence.toFixed(2),
+          created_run: proposal.created_run,
+        },
+        `created:${proposal.id}`,
+      ),
+      tokens_in: null,
+      tokens_out: null,
+      cost_microusd: null,
+    })
+
+    if (proposal.rationale) {
+      // MOCK-ONLY figures. Derived from the fingerprint so they are stable, and
+      // deliberately small: they stand in for a rationale call, they are not a
+      // measurement of one.
+      const tokensIn = 180 + (fnv1a(`in:${proposal.id}`) % 120)
+      const tokensOut = 40 + (fnv1a(`out:${proposal.id}`) % 60)
+      push({
+        actor: 'system:budget',
+        action: 'llm_call',
+        subject: 'daily',
+        detail: envelope(
+          { model: 'mock-rationale-v1', scope: 'daily', proposal_id: proposal.id },
+          `llm:${proposal.id}`,
+        ),
+        tokens_in: tokensIn,
+        tokens_out: tokensOut,
+        cost_microusd: tokensIn * 3 + tokensOut * 12,
+      })
+    }
+
+    if (proposal.decided_by) {
+      push({
+        actor: token(`reviewer:${proposal.decided_by}`),
+        action: `proposal.${proposal.status}`,
+        subject: proposal.id,
+        detail: envelope(
+          {
+            proposal_id: proposal.id,
+            conflict_id: proposal.conflict_id,
+            to_status: proposal.status,
+            sensitive: proposal.sensitive,
+            confidence: proposal.confidence,
+          },
+          `decided:${proposal.id}`,
+        ),
+        tokens_in: null,
+        tokens_out: null,
+        cost_microusd: null,
+      })
+    }
+  }
+
+  push({
+    actor: 'system:reconciler',
+    action: 'reconcile.run',
+    subject: 'run-0003',
+    detail: envelope(
+      { run_id: 'run-0003', conflicts_seen: data.conflicts.length, proposed: data.proposals.length },
+      'reconcile:run-0003',
+    ),
+    tokens_in: null,
+    tokens_out: null,
+    cost_microusd: null,
+  })
+
+  // Newest first, exactly as `recon/api/audit.py` orders by `id DESC`.
+  return entries.reverse()
+}
+
 /**
  * Creates a mock client over a dataset. Exported so tests can build a small,
  * fast dataset; the module-level `mockClient` uses the full golden seed.
@@ -584,6 +735,10 @@ export function createMockClient(
 ): KeystoneApi {
   let cached: Promise<MockDataset> | null = null
   const ready = () => (cached ??= loadDataset())
+  // Derived once per client, so `listAudit` is stable across calls the way a
+  // table is: paging through a log whose ids were re-derived per request would
+  // show a different row on every page turn.
+  let auditCache: AuditEntry[] | null = null
 
   return {
     async listConflicts(query: ConflictQuery): Promise<Page<Conflict>> {
@@ -792,7 +947,42 @@ export function createMockClient(
           total: data.proposals.length,
           by_status: byStatus,
         },
+        // The SEED GENERATOR's self-checks, not the suite's. `spend-cap-burst`
+        // is deliberately absent — see the header: this mock invents data, and
+        // it does not invent a verification verdict.
         checks: goldenSummary.self_check as Record<string, boolean>,
+      }
+    },
+
+    /**
+     * `GET /api/audit`, over the MOCK-ONLY log `mockAuditLog()` derives.
+     *
+     * The three semantics that matter are the service's, not convenience ones:
+     * the filters are applied (an unmatched value empties the page rather than
+     * widening it), the facets are computed over the WHOLE log so selecting one
+     * value does not strand the reviewer, and the totals cover the FILTERED SET
+     * rather than the page on screen.
+     */
+    async listAudit(query: AuditQuery): Promise<AuditPage> {
+      const data = await ready()
+      const log = (auditCache ??= mockAuditLog(data))
+      const rows = log.filter(
+        (entry) =>
+          (!query.actor || entry.actor === query.actor) &&
+          (!query.action || entry.action === query.action) &&
+          (!query.subject || entry.subject === query.subject),
+      )
+      const page = paginate(rows, query.page, query.page_size)
+      return {
+        ...page,
+        totals: {
+          tokens_in: rows.reduce((sum, row) => sum + (row.tokens_in ?? 0), 0),
+          tokens_out: rows.reduce((sum, row) => sum + (row.tokens_out ?? 0), 0),
+          cost_microusd: rows.reduce((sum, row) => sum + (row.cost_microusd ?? 0), 0),
+          priced_rows: rows.filter((row) => row.cost_microusd !== null).length,
+        },
+        actors: [...new Set(log.map((entry) => entry.actor))].sort(),
+        actions: [...new Set(log.map((entry) => entry.action))].sort(),
       }
     },
   }

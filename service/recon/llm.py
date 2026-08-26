@@ -53,7 +53,8 @@ neither is:
 
 * **a retry after a post-send failure pays the full worst case twice.** That is
   the honest price of not knowing, and it is why a failure storm now walks into
-  the cap and halts instead of looping forever against a ledger that never moves;
+  the cap and is refused there, instead of looping forever against a ledger that
+  never moves;
 * **an overspend halts the scope, not just the call.** ``settle_capped`` records
   a durable halt, so the next :func:`recon.budget.reserve` on that scope is
   refused (:data:`STATUS_SCOPE_HALTED`) rather than proceeding against a ledger
@@ -89,6 +90,18 @@ A retry is a fresh :func:`recon.budget.reserve` with a fresh idempotency key --
 never a reuse of a reservation that was already refused, and never a call
 without one. When the cap refuses, the attempt loop stops: a cap hit is
 terminal, and retrying it would only produce more ``KS006``.
+
+**What stops is this call, and the spend.** Not the run: the caller receives
+:data:`STATUS_CAP_HIT` with ``text=None``, ``recon.reconciler``'s rationale hook
+turns that into ``None``, and the proposal lands with ``rationale NULL`` while
+the run carries on -- so the next conflict makes its own reservation and meets
+the same refusal, each one auditing a ``cap_hit`` row and firing an alert. This
+paragraph used to say the run halted; nothing performed that halt, and adding a
+process-side latch to make it true would be the Python cap check
+:mod:`recon.budget` refuses to have (its module docstring, `What "stop on cap"
+actually stops`, has the reasoning and the scorecard measurement). The batch job
+that *does* halt on ``KS006`` is ``python -m recon.incidents``, which lets
+:class:`~recon.budget.BudgetCapExceeded` propagate and exits non-zero.
 
 PII
 ---
@@ -792,9 +805,20 @@ def _attempt_rationale(
                 lease_seconds=lease_seconds,
             )
         except BudgetCapExceeded as exc:
-            # Terminal. `reserve` has already written the `cap_hit` audit row
-            # and fired the alert; the run halts here rather than retrying into
-            # the same trigger.
+            # Terminal FOR THIS CALL, and that is the whole of it. `reserve` has
+            # already written the `cap_hit` audit row and fired the alert, so the
+            # spend has stopped and been recorded; the attempt loop ends here
+            # rather than retrying into the same trigger.
+            #
+            # It does NOT halt the run, and this comment used to say it did. The
+            # caller gets `status="cap_hit"` and `text=None`; `recon.reconciler`'s
+            # rationale hook turns that into `None` and the proposal lands with
+            # `rationale NULL`, so the run continues and the next conflict makes
+            # its own refused reservation. That degradation is the documented one
+            # -- see `recon.budget`'s module docstring, section `What "stop on
+            # cap" actually stops` -- and it is deliberate: the rationale is text
+            # and nothing else, and stopping the caller from Python would be the
+            # process-side cap check that the burst scorecard exists to disprove.
             log.warning(
                 "llm.rationale_skipped_cap",
                 subject=request.subject,

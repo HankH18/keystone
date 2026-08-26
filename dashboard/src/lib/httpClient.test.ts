@@ -205,6 +205,19 @@ const METHODS: {
     invoke: (signal) => httpClient.getScorecard(signal),
     ok: SCORECARD,
   },
+  {
+    name: 'listAudit',
+    invoke: (signal) => httpClient.listAudit({}, signal),
+    ok: {
+      items: [],
+      page: 1,
+      page_size: 25,
+      total: 0,
+      totals: { tokens_in: 0, tokens_out: 0, cost_microusd: 0, priced_rows: 0 },
+      actors: [],
+      actions: [],
+    },
+  },
 ]
 
 beforeEach(() => {
@@ -234,7 +247,9 @@ describe('the exact request each method makes', () => {
     // letting a ninth method ship untested. The number only ever moves UP with a
     // new method, and only together with its rows in both tables — moving it
     // without them is the failure this assertion exists to catch.
-    expect(exposed).toHaveLength(9)
+    // 9 -> 10: `listAudit` was ADDED to the client (`GET /api/audit`,
+    // recon/api/audit.py).
+    expect(exposed).toHaveLength(10)
   })
 
   const CASES: {
@@ -306,6 +321,21 @@ describe('the exact request each method makes', () => {
       pathname: '/api/scorecard',
       method: 'GET',
       ok: SCORECARD,
+    },
+    {
+      name: 'listAudit',
+      invoke: () => httpClient.listAudit({}),
+      pathname: '/api/audit',
+      method: 'GET',
+      ok: {
+        items: [],
+        page: 1,
+        page_size: 25,
+        total: 0,
+        totals: { tokens_in: 0, tokens_out: 0, cost_microusd: 0, priced_rows: 0 },
+        actors: [],
+        actions: [],
+      },
     },
   ]
 

@@ -75,7 +75,8 @@ SYNC_TIMEOUT ?= 3600
 #: `POST /internal/reconcile` scores the conflicts `sync` detected and writes
 #: proposals. Measured at 11.2s end to end over HTTP on the graded dataset
 #: (3,050 conflicts -> 3,050 proposals; the isolated reconcile clock in
-#: `bench:invariant-pass` is 7.29s), so this ceiling is slack, not an expectation.
+#: `bench:detect-persist-reconcile` is 7.29s), so this ceiling is slack, not an
+#: expectation.
 RECONCILE_TIMEOUT ?= 900
 
 DOTENV = if [ -f "$(DOTENV_FILE)" ]; then \
