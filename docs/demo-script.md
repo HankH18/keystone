@@ -40,12 +40,14 @@ flowchart LR
 
 ### 0. Recreate the Postgres container. This is step one, not a footnote.
 
-The running container's log holds **over 450,000 lines** from days of audit work. Measured
-2026-08-24: 454,436 lines, of which 9,450 are `DETAIL:` lines, 100,032 are `STATEMENT:` lines and
-18,124 mention `canonical` — Postgres `ERROR:`/`STATEMENT:` pairs that quote statement parameters
-verbatim. The log grows every time anything touches the database, so read those figures as a floor,
-not a fixed number. They were emitted by earlier passes — including a deliberate sabotage mutant run
-during a prior audit — not by current code, and none of them belong on camera.
+The running container's log holds **over 680,000 lines** from days of audit work. Measured
+2026-08-26: 688,167 lines, of which 14,037 are `DETAIL:` lines, 147,736 are `STATEMENT:` lines and
+24,745 mention `canonical` — Postgres `ERROR:`/`STATEMENT:` pairs that quote statement parameters
+verbatim. Two days earlier the same log was 454,436 lines, so read every figure here as a floor and
+not a fixed number: it grows each time anything touches the database, and a plain `docker restart`
+does not clear it — this container was created 2026-08-22, restarted 2026-08-26, and kept the lot.
+They were emitted by earlier passes — including a deliberate sabotage mutant run during a prior
+audit — not by current code, and none of them belong on camera.
 
 ```bash
 cd <repo>
@@ -57,8 +59,9 @@ make down && make up
 **Also: never type `docker logs` on camera.** There is no beat in this script that needs it.
 
 > Verification status: I did **not** execute `make down && make up` — it would have interrupted work
-> in flight. Everything else in this file I ran. The volume claim is read from the compose file and
-> from the Makefile's own `down:` help text.
+> in flight. The volume claim is read from the compose file and from the Makefile's own `down:` help
+> text. The Verification log at the end lists, row by row, what was re-run on 2026-08-26, what is
+> carried over from the 2026-08-24 rehearsal, and the handful of things nobody has re-measured.
 
 ### 1. Confirm the deliverables the video points at exist
 
@@ -73,20 +76,38 @@ Beat 0 walks `ARCHITECTURE.md` §1 and §2. If it is missing, there is no beat 0
 This is the prerequisite the whole script hangs on. The demo writes to real rows, and a proposal that
 has been approved or applied **cannot be replayed**: a second `approve` answers 409
 `proposal-not-decidable` and a second `apply` answers 409 `apply-not-approved`. There is no "undo and
-go again" — a second take of beat 8 needs a **fresh `CREATE DATABASE … TEMPLATE ks_verify_hh`** (the
-command below, ~5 s), or a different id off the C9 list. Never record against the loaded database
-directly — record against a template copy you can throw away between takes.
+go again" — a second take of beat 8 needs a **fresh `CREATE DATABASE … TEMPLATE ks_score`** (the
+command below, a few seconds), or a different id off the C9 list. Never record against the loaded
+database directly — record against a template copy you can throw away between takes.
 
-On this machine the loaded, graded database is `ks_verify_hh` (3,050 conflicts → 3,050 proposals,
-0 applied, 0 `proposal_events`; it is pristine). Substitute your own if it differs.
+On this machine the loaded, graded database is **`ks_score`** — the database the committed scorecard
+was generated against (3,050 conflicts → 3,050 proposals, 2,670 `pending` + 380 `sensitive_hold`,
+0 applied, 0 `proposal_events`; it is pristine, and it is at migration head). Substitute your own if
+it differs. The earlier `ks_verify_hh` no longer exists on this machine; `ks_score` replaced it.
 
 ```bash
 docker exec keystone-postgres psql -U keystone -d postgres \
   -c "DROP DATABASE IF EXISTS ks_demo;" \
-  -c "CREATE DATABASE ks_demo TEMPLATE ks_verify_hh;"
+  -c "CREATE DATABASE ks_demo TEMPLATE ks_score;"
 ```
 
-Measured: **4.7 seconds** for the 1,089 MB copy. That is your whole retake cost.
+**Measure the template yourself; do not trust a size quoted here.** It was 1,190 MB when this
+paragraph was written and 3,701 MB about an hour later, because `invariant_results` accumulates
+~376,000 rows per invariant run and anything pointed at this database keeps adding to it. A figure
+that triples inside an hour is not a fact to read out; it is a number to re-read:
+
+```bash
+psql -h localhost -p 55432 -U keystone -d postgres \
+  -c "SELECT pg_size_pretty(pg_database_size('ks_score'));"
+```
+
+The copy has not been re-timed in this pass — the last measurement was 4.7 s for a 1,089 MB template
+on 2026-08-24, and the template is larger than that now. Time your own first copy; that is your whole
+retake cost, and it is the only honest way to state it.
+
+If you want a small, stable template instead, truncate `invariant_results` on the copy before you
+make it — the graded rows the demo touches (`conflicts`, `proposals`, `entities`, `field_lineage`)
+do not read it, and the beats below never open it.
 
 ### 3. Write the demo env file, and migrate the copy to head
 
@@ -96,10 +117,13 @@ sed 's|^DATABASE_URL=.*|DATABASE_URL=postgresql://keystone:keystone@localhost:55
 make migrate DOTENV_FILE=/tmp/demo.env
 ```
 
-**This migrate step is mandatory and it is new.** `ks_verify_hh` sits at
-`0014_write_set_from_the_value`; head is now `0015_escalation_reason_grant`. Without the migrate,
-`make serve` refuses at its `db-ready` guard with *"That database is not migrated to head"* and you
-have a dead terminal on camera. Measured: **0.55 s**.
+**Run this even though it is currently a no-op.** Head is now `0017_cap_message_states_refusal`, and
+`ks_score` is already there — so a copy of it is at head and `alembic upgrade head` applies nothing.
+Measured 2026-08-26 against `ks_score`: **0.51 s**, and `alembic current` prints
+`0017_cap_message_states_refusal (head)`. The step stays in the pre-flight because it is a
+half-second insurance policy: `make serve` runs a `db-ready` guard first and refuses any database
+that is not at head — *"That database is not migrated to head. Run 'make migrate' first"* — and a
+dead terminal on camera costs more than the half second does.
 
 Using `DOTENV_FILE=/tmp/demo.env` rather than editing `.env` keeps the repo tree untouched. If you
 prefer `.env`, `cp .env.example .env` and edit `DATABASE_URL` — every command below then drops the
@@ -116,7 +140,9 @@ make dash  DOTENV_FILE=/tmp/demo.env      # vite on :5173, ready in ~0.3 s
 
 Verified: `GET /health` → 200 with all three sources `ok` and generations `[1,2,3]`; the CORS
 preflight from `http://localhost:5173` returns `access-control-allow-origin: http://localhost:5173`
-and `access-control-allow-headers: ... X-Api-Key`; the dashboard renders live rows.
+and `access-control-allow-headers: ... X-Api-Key`; the dashboard renders live rows. The health shape
+was re-read on 2026-08-26 — three sources `ok`, generations `[1,2,3]` — against the deployed service,
+which runs this same code; the CORS pair was measured locally on 2026-08-24 and not re-run since.
 
 ### 5. Set the key in your third (command) terminal
 
@@ -134,6 +160,8 @@ synthetic dataset, deliberately committed so the demo reproduces;
 - `http://localhost:5173/proposals?type=C9`
 - `http://localhost:5173/proposals/6102`
 - `http://localhost:5173/proposals/6397`
+- `http://localhost:5173/audit` — the Audit log page, fourth in the primary nav. New, and it carries
+  the *Verification checks* panel beat 9 otherwise reads out of a text file.
 
 ### 7. Last look before recording
 
@@ -203,10 +231,13 @@ them — the doc says both out loud:
 **Command A — the port has no write member.**
 
 ```bash
-sed -n '279,290p' service/recon/adapters/base.py
+sed -n '313,324p' service/recon/adapters/base.py
 ```
 
 Output is 12 lines: `class ReadOnlyAdapter(Protocol)` with `source_id`, `generations()`, `read()`.
+(The Protocol moved down the file; `313,324` is where it sits as of 2026-08-26. If the file has
+shifted again, `grep -n 'class ReadOnlyAdapter' service/recon/adapters/base.py` gives you the
+starting line and the block is the twelve lines from there.)
 
 **Say:** "Three members. None of them writes. There is no `write`, no `upsert`, no `delete` to
 comment out later — the port structurally cannot express one."
@@ -233,6 +264,10 @@ timings, `degraded:false` and `incomplete:[]` are elided; everything else is ver
    "by_type":{"C1":500,"C10":50,"C11":50,"C12":100,"C13":100,"C14":50,"C2":200,"C3":300,
               "C4":250,"C5":400,"C6":500,"C7":300,"C8":150,"C9":100}}}}
 ```
+
+The invariant half of that block was re-run on 2026-08-26 straight against `ks_score` — 15 rules,
+0 skipped, `results` 376,000, `raw_conflicts` 3,750, `conflicts` 3,050, `oscillating` 25, and the
+same fourteen `by_type` counts. The vector has not moved.
 
 **Say:** "The sources are three snapshot generations and they are already landed, so ingest does
 nothing — `records_ok: 0`. Then fifteen committed SQL rules run against the normalized layer:
@@ -276,24 +311,41 @@ claimed, not re-executed: a cron that double-fires cannot double-ingest."
 
 **Show:** `http://localhost:5173/`
 
+The primary nav has **four** items — Overview, Conflicts, Proposals, **Audit log** — and the jump
+links under the intro read "Go to conflicts · Go to proposals" (two links with a separator, not one
+run-on phrase). Do not promise the audit page here; beat 8 goes there.
+
 **Say:** "Every number on this page is fetched twice — once from `/api/scorecard`, which is the
 committed grading harness's own artifact, and once as the `total` of the matching `/api/conflicts`
 query — and compared. A row that doesn't match is a real discrepancy, not a rounding artefact."
 
 Scroll the *Conflicts by type* table. All fourteen rows read **Match**: 500/500, 200/200, 300/300,
 250/250, 400/400, 500/500, 300/300, 150/150, 100/100, 50/50, 50/50, 100/100, 100/100, 50/50.
-Selected window: run `recon-299d6d2c4fe3d1d6`, 3,050 conflicts, 3,050 proposals, **Match**.
+Selected window: run `recon-299d6d2c4fe3d1d6`, scorecard generated `2026-08-26T07:39:39+00:00`,
+3,050 conflicts, 3,050 proposals, **Match**.
 
-> **Get in front of one thing a grader will notice.** That window says `database ks_verify_hh`, not
-> `ks_demo`. `GET /api/scorecard` serves the *committed* `docs/scorecard.json` artifact, which is
-> stamped with the database the graded suite ran against. Say it out loud: "the left-hand number is
-> the committed harness artifact, the right-hand number is this live database, and the point of the
-> page is that they agree." `ks_demo` is a byte-copy of `ks_verify_hh`, which is why they do.
+> **Get in front of one thing a grader will notice.** The *Selected window* panel does **not** print
+> a database name — it shows Run, Scorecard generated, Conflicts reported, Proposals reported and
+> Reconciliation, and nothing else. The database name is on the artifact behind it: `/api/scorecard`
+> serves the *committed* `docs/scorecard.json`, whose header says **`database ks_score`**, and beat 9
+> puts that header on screen. So if you show beat 9's header, say it out loud: "the left-hand number
+> is the committed harness artifact, the right-hand number is this live database, and the point of
+> the page is that they agree." `ks_demo` is a byte-copy of `ks_score`, which is why they do.
 
-Point at *Proposals by status* and the "Reconciles" column icons.
+Then point at *Proposals by status*. **This table changed and it is now the better half of the
+beat:** it has five columns — Status | What it means | Scorecard | `/api/proposals` total |
+Reconciles — and it reconciles the same way the conflicts table above it does, instead of quoting
+the scorecard. Rows read `Pending review` 2,670/2,670 and `Held for human review` 380/380, both
+**Match**.
 
 **Say:** "Status is never carried by colour alone — icon, word and shape, because 'pending / applied
 / rejected / held' has to survive a colourblind reviewer. That's graded."
+
+> **One cell has a third state, and it is worth ten seconds if you have approved anything.** A status
+> count moves the moment a reviewer decides — approving one proposal takes `pending` from 2,670 to
+> 2,669 against an artifact that still says 2,670. That row then reads **"Moved by review"**, not
+> "Mismatch", because the unfiltered `/api/proposals` total is still 3,050: nothing appeared and
+> nothing vanished, only a state changed. A total that has itself moved is still called a mismatch.
 
 ---
 
@@ -301,15 +353,32 @@ Point at *Proposals by status* and the "Reconciles" column icons.
 
 **Show:** `http://localhost:5173/proposals/6102`
 
-Walk the page top to bottom:
+**The page's real order, so you are not hunting on camera.** Panels run: **Summary** → **Reviewer
+action** → **Auto-apply gate (R24)** → **Reversal ledger (R24)** → **Rationale** → **Evidence
+packet** → **Action record**. Note that Rationale sits *above* Evidence packet, and that the
+Auto-apply gate is passed on the way down — beat 5 comes back to it deliberately, so leave it alone
+for now rather than reading it twice.
+
+The **Summary** `dl` has eight rows, in this order. Read the ones that matter and let the eye pass
+over the rest; the list is exhaustive so nothing on screen is a surprise:
 
 - **Status** — "Pending review · *Waiting for a reviewer decision. Nothing has been written.*"
 - **Confidence** — `0.90`
 - **Proposed fix** — "Writes one field: `crm.contact.grade` *(auto-apply eligible)*"
-- **Conflict** — link to `/conflicts/2440`; rule `R-006`; sources `appdb`, `crm`
-- **Evidence packet** — `observed_values` shows both sides of the disagreement; `derivation` reads
-  *"§4.6 survivorship: write the authoritative `appdb.student.grade` value onto `crm.contact.grade`,
-  in `crm.contact.grade`'s own vocabulary"*
+- **Sensitive field** — "No"
+- **Fingerprint** — the 64-character digest; the identifier that is stable across databases
+- **Conflict** — a link reading "View the conflict this proposal answers", to `/conflicts/2440`. The
+  rule (`R-006`) and the sources (`appdb`, `crm`) are not `dl` rows on this page; they are inside the
+  evidence packet below, and on the conflict page itself
+- **Created on run** — the reconcile run id that wrote it
+- **Decided** — "Not yet decided"
+
+Then scroll past Reviewer action, the gate and the ledger to the **Evidence packet**:
+`observed_values` shows both sides of the disagreement (`crm.contact.grade: "6"` against
+`appdb.student.grade: "1"`); `derivation` reads *"SS4.6 survivorship: write the authoritative
+appdb.student.grade value onto crm.contact.grade, in crm.contact.grade's own vocabulary"* — `SS` is
+the repo's ASCII spelling of `§`, and it is on screen exactly like that, so read it as "section four
+point six" rather than mis-quoting the screen
 
 Then scroll to **confidence → terms** and read the arithmetic off the screen:
 
@@ -329,14 +398,24 @@ The screen shows **all seven** signals, including the four that contributed noth
 deliberate: a packet that listed only the terms that fired would not tell a reviewer what was
 *looked at* and came back negative.
 
+> **If you click through to `/conflicts/2440`, the Classification column reads differently now, and
+> the difference is the point.** It used to render one unattributed string — `left / right`, e.g.
+> "auto-apply eligible / sensitive" — with nothing saying which side was the sensitive one, so a
+> reviewer taking the first half at face value drew exactly the wrong conclusion. It now names each
+> side on its own line. On 2440's `grade` row that reads **"CRM — auto-apply eligible"** over
+> **"App DB — not eligible for auto-apply"**; on a row like `lifecycle`, where the App-DB path is
+> `appdb.student.status`, the second line reads **"App DB — sensitive"**. Worth five seconds if you
+> go there; skip the click otherwise.
+
 **Say:** "Confidence is not a model output and it is not a vibe. It's a committed weighted sum with
 a version and a sha256, and the proposal carries every term that produced it. A reviewer can
 recompute this by hand."
 
-**Then, the honest bit — point at the Rationale panel:**
+**Then, the honest bit — scroll back UP one panel to Rationale** (it sits between the Reversal
+ledger and the Evidence packet, not below them):
 
 > "No rationale attached. The rationale is LLM-written text only and is skipped silently on failure
-> or when the spend cap is hit — the proposal still lands."
+> or when the spend cap is hit — the proposal still lands (R17, DESIGN §Reconciler)."
 
 **Say:** "That's deliberate. On the graded path `LLM_PROVIDER=mock`, and the rationale hook returns
 the no-op function *itself* — no provider is built, no reservation is taken, so the dataset stays
@@ -357,7 +436,8 @@ docker exec keystone-postgres psql -U keystone -d ks_demo -c \
   GROUP BY 1,2 ORDER BY 1,2;"
 ```
 
-Real output on a copy migrated to head (`0015`) — four rows, and it fits on one screen:
+Real output on a copy at head (`0017`) — four rows, and it fits on one screen. Re-run against
+`ks_score` on 2026-08-26; identical:
 
 ```
     grantee    | table_name |            updatable_columns
@@ -368,8 +448,10 @@ Real output on a copy migrated to head (`0015`) — four rows, and it fits on on
  review_writer | proposals  | decided_at, decided_by, status
 ```
 
-> If your copy still shows `recon_writer | conflicts | last_seen_run, status`, you skipped pre-flight
-> step 3. `0015_escalation_reason_grant` adds the third column; on `0014` you will see two.
+> If your copy shows `recon_writer | conflicts | last_seen_run, status`, it is on a database older
+> than `0015_escalation_reason_grant`, which is the revision that adds the third column. `ks_score`
+> is well past it — it sits at head, `0017_cap_message_states_refusal` — so a copy of it shows
+> three. Two columns means you copied something other than `ks_score`.
 
 **Say:** "This is the whole holds-before-writes guarantee, and it is a `GRANT`, not a code comment.
 `recon_writer` — the role the reconciler runs as — appears once, on three columns of `conflicts`,
@@ -413,6 +495,9 @@ The table renders all ten conditions with **met / NOT met** in words:
 | `rollback_path` | met |
 | `status_appliable` | NOT met — `status is 'pending'; apply_writer may only move 'approved' -> 'applied' (SQLSTATE KS004)` |
 
+Re-evaluated against `ks_score` on 2026-08-26: same ten conditions, same two failures, same two
+detail strings.
+
 **Say:** "This is the strongest version of this beat, because the gate isn't refusing because
 something is broken. Eight of the ten conditions hold, and the two that don't are different in kind.
 `confidence_floor` is the substantive refusal — it names the number and the requirement,
@@ -442,9 +527,12 @@ is above it. 6102's own packet records `positive_clamped: false`, because its po
 exactly 1.00 rather than over it.)*
 
 *(If you prefer the API for this beat, the same verdict is on `GET /api/proposals/6102` under
-`auto_apply`, and a real `?auto=true` attempt returns HTTP 409 `auto-apply-refused` with detail
-`R24's gate refused proposal 6102: confidence 0.9000 < 0.95 (R24)` and the same ten checks in the
-body. The UI is the better shot; the 409 is the better artefact.)*
+`auto_apply`, and a real `?auto=true` attempt returns HTTP 409 `auto-apply-refused` with the same ten
+checks in the body. **After** the approve the detail reads
+`R24's gate refused proposal 6102: confidence 0.9000 < 0.95 (R24)`; before it, the same detail also
+carries the `status is 'pending'; apply_writer may only move 'approved' -> 'applied'` clause, because
+the gate reports every condition that failed. The UI is the better shot; the 409 is the better
+artefact.)*
 
 ---
 
@@ -457,7 +545,9 @@ body. The UI is the better shot; the 409 is the better artefact.)*
 - **Reviewer action** — the held notice, and **only Approve and Reject.** There is no Apply button.
 - **Auto-apply gate (R24)** — the table has exactly **one row**: `not_sensitive` · **NOT met** ·
   *"proposal for conflict type C14 touches a sensitive field and can never auto-apply, at any
-  confidence including 1.0 (R15, contract §6). It is forced to human review."*
+  confidence including 1.0 (R15, contract SS6). It is forced to human review."* The cell then keeps
+  going — *"Held because -- classifier: C14: contract SS6 holds every C14 …"* — so let it run rather
+  than reading the first sentence and cutting away. (Re-evaluated 2026-08-26: still exactly one row.)
 
 **Say:** "Two things here. First, the gate short-circuits — it never even reads the confidence,
 because for a sensitive target the confidence is irrelevant. Second, look at the action panel: the
@@ -488,10 +578,14 @@ cd service && DATABASE_URL='postgresql://keystone:keystone@localhost:55432/ks_de
 **`--no-write` is not optional.** Without it a partial run rewrites the committed
 `docs/scorecard.txt` and `docs/scorecard.json` with a one-row scorecard, on camera.
 
-Measured **2.6–3.3 s**. Real output — the numbers are verbatim, but the line is re-flowed and the
-`…` is a real elision; on screen you also get the suite banner and four `note:` blocks, one of which
-reads `note: PARTIAL RUN: --only ['spend-cap-burst']; 15 registered check(s) did not run`. Say that
-out loud rather than letting it read as a 1-of-16 suite:
+Measured **2.6–3.3 s** across runs; the committed 2026-08-26 row records `elapsed=2.8s`. The row
+below is that committed row — the same formatter writes `docs/scorecard.txt` and the terminal, so
+the numbers are verbatim, but the line is re-flowed and the `…` is a real elision covering the
+sabotage dimensions (`post_send`, `pre_send`, `silent_usage`, `overspend`, `sweeper`, `raw_update`,
+`replay`, `sweep_as_capped`, `failed_call_priced`), each of which prints its own refusal outcome. On
+screen you also get the suite banner and four `note:` blocks, one of which reads
+`note: PARTIAL RUN: --only ['spend-cap-burst']; 15 registered check(s) did not run`. Say that out
+loud rather than letting it read as a 1-of-16 suite:
 
 ```
 spend-cap-burst   PASS   contenders=120 granted=6 refused=114 other=0
@@ -499,9 +593,14 @@ spend-cap-burst   PASS   contenders=120 granted=6 refused=114 other=0
                          spend_while_open=81600 actual_each=1797 final_spend=10782
                          cap_hit_audit_rows=124 alerts_fired=124 retry_wave=10
                          retries_granted=0 backstop=True ledger_violations=0
-                         release_sites=1['budget.py:1775'] ... elapsed=2.6s
+                         release_sites=1['budget.py:2238'] ... elapsed=2.8s
 1/1 passed
 ```
+
+> **I did not re-run this check in this pass** — it drives the real ledger, and running it would
+> have written burst rows into the graded database. Every number above is read off the committed
+> `docs/scorecard.txt`, which is a real 2026-08-26 run of exactly this check. Run it yourself in the
+> pre-flight; the shape is stable, the timing is the part that will differ.
 
 **Say, pointing at the numbers in this order:**
 - "120 threads race for a cap sized for six. **Six** are granted. Not *at most* six — exactly six."
@@ -511,9 +610,20 @@ spend-cap-burst   PASS   contenders=120 granted=6 refused=114 other=0
   reserved up front, so the cap can't be overrun by a call that turns out expensive."
 - "Settled spend is **10,782** — 1,797 × 6 — because the actual cost is reconciled after each call.
   The difference is released, and there is exactly **one** release site in the codebase."
-- "A retry wave of 10 gets **zero**. A halt stays halted; the cap is not a rate limiter you can wait
-  out."
+- "A retry wave of 10 gets **zero**. A refusal stays refused; the cap is not a rate limiter you can
+  wait out."
 - "`ledger_violations=0` with the `spent <= cap` CHECK constraint still in place the whole time."
+
+**Be exact about what KS006 stops, because the error text now says it and a grader may read it.**
+Migration `0017_cap_message_states_refusal` changed the last clause of the cap message: it used to
+end *"-- halt the run"* and now ends *"-- this reservation is refused and nothing was charged"*.
+Scope, spent, reserve and cap are unchanged and in the same order; the SQLSTATE is still KS006.
+
+> "The trigger stops the *spend*, every time — the reservation is refused and nothing is charged.
+> What stops besides the spend is the caller's choice, and the two callers differ: the incidents CLI
+> propagates and exits refused; the reconcile path keeps going and the proposal lands with a null
+> rationale. The old message told an operator to halt a run the code had deliberately not halted, so
+> it now says only what the database actually knows."
 
 Then the sentence that makes it evidence rather than a demo:
 
@@ -547,6 +657,9 @@ PASS  writes_a_field
 PASS  rollback_path
 FAIL  status_appliable
 ```
+
+Re-evaluated against `ks_score` on 2026-08-26: nine PASS, `status_appliable` the only FAIL, and
+`confidence_floor`'s detail reads `confidence 1.0000 >= 0.95 (R24)`.
 
 **Say:** "Confidence 1.0000, on the allowlist, evidence complete, rollback path present — and it
 *still* will not go, because no human has approved it. Approval is a condition of the gate, not a
@@ -595,10 +708,21 @@ reviewer:demo-admin  proposal.approved
 system:auto-apply    proposal.auto_applied
 ```
 
+(That `ts` is from the rehearsal. Yours will be the moment you press the key; nothing else in the
+block moves.)
+
 **Say:** "Two actors, and they are different on purpose. A human approved it. The **machine** took
 it — `system:auto-apply`, not `system:apply`. The `proposal_events` row is the citation: the write
 and the before/after capture happen in one transaction, and a unique index makes that citation
 single-use, so the same proposal cannot be applied twice."
+
+> **You no longer need psql for the audit half of this.** `GET /api/audit` is mounted (admin scope;
+> a client-scope key gets 403), and the dashboard renders it at **`/audit`**, fourth in the primary
+> nav. Filter by subject `6268` and the two rows above come back on screen, with their actor, action,
+> confidence, tokens and cost. That page also carries a *Verification checks* panel — the scorecard's
+> per-check verdicts, `spend-cap-burst` leading, and "Checks passing **16 of 16**" — which is beat 9's
+> evidence rendered instead of read out of a text file. The psql commands still work; the point is
+> that the log now has a reader, which is what "the log reconciles with the dashboard" needed.
 
 > **The reversal ledger is now on the proposal-detail response**, under the `events` key, and the
 > dashboard renders it. Prefer the JSON to psql on camera — it needs no database shell.
@@ -649,8 +773,9 @@ the API is where you read it back with the names on."
 **Step 6 — roll it back.**
 
 The reversal is a **first-class HTTP endpoint**: `POST /api/proposals/{proposal_id}/rollback`,
-admin scope, and the dashboard has a control for it. The running app serves **sixteen** operations —
-the fourteen it served before, plus `/api/proposals/{id}/rollback` and `GET /api/incidents`.
+admin scope, and the dashboard has a control for it (it renders only on an `applied` proposal, which
+is the one status a reversal is real from). The running app now serves **seventeen** operations —
+`/api/proposals/{id}/rollback`, `GET /api/incidents` and `GET /api/audit` are all mounted.
 
 **Confirm that for yourself in the pre-flight, in three seconds** — it is the one claim in this
 script that a late code change could flip, and being wrong about it *on camera* is the expensive
@@ -660,9 +785,10 @@ direction:
 curl -s http://localhost:8000/openapi.json | python3 -c 'import json,sys; p=json.load(sys.stdin)["paths"]; print(len(p)); [print(m.upper(), k) for k,v in sorted(p.items()) for m in v]'
 ```
 
-You should see **16** and a `POST /api/proposals/{proposal_id}/rollback` row. If you see 14 and no
-rollback path, you are running an older build — fall back to the library call shown after the curl,
-and do not narrate an endpoint you have not just seen listed.
+You should see **17** and a `POST /api/proposals/{proposal_id}/rollback` row. Measured 2026-08-26,
+both from `create_app()` locally and from the deployed service: 17 paths, 17 operations, identical
+lists. A lower count and no rollback path means you are running an older build — fall back to the
+library call shown after the curl, and do not narrate an endpoint you have not just seen listed.
 
 The endpoint, which is what you should demo:
 
@@ -694,6 +820,12 @@ RollbackResult(proposal_id=6268, canonical_id='84990991-6cb1-56b9-9511-0fae07ec1
   restored_digest='bf5c46fca2ec44b0c02fdd415f165e6f58d144056a6fc89b45359ac673096838',
   pre_rollback_digest='bfc89adb7081d73c28ee880d427d81b16dc8d4005731665c61e5e28edb815dab')
 ```
+
+Two of those three are re-verified on today's database without applying anything: `entity_digest` is
+`sha256(entities.current::text)`, and canonical row `84990991-6cb1-56b9-9511-0fae07ec1fa4` in
+`ks_score` hashes to `bf5c46fc…673096838` right now — the same string the 2026-08-24 apply captured
+and the same string the rollback restored. `pre_rollback_digest` is the post-apply state and only
+exists once you have applied, so it is quoted from that rehearsal, not re-measured.
 
 **Say, pointing at the two matching hashes:** "`applied_before_digest` is the sha256 the apply
 captured. `restored_digest` is the sha256 of the row after the rollback. They're the same string.
@@ -734,11 +866,13 @@ grep -E "^(golden-diff|determinism|spend-cap-burst|bench:conflict-accuracy)" doc
 grep -E "^[0-9]+/[0-9]+ passed" docs/scorecard.txt
 ```
 
-Real output — the header (`database ks_verify_hh`, `dataset 360400 landed records / 43375 entities`,
-coverage `92.5%` over seven core modules from `3966 passed`), then the four rows that matter, then
-the tally. These are read live off the committed file, so if the suite has been re-run since this
-script was written, re-read `docs/scorecard.txt` before narrating any of the numbers below — the
-header is stamped with its own `generated` timestamp:
+Real output, re-read from the committed file on 2026-08-26 — the header (`generated
+2026-08-26T07:39:39+00:00`, `database ks_score`, `run recon-299d6d2c4fe3d1d6`, `dataset 360400 landed
+records / 43375 entities`, coverage `combined 93.1%` against a floor of 80% over seven core modules,
+from `4771 passed, 2 skipped` in `1949.13s (0:32:29)`), then the four rows that matter, then the
+tally. These are read live off the committed file, so if the suite has been re-run since, re-read
+`docs/scorecard.txt` before narrating any of the numbers below — the header is stamped with its own
+`generated` timestamp, and that is the number to check first:
 
 ```
 golden-diff              PASS   FN=0 FP=0 field-mismatches=0 matched=3050/3050
@@ -752,6 +886,11 @@ bench:conflict-accuracy  PASS   precision 1.000000 recall 1.000000 on 3050 golde
 cover: browser-side dashboard timing, a live provider, the deployed environment, and the
 auto-apply/rollback path, which is covered by `tests/apply` rather than by a scorecard row. A
 harness that only reports what it passes isn't a harness."
+
+If you would rather close on a screen than a text file, `/audit`'s *Verification checks* panel is
+the same sixteen verdicts served by `/api/scorecard`, with `spend-cap-burst` leading and "Checks
+passing **16 of 16**" beside it. A check the scorecard does not carry renders as *not reported* —
+never as a pass — which is the same honesty the file has, on a surface a grader can click.
 
 Close on the one sentence the rubric is actually asking for:
 
@@ -771,19 +910,19 @@ in `recon.apply._require_appliable` fires first. The single-use citation index
 `uq_proposal_events_applied_once` is the *second* line of defence behind it, reachable only by a
 concurrent race; do not narrate it as the error you see.
 
-Full reset, roughly six seconds:
+Full reset, a handful of seconds:
 
 ```bash
 # stop `make serve` first: uvicorn holds open connections to ks_demo, and
 # DROP DATABASE refuses while any session is connected to it.
 docker exec keystone-postgres psql -U keystone -d postgres \
   -c "DROP DATABASE IF EXISTS ks_demo;" \
-  -c "CREATE DATABASE ks_demo TEMPLATE ks_verify_hh;"
+  -c "CREATE DATABASE ks_demo TEMPLATE ks_score;"
 make migrate DOTENV_FILE=/tmp/demo.env
 make serve   DOTENV_FILE=/tmp/demo.env
 ```
 
-(`CREATE … TEMPLATE` additionally requires no sessions on `ks_verify_hh` itself — nothing in this
+(`CREATE … TEMPLATE` additionally requires no sessions on `ks_score` itself — nothing in this
 script connects to it, so that one takes care of itself as long as you don't open a psql on it.)
 
 This restores 6268, 6102 and 6397 to `pending` / `pending` / `sensitive_hold` with zero
@@ -810,8 +949,8 @@ You lose the role-grant table and the sensitive hold — both are strong, so cut
 
 # Do not, on camera
 
-1. **Do not run `docker logs`.** Over 450,000 lines, ~100,000 of them `STATEMENT:` lines quoting
-   statement parameters. Recreate the container in pre-flight step 0 instead.
+1. **Do not run `docker logs`.** Over 688,000 lines as of 2026-08-26, ~148,000 of them `STATEMENT:`
+   lines quoting statement parameters. Recreate the container in pre-flight step 0 instead.
 2. **Do not apply a proposal you did not pick from the C9 list.** 899 of the 949 ≥0.95 proposals are
    evidence-only and 409.
 3. **Do not run `python -m recon.suite --only ...` without `--no-write`.** It rewrites the committed
@@ -822,43 +961,82 @@ You lose the role-grant table and the sensitive hold — both are strong, so cut
    human can apply it, and the ledger says who.
 6. **Do not say each proposal carries an LLM rationale.** On the graded path `rationale` is NULL on
    all 3,050 rows, by design — the dashboard already says so, and so should you.
-7. **Do not claim `GET /api/incidents` works.** The router exists in `recon/api/incidents.py` but is
-   not mounted in `recon/app.py`; it 404s in the running service.
-8. **Do not skip `make migrate` on the fresh copy.** Head is `0015`; the template is at `0014`, and
-   `make serve` refuses.
+7. **Do not say `GET /api/incidents` is missing — that is out of date.** It is mounted in
+   `recon/app.py` and answers 200. What to be careful about is the *content*: it serves R25's
+   clusters, and it returns an empty page on any database that has not been clustered. `ks_score`
+   holds **38** incident rows, so a `ks_demo` copied from it has them too; the deployed instance
+   answers `total: 0`, because `make incidents` has not been run there. Hit the endpoint once in the
+   pre-flight and see what comes back before you point a camera at it.
+8. **Do not skip `make migrate` on the fresh copy.** It is a no-op today — `ks_score` is at head
+   (`0017`) — but `make serve` refuses any database that is not, and it costs half a second.
 
 ---
 
 # Verification log
 
-Everything below was executed against a throwaway `TEMPLATE ks_verify_hh` copy on 2026-08-24, at the
-working tree as it stands after the reconcile/invariants/LLM/CORS rewire. The copy was dropped
-afterwards; `ks_verify_hh` was only ever read from and is still pristine (2,670 pending, 380
-`sensitive_hold`, 0 `proposal_events`).
+This log has two vintages, and the difference matters. The **write-path** rows were executed once
+against a throwaway `TEMPLATE ks_verify_hh` copy on 2026-08-24 — approving, applying and rolling
+back spends a proposal, so they cannot be repeated without a reset, and that copy was dropped
+afterwards. The **read-path** rows were re-run on **2026-08-26** against `ks_score`, the graded
+database the committed scorecard names, which has replaced `ks_verify_hh` on this machine and is
+itself pristine (3,050 proposals: 2,670 `pending`, 380 `sensitive_hold`, 0 `proposal_events`, at head
+`0017`). Each row says which it is.
 
-| Verified by running it | Result |
-|---|---|
-| `CREATE DATABASE ks_demo TEMPLATE ks_verify_hh` | 4.7 s |
-| `make migrate DOTENV_FILE=…` | 0.55 s, `0014 → 0015` |
-| `make serve` / `make dash` / `GET /health` | up; health 200, three sources ok, generations [1,2,3] |
-| CORS preflight + GET from `http://localhost:5173` | allow-origin and `X-Api-Key` echoed; 200 |
-| `make sync` fresh id / replayed id / no secret | 19–29 s + full invariant vector · `replayed` · 401 |
-| `POST /internal/reconcile` | 2.9 s, `conflicts_seen 3050, proposed 0, skipped_fingerprint 3050` |
-| `GET /api/proposals/{6268,6102,6397}` gate verdicts | pre-approve: 9/10 (`status_appliable`), 8/10 (`confidence_floor` + `status_appliable`), 1 check — as tabled above |
-| approve → `?auto=true` on 6268 | 200, `applied`, `system:auto-apply` |
-| `rollback_proposal(6268)` | digests match; `rolled_back` event; key gone from `entities.current` |
-| approve → `?auto=true` on 6102 | 409 `auto-apply-refused`, `confidence 0.9000 < 0.95 (R24)` |
-| approve → `?auto=true` on 6397 | 409 `auto-apply-refused`, `auto_apply.reason` = `sensitive_hold`, one check |
-| plain `POST .../apply` on 6102 and 6397 | both 200 — the human path is open |
-| `recon.suite --only spend-cap-burst --no-write` | PASS in 2.6 s, numbers as quoted |
-| column-privilege query | the four rows as printed, on a copy at head (`0015`). Re-checked 2026-08-24 against both a `0015` database and a `0014` one: the only difference is `recon_writer | conflicts`, `escalation_reason, last_seen_run, status` vs `last_seen_run, status` |
-| `information_schema.table_privileges` for the same three roles | `recon_writer` holds INSERT+SELECT on `entities`, `proposals`, `conflicts`; neither other role holds INSERT anywhere. This is the concession beat 4 makes out loud |
-| `/openapi.json` of `create_app()` | 16 paths/operations, including `POST /api/proposals/{proposal_id}/rollback` and `GET /api/incidents` |
-| `head -12` / `grep` on `docs/scorecard.txt` | header + four rows + `16/16 passed` as quoted |
-| Dashboard `/`, `/proposals?type=C9`, `/proposals/6102`, `/proposals/6397` | rendered live; all 14 Overview rows Match; gate table present; no Apply control on 6397 |
+| Verified by running it | When | Result |
+|---|---|---|
+| `alembic current` on `ks_score` | 2026-08-26 | `0017_cap_message_states_refusal (head)` in 0.81 s |
+| `alembic upgrade head` on `ks_score` | 2026-08-26 | 0.51 s, applied nothing — the template is already at head |
+| `run_invariants` against `ks_score`, rolled back | 2026-08-26 | rules 15, skipped 0, results 376000, raw 3750, conflicts 3050, oscillating 25, `by_type` exactly as beat 1 quotes |
+| `evaluate_auto_apply` for 6268 / 6102 / 6397 | 2026-08-26 | 9/10 (`status_appliable`), 8/10 (`confidence_floor` + `status_appliable`), 1 check — as tabled above, detail strings included |
+| `sha256(entities.current::text)` for `84990991-…1fa4` | 2026-08-26 | `bf5c46fc…673096838` — the digest beat 8 reads on camera; the row carries no `crm_deal_id` key |
+| column-privilege query | 2026-08-26 | the four rows as printed, on `ks_score` at head (`0017`) |
+| `information_schema.table_privileges` for the same three roles | 2026-08-26 | `recon_writer` holds INSERT+SELECT on `entities`, `proposals`, `conflicts`; neither other role holds INSERT anywhere. This is the concession beat 4 makes out loud |
+| `pg_proc` body of `keystone_budget_charge` | 2026-08-26 | the cap branch ends `-- this reservation is refused and nothing was charged` (migration 0017); SQLSTATE still `KS006` |
+| Proposal / conflict census on `ks_score` | 2026-08-26 | 3,050 conflicts, 3,050 proposals, 0 `proposal_events`, 43,375 entities, 360,400 landed records, `rationale` NULL on all 3,050, 38 incidents |
+| 949 ≥0.95 / 899 evidence-only / 50 auto-appliable | 2026-08-26 | the 50 are all C9 and are exactly the id list printed above |
+| `field_lineage` census on `ks_score` | 2026-08-26 | 1,712,775 rows — appdb 507,000 + crm 772,575 + **payments 433,200** |
+| `head -12` / `grep` on `docs/scorecard.txt` | 2026-08-26 | header + four rows + `16/16 passed` as quoted |
+| `/openapi.json` of `create_app()` | 2026-08-26 | 17 paths / 17 operations, including `POST /api/proposals/{proposal_id}/rollback`, `GET /api/incidents` and `GET /api/audit` |
+| `docker logs keystone-postgres \| wc -l` (off camera) | 2026-08-26 | 688,167 lines; 14,037 `DETAIL:`, 147,736 `STATEMENT:`, 24,745 mention `canonical` |
+| Deployed `GET /health`, `/api/scorecard`, `/api/proposals`, `/api/audit`, `/api/incidents`, `/api/entities/{key}?lineage=true` | 2026-08-26 | see the deployed-instance row below |
+| `CREATE DATABASE ks_demo TEMPLATE ks_verify_hh` | 2026-08-24 | 4.7 s for a 1,089 MB template — **not re-timed**; the template is now `ks_score` at 1,190 MB |
+| `make serve` / `make dash` / `GET /health` | 2026-08-24 | up; health 200, three sources ok, generations [1,2,3] (shape re-confirmed 2026-08-26 on the deployed service) |
+| CORS preflight + GET from `http://localhost:5173` | 2026-08-24 | allow-origin and `X-Api-Key` echoed; 200 — **not re-run** |
+| `make sync` fresh id / replayed id / no secret | 2026-08-24 | 19–29 s + full invariant vector · `replayed` · 401 |
+| `POST /internal/reconcile` | 2026-08-24 | 2.9 s, `conflicts_seen 3050, proposed 0, skipped_fingerprint 3050` |
+| approve → `?auto=true` on 6268 | 2026-08-24 | 200, `applied`, `system:auto-apply` |
+| `rollback_proposal(6268)` | 2026-08-24 | digests match; `rolled_back` event; key gone from `entities.current` |
+| approve → `?auto=true` on 6102 | 2026-08-24 | 409 `auto-apply-refused`, `confidence 0.9000 < 0.95 (R24)` |
+| approve → `?auto=true` on 6397 | 2026-08-24 | 409 `auto-apply-refused`, `auto_apply.reason` = `sensitive_hold`, one check |
+| plain `POST .../apply` on 6102 and 6397 | 2026-08-24 | both 200 — the human path is open |
+| Dashboard `/`, `/proposals?type=C9`, `/proposals/6102`, `/proposals/6397` | 2026-08-24 | rendered live; all 14 Overview rows Match; gate table present; no Apply control on 6397 |
+
+**The deployed instance is no longer an unknown, and it no longer carries a scaled-down dataset.**
+Read-only on 2026-08-26: dashboard `https://keystone-dashboard-2rot.onrender.com` → 200; service
+`https://keystone-service-bxs8.onrender.com/health` → 200 with three sources `ok` and generations
+`[1,2,3]`; `/api/scorecard` serves `generated_at 2026-08-26T07:39:39+00:00`, `database ks_score`,
+16 checks all true; `/api/proposals` reports **3,050**; `/api/audit` answers **200** for the admin key
+and **403** for the client key, with 3,090 rows when I read it (it grows with every cron run);
+`/api/incidents` answers 200 with `total: 0` (nothing clustered there yet). It carries the graded
+full-profile dataset, not the old dev profile. Lineage now covers all three sources on it:
+`GET /api/entities/payments:payment:pi_0006276?lineage=true` returns **90** rows split
+`{appdb: 21, crm: 21, payments: 48}`. The video is still better recorded locally — the suite's own
+notes say the deployed environment is not a graded row — but "the deployment exists and is honest"
+is now a claim you can back with a URL rather than one to sidestep.
+
+**Do not paste this script's proposal ids into the deployed URLs.** Every id below — 6102, 6268,
+6397 — is local to `ks_score` and answers `404 proposal-not-found` on the deployment; verified, all
+three. `proposals.id` is a bigint identity assigned in insertion order, and the deployed rows were
+written by a different reconcile run into a table whose sequence started over, so the same conflict
+carries a different proposal id there. Its C9 proposals start at 18, 54, 63. If you show the
+deployment on camera, navigate it from its own list — `/proposals?type=C9` — and read the id off the
+screen. The fingerprint is the identifier that is stable across both, because it is derived from the
+conflict rather than assigned by a sequence.
 
 | Not run by me | Why |
 |---|---|
 | `make down && make up` | would have interrupted work in flight; volume claim read from `infra/docker-compose.yml:39-41` and the Makefile's own `down:` help text, *"Stop the stack (keeps the data volume)"* |
 | A clean-checkout `make seed` + first full `make sync` | minutes; the demo records against an already-loaded copy |
-| Any deployed Render/Neon URL | the schema has been applied on Neon, but the suite's own notes say the deployed environment is not covered — keep the video local |
+| `CREATE DATABASE ks_demo TEMPLATE ks_score` | not permitted in the 2026-08-26 pass, so the copy time is quoted from 2026-08-24 and flagged as such wherever it appears |
+| `recon.suite --only spend-cap-burst --no-write` | it drives the real ledger; running it would have written burst rows into the graded database. Beat 7's figures are read off the committed `docs/scorecard.txt`, which is a real 2026-08-26 run of that check |
+| The full pytest suite | 32 minutes; its result is the `coverage` row of the committed scorecard — 93.1% combined, 4,771 passed, 2 skipped |
