@@ -80,10 +80,21 @@
 # THE ONE OWNER-GRADE CREDENTIAL THE WEB SERVICE STILL HOLDS
 # -----------------------------------------------------------
 # `OPS_DATABASE_URL` is the database owner and it is deliberately NOT
-# `DATABASE_URL`. Only `recon.budget.ops_engine()` reads it, and only four
-# operations use that engine: provisioning a run's ledger row, reading a ledger
-# row back, lifting an overspend halt, and sweeping dead leases. Everything the
-# service does while serving a request connects as `recon_writer`.
+# `DATABASE_URL`. Only `recon.budget.ops_engine()` reads it, and only five
+# operations use that engine: provisioning a run's ledger row, opening the
+# current UTC day's ledger row on demand, reading a ledger row back, lifting an
+# overspend halt, and sweeping dead leases. Everything the service does while
+# serving a request connects as `recon_writer`.
+#
+# The day-roll is the fifth, and it is why there is no fourth cron here. The
+# daily cap is keyed on the UTC date, so a new day needs a ledger row that does
+# not exist yet; `recon.budget` opens it on first use through this engine rather
+# than requiring a scheduled job to have run first. A cron would have meant that
+# a deploy on a new day meters nothing until the scheduler catches up — and that
+# a missed run is a silent outage — so the row opens itself instead. Migration
+# 0005 revoked INSERT on `budget_ledger` from `recon_writer` precisely so the
+# capped party cannot conjure a scope with a cap of its choosing; that
+# revocation stands, which is why opening the day is an OWNER operation.
 #
 # It is here because `POST /internal/{sync,reconcile}` provisions `run:<id>`
 # through `recon.budget.provision_run_scope`, and migration 0005 revoked INSERT
@@ -248,7 +259,7 @@ services:
         value: "5432"
       - key: KEYSTONE_DB_NAME
         value: neondb
-      # ---- The OWNER, for the pre-deploy migration and for the four ops-only
+      # ---- The OWNER, for the pre-deploy migration and for the five ops-only
       # operations in `recon.budget.ops_engine()` -- never for serving a
       # request. See the header for the residual gap this represents.
       #
