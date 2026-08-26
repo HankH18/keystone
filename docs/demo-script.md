@@ -1,8 +1,9 @@
 # Keystone — 5 minute demo
 
-All of it in the dashboard. No terminal, no setup, no local install.
+Everything happens in the browser. Five tabs, no terminal, no setup.
 
-Open these four tabs before you record:
+**Open these and load each one once before you record** (the host sleeps when idle, and you don't
+want a page waking up on camera):
 
 1. `https://github.com/HankH18/keystone/blob/main/ARCHITECTURE.md`
 2. `https://keystone-dashboard-2rot.onrender.com/`
@@ -10,135 +11,164 @@ Open these four tabs before you record:
 4. `https://keystone-dashboard-2rot.onrender.com/proposals/206`
 5. `https://keystone-dashboard-2rot.onrender.com/audit`
 
-The dashboard is slow on the very first load — the host sleeps when idle. Load every tab once
-before recording so none of them wake up on camera.
+**Never click Approve or Reject.** You don't need to, and it can't be undone.
 
 ---
 
-## 1. The diagram · 0:45
+## 1. What problem this solves · 45s
 
-**TAB 1.** Show the first diagram.
+**Tab 1.** Show the first diagram. Trace the arrows left to right with your cursor while you talk.
 
-> "Three systems disagree — a CRM, an app database, and payments. Keystone copies all three in
-> read-only, resolves them into one identity layer, and runs committed SQL rules over the result.
+> "Most companies keep the same customer in three or four different systems. A CRM, an app database,
+> a payments processor. They're supposed to agree with each other. Over time they quietly stop.
 >
-> Every conflict becomes a proposal. A proposal is a suggestion with evidence attached. Nothing it
-> suggests ever reaches production until a person approves it.
+> Somebody pays but no deal gets created. Two records share an email. A refund goes through in one
+> place and not the other. Nobody notices until a customer is angry.
 >
-> That last part is the whole system. Everything else is plumbing."
+> Keystone is the thing that notices. It pulls a read-only copy of all three systems into one place,
+> works out which records are the same person, and then constantly checks rules that should always
+> be true. When one breaks, it writes up what it found and what it thinks the fix is — and then it
+> stops and waits for a human.
+>
+> It never fixes anything on its own. That's the part I want to show you."
 
 ---
 
-## 2. The dashboard · 0:40
+## 2. What it found · 40s
 
-**TAB 2.** The Overview page.
+**Tab 2.** The Overview page.
 
-> "Three thousand and fifty conflicts, across fourteen types, from three hundred and sixty thousand
-> records.
+> "This is running against 360,000 records across those three systems. It found 3,050 places where
+> they disagree, and sorted them into fourteen kinds of disagreement.
 >
-> Every number on this page is fetched twice — once from the graded scorecard, once live from the
-> API — and compared. That's the Match column. If those two ever disagreed, the page would say so
-> rather than quietly showing you one of them."
-
-Scroll to **Proposals by status**.
-
-> "Three thousand and fifty conflicts, three thousand and fifty proposals. Twenty-six seventy
-> waiting for a reviewer, three eighty held because they touch something sensitive.
+> Now — every number on this page is deliberately fetched twice. Once from the test harness that
+> graded this run, and once live from the database right now. Then it compares them. That's what
+> this Match column is.
 >
-> Zero applied. Nothing has been written to anything."
+> The reason it does that: a dashboard that reads one number and prints it will happily show you a
+> confident, wrong figure forever. This one can't. If those two ever disagreed, this page would say
+> Mismatch instead of picking one."
+
+Scroll down to **Proposals by status**.
+
+> "Every one of those 3,050 problems got a written-up fix. 2,670 are waiting for someone to look at
+> them. 380 are held back because the fix would touch something sensitive.
+>
+> And zero have been applied. Nothing has been written to anything."
 
 ---
 
-## 3. A conflict and its proposal · 1:00
+## 3. What one of them actually looks like · 60s
 
-**TAB 3.** Proposal 2.
+**Tab 3.** Proposal 2.
 
-> "Same person in two systems, different grade. This is the fix Keystone proposes, and this is why."
-
-Scroll to the **Evidence packet**, then to **confidence → terms**.
-
-> "Confidence is 0.90. That's not a model output and it's not a guess — it's a weighted sum of named
-> signals, and the proposal carries every term that produced it, including the four that contributed
-> nothing. A reviewer can add it up by hand.
+> "Here's one. Same person exists in the CRM and in the app database, and the two systems disagree
+> about what grade they're in.
 >
-> Status: pending. Nothing has been written."
+> This is the fix it's proposing — and everything underneath is why it thinks so."
+
+Scroll to the **Evidence packet**, then keep going to **confidence → terms**.
+
+> "That 0.90 confidence is the part people usually hand-wave. It's not a gut feeling and it isn't a
+> language model guessing at a number.
+>
+> It's arithmetic, and it's all right here. These are the specific things it checked. This one
+> matched on a hard ID, worth 0.35. Emails matched, worth 0.25. It also checked name and date of
+> birth and got nothing, so that's zero — and it shows you that too. Then it subtracts for the
+> fields that disagree.
+>
+> If you don't trust the number, you can add it up yourself on paper. That's the point of showing
+> the terms that scored nothing — you can see what it looked at, not just what it liked."
 
 ---
 
-## 4. Low confidence stays with a person · 0:55
+## 4. Why it won't fix this itself · 55s
 
-**TAB 3, same page.** Scroll to **Auto-apply gate (R24)**.
+**Still tab 3.** Scroll to **Auto-apply gate (R24)**.
 
-> "Ten conditions. Confidence 0.90 misses the 0.95 floor, so this doesn't move.
+> "So here's the interesting bit. There's a version of this system that's allowed to fix things
+> automatically — but only if it clears every one of these ten conditions.
 >
-> But look at the last row. Status is pending — and the role that applies changes is only allowed to
-> move something from *approved* to *applied*. So even at perfect confidence, a machine still can't
-> skip the person. That's a database grant, not an if-statement in code somebody can delete."
-
-**TAB 4.** Proposal 206.
-
-> "This one's different. One condition was evaluated and it stopped right there — the fix touches a
-> legal name.
+> This one scores 0.90 and the bar is 0.95. So it stops. A human gets it.
 >
-> Sensitive fields can never auto-apply, at any confidence, including a perfect one. It doesn't even
-> reach the confidence check. It short-circuits before it gets there."
+> But look at the bottom row, because that's the one that actually matters. It says the status is
+> still pending. The part of this system that's allowed to write changes is only permitted to touch
+> something a human has already marked approved.
+>
+> That's not an if-statement in my code that somebody could delete. That's a permission in Postgres.
+> Even if the confidence were a perfect 1.0, it would still stop right here and wait for a person."
+
+**Tab 4.** Proposal 206.
+
+> "And this one's different in a way I think is the strongest thing in the project.
+>
+> Look how short the list is. It checked one condition and stopped. The fix here would change
+> someone's legal name — and legal names, billing owners, anything with a financial consequence are
+> permanently off limits to automation.
+>
+> It didn't even get as far as reading the confidence score. Doesn't matter what the number is.
+> It short-circuits before it can matter."
 
 ---
 
-## 5. The spend cap · 0:50
+## 5. It can't run up a bill either · 50s
 
-**TAB 5.** The Audit log page. Point at **Verification checks** at the top.
+**Tab 5.** The Audit log page. The **Verification checks** panel is at the top.
 
-> "The reconciler spends money, so it runs under a hard cap. This is the burst test: a hundred and
-> twenty jobs rush the budget at once.
+> "The other thing an unattended agent can do to you is spend your money. So it runs under a hard
+> cap, and this is the test that proves the cap holds.
 >
-> Six get through. A hundred and fourteen are refused. Ledger violations: zero — it never goes
-> negative, not once. And the retry wave of ten was granted nothing, so retrying doesn't get you
-> around it.
+> It throws 120 jobs at the budget simultaneously, all trying to spend at once. Six get through.
+> 114 get refused. And the ledger never goes negative — not once, not by a cent.
 >
-> The refusal comes from the database, not from the application."
+> Two details worth calling out. That refusal comes from the database itself, not from application
+> code. And see the retry wave — ten jobs retried after being refused, and got granted nothing.
+> Retrying doesn't get you around the cap."
 
-Scroll down to the audit rows.
+Scroll down to the log rows underneath.
 
-> "And every action the system takes lands here — the proposals, the runs, the reviewer decisions.
-> This is the same log those numbers come from."
+> "And underneath, every single thing this system has done. Every proposal it wrote, every run,
+> every decision. Those numbers up top come out of this log — so you can check them against it."
 
 ---
 
-## 6. Close · 0:40
+## 6. Close · 40s
 
-Back to **TAB 2**.
+Back to **tab 2**.
 
-> "Nothing here is true because I said so.
+> "The through-line for all of it: none of this is safe because I said it's safe.
 >
-> The reconciler can't approve its own work — that's a grant. The cap can't be overrun — that's a
-> trigger. The sources can't be written to — the read-only interface has no write method at all, and
-> a test fails the build if one ever appears.
+> The reconciler can't approve its own work — that's a database permission. It can't overrun the
+> budget — that's a database trigger. It can't write back to the source systems — the interface it
+> uses to read them doesn't have a write method at all, and there's a test that fails the build if
+> anybody ever adds one.
 >
-> Sixteen of sixteen on the committed harness, against a database rebuilt from the committed seed.
-> And everything you just watched was the deployed instance, not my laptop."
+> The committed test harness passes sixteen out of sixteen against a database rebuilt from scratch.
+> And everything you just watched was the live deployed version, not my laptop."
 
 ---
 
-# If something goes wrong mid-take
+# If something goes sideways
 
-**Don't approve anything.** Approving is permanent and single-use. The demo never needs you to click
-Approve — every beat is read-only.
+**A page won't load** — the host fell asleep. Reload once and give it a few seconds.
 
-If a proposal page won't load, the host went to sleep. Reload once and wait.
+**You want a second take** — nothing you did changed anything, so just go again. Every beat here is
+read-only. But if you want different records:
 
-Swap-in ids, same behaviour:
-
-- **Beat 3 / 4 (0.90, ten conditions):** `2`, then `73`, `91`, `101`
-- **Beat 4 (sensitive, one condition):** `206`, then `216`, `232`, `275`
+- **Beats 3 and 4** (0.90 confidence, ten conditions): `2`, then `73`, `91`, `101`
+- **Beat 4's sensitive one** (one condition, stops immediately): `206`, then `216`, `232`, `275`
 
 ---
 
-# Don't
+# Three things not to say
 
-- **Don't click Approve or Reject.** Nothing in this demo needs it, and it can't be undone.
-- **Don't say "sixteen of sixteen"** while pointing at the Verification checks panel unless you mean
-  the whole harness — that panel shows the full run, which is genuinely 16/16, but only the spend-cap
-  row is the one you're talking about in beat 5.
-- **Don't promise the deployed instance is the graded environment.** It runs the same code and the
-  same dataset, but the graded numbers come from the committed harness run.
+**Don't click Approve or Reject.** Each proposal can only be used once and there's no undo. The demo
+never needs it.
+
+**Don't call the Verification checks panel "the spend cap test."** That panel is the whole harness,
+all sixteen checks. The spend cap is one row in it. Say "here's the spend cap check" and point at
+the row, not at the panel.
+
+**Don't say the deployed version is what got graded.** It runs the same code against the same
+dataset, but the graded numbers come from the committed harness run. It's a real deployment, not the
+grading environment — that distinction is worth keeping straight if anyone asks.
