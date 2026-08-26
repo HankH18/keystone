@@ -70,6 +70,12 @@ TAG = "privacy-cli-test"
 #: `tests.er.scratchdb` names a database `keystone_<label>_<pid>_<token>`.
 SCRATCH_LABEL = "ret"
 
+#: The driver SQLAlchemy must be told to use. `recon.db._ASYNC_SAFE_DRIVER` pins the
+#: same string for connections built from the environment; the DSNs in this module
+#: come from `tests.er.scratchdb` instead, which speaks libpq, so they need the same
+#: normalisation applied by hand.
+_SQLALCHEMY_DRIVER = "postgresql+psycopg"
+
 #: Synthetic, from the generated dataset's shape -- never a real address (SS3).
 EMAIL = "brenmar-fairbank-mead@gmail.com"
 NAME = "Fairbank-Mead"
@@ -178,7 +184,16 @@ def scratch_database(configured_url: str) -> Iterator[str]:
 @pytest.fixture(scope="module")
 def sweep_engine(scratch_database: str) -> Iterator[Engine]:
     """Owner engine on the scratch database -- the one the sweep will really run on."""
-    engine = create_engine(scratch_database, future=True)
+    # `create_scratch_database` returns a **libpq** DSN (`postgresql://...`), which
+    # is what psycopg.connect wants. Handed to SQLAlchemy unchanged it selects the
+    # default `postgresql` dialect -- psycopg2, which this project does not install
+    # -- and every test in the module errors with ModuleNotFoundError before it
+    # reaches an assertion. `recon.db` pins the same driver for the same reason
+    # (`_ASYNC_SAFE_DRIVER`); this is that normalisation applied to a DSN that did
+    # not come from the environment.
+    engine = create_engine(
+        make_url(scratch_database).set(drivername=_SQLALCHEMY_DRIVER), future=True
+    )
     with engine.connect() as conn:
         migrated = conn.execute(text("SELECT to_regclass('public.audit_log')")).scalar()
     assert migrated is not None, "the scratch database was not migrated"
@@ -347,7 +362,7 @@ def test_a_row_in_the_configured_database_survives_a_full_apply_sweep(
     swept it, so the marker went, along with every other row in it older than the
     windows.
     """
-    engine = create_engine(configured_url, future=True)
+    engine = create_engine(make_url(configured_url).set(drivername=_SQLALCHEMY_DRIVER), future=True)
     try:
         with engine.begin() as conn:
             conn.execute(
@@ -455,7 +470,26 @@ def test_every_run_names_the_database_it_is_about_to_sweep(
         assert f"port={url.port}" in first
         assert f"user={url.username}" in first
         assert mode in first
-        assert url.password and url.password not in first
+        # The password must not leak. A bare `url.password not in first` cannot
+        # express that here: the local password IS "keystone", which is also the
+        # username and a substring of every scratch database name, so that check
+        # is unsatisfiable for this credential no matter how correct the output
+        # is -- it fails on a line that leaks nothing. So assert the two things
+        # that actually distinguish a leak:
+        #   1. the line is not a DSN (no `://`, no `user:pass@host` userinfo), and
+        #   2. the password does not appear anywhere OUTSIDE the four fields that
+        #      legitimately carry it as a substring.
+        assert "://" not in first and "@" not in first, f"the target line is a DSN: {first}"
+        assert url.password
+        residue = first
+        for legitimate in (
+            f"database={url.database}",
+            f"host={url.host}",
+            f"port={url.port}",
+            f"user={url.username}",
+        ):
+            residue = residue.replace(legitimate, "")
+        assert url.password not in residue, f"password leaked outside the named fields: {first}"
 
 
 def test_an_apply_reports_what_it_will_remove_before_removing_it(
