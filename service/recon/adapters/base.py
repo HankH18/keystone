@@ -107,6 +107,7 @@ WRITE_NAME_TOKENS: tuple[str, ...] = (
     "flush",
     "sync",
     "land",
+    "emit",
 )
 
 #: DESIGN.md: "Timeouts bounded at 10s -> structured error". This is the **stall**
