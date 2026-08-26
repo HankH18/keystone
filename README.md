@@ -8,9 +8,10 @@ nothing else: it never detects a conflict, never computes a confidence score, an
 Everything runs offline on synthetic data with **no API keys**. The dataset, the golden set and the
 scorecard are all reproducible from one committed seed.
 
-**Status: complete.** The last committed grading-harness run — `2026-08-23T21:04:57Z`, in
-[`docs/scorecard.txt`](docs/scorecard.txt) — reports **16/16 PASS**. See [Results](#results),
-including what has moved in the tree since that run.
+**Status: complete.** The committed grading-harness run — `2026-08-26T07:39:39Z`, in
+[`docs/scorecard.txt`](docs/scorecard.txt) — reports **16/16 PASS**, and it grades **this** tree: a
+database rebuilt from the committed seed at that commit, not an older snapshot. See
+[Results](#results).
 
 ```mermaid
 flowchart LR
@@ -110,12 +111,12 @@ The local quick start below reproduces the same full-profile dataset.
 |---|---|---|
 | **~1 min** *(plus the one-time `pnpm install`)* | Dashboard rendering the **committed golden set** in an in-browser mock. No Docker, no Python, no database. | `pnpm --dir dashboard install && pnpm --dir dashboard run dev:mock` → http://localhost:5173 |
 | **~10 min** | The **real system**: Postgres, migrated schema, seeded dataset, live API, conflicts *and* proposals, dashboard against it. | [Quick start](#quick-start) steps 1–10 |
-| **+~25 min** | The **graded scorecard**, all 16 rows. Runs *on top of* the ~10-minute path — it grades an already-loaded database. | [The graded gate](#the-graded-gate) |
+| **+~35 min** | The **graded scorecard**, all 16 rows. Runs *on top of* the ~10-minute path — it grades an already-loaded database. | [The graded gate](#the-graded-gate) |
 
 On the ~10-minute path most of the clock is one-time dependency installation (`uv sync`, `pnpm
 install`); of the steps that touch data, `make sync` is the slowest (below). The graded gate adds at least
-another ~25 minutes, dominated by one row (`coverage`, a real pytest run measured at **23 m 33 s**),
-so a clean clone to a full scorecard is **≈35 minutes**. Both slow steps are called out where they
+another ~35 minutes, dominated by one row (`coverage`, a real pytest run measured at **32 m 29 s**),
+so a clean clone to a full scorecard is **≈45 minutes**. Both slow steps are called out where they
 occur — nothing here silently blocks for half an hour.
 
 ---
@@ -237,7 +238,7 @@ make suite          # ~25 minutes; writes docs/scorecard.{txt,json}
 
 `make suite` grades an already-loaded database (step 8 is its precondition — a half-loaded database
 fails every row rather than producing a small green). The rows in `docs/scorecard.txt` that report a
-time sum to **~25 minutes**, of which **23 m 33 s** is the `coverage` row shelling out to a real
+time sum to **~35 minutes**, of which **32 m 29 s** is the `coverage` row shelling out to a real
 pytest run. Treat that as a floor, not a wall clock: several rows report no time of their own.
 
 The `coverage` row's pytest child points at `DATABASE_URL` unless you give it a second database, so
@@ -463,38 +464,41 @@ ledger is structurally impossible rather than merely forbidden.
 ## Results
 
 From [`docs/scorecard.txt`](docs/scorecard.txt) (machine-readable twin:
-[`docs/scorecard.json`](docs/scorecard.json)), generated `2026-08-23T21:04:57Z` over **360,400
+[`docs/scorecard.json`](docs/scorecard.json)), generated `2026-08-26T07:39:39Z` over **360,400
 landed records / 43,375 entities**. Regenerate it yourself with `make suite`.
 
-**This is the last committed harness run, not a run against the current tree**, and two of its
-figures will move when it is regenerated. The `coverage` row's **3,966 passed, 1 skipped** predates
-127 tests added since (`service/tests/config/`, `service/tests/incidents/`, and the reconcile and
-rationale wiring tests); the suite collects **4,184** today. And the `oscillation-dedup` row's note
-that `conflicts.escalation_reason` is not writable by `recon_writer` is superseded by migration
-`0015_escalation_reason_grant`, which grants exactly that column — confirmed against a freshly
-migrated database. The scorecard is a generated artifact and is never hand-edited; `make suite` is
-the only way to refresh it.
+**This run grades the current tree.** The database was dropped, migrated to head, re-seeded from the
+committed seed and re-synced immediately before the harness ran, so every figure below describes the
+code in this commit rather than an older snapshot. The scorecard is a generated artifact and is
+never hand-edited; `make suite` is the only way to refresh it, and it rewrites both files together.
+
+Two figures moved for reasons worth naming rather than leaving to be noticed. `field_lineage` is now
+**1,712,775** rows, up from 1,279,575, because payments — one of the three mandated sources — had
+**no** field-level lineage at all until this commit; the added rows are exactly that source's. And
+the confidence vector's digest is **unchanged** across that addition, which is the point: lineage
+coverage and the compared-field vocabulary were deliberately decoupled so that widening the first
+cannot perturb conflict detection.
 
 ### **16 / 16 PASS**
 
 | Check | Result |
 |---|---|
-| `coverage` | **92.5 %** combined over the 7 core modules (floor 80 %) — adapters 92.0, budget 87.6, confidence 89.2, er 93.2, invariants 94.2, normalize 100.0, reconciler 96.1. **3,966 passed, 1 skipped** in 1,413.58 s. |
+| `coverage` | **93.1 %** combined over the 7 core modules (floor 80 %) — adapters 92.1, budget 90.7, confidence 89.2, er 93.2, invariants 94.4, normalize 100.0, reconciler 96.2. **4,771 passed, 2 skipped** in 1,949.13 s. |
 | `golden-diff` | **FN = 0, FP = 0**, field-mismatches 0, matched **3,050 / 3,050** across all 14 conflict types. |
 | `clean-sample` | 1,000 asserted-clean entities, **0 flagged**. |
 | `join-check` | **25 / 25** unified views from `GET /api/entities/{key}` match `golden/expected-views.json` across 14 view fields. |
 | `proposal-safety` | 3,050 conflicts → 3,050 proposals — status pending 2,670 + `sensitive_hold` 380. Cutting the same 3,050 a second way, 1,950 are **evidence-only** (no field-write target: the fix is a note for a human, not a value). C14 held **50/50**; every sensitive target held **380/380**. Source mirror byte-unchanged. |
-| `oscillation-dedup` | Second pass proposed **0** (3,050/3,050 fingerprints skipped); 25/25 oscillating fields escalated. |
+| `oscillation-dedup` | Second pass proposed **0** (3,050/3,050 fingerprints skipped); 25/25 oscillating fields escalated, `escalation_reason` persisted on the row (migration `0015`); lineage 1,712,775 rows over 3 generations. |
 | `mirror-unchanged` | 7 landing/staging tables, 720,809 rows, **byte-unchanged** after a full run. |
 | `determinism` | Dataset, conflict set and confidence vector all byte-identical across two regenerations — digests in [Determinism](#determinism-and-the-canonical-seed). |
 | `manifest` | **47 / 47** generator self-checks green; Appendix A.4 conflict minimums **14 / 14**; A.5 compound ratio 0.2295. |
 | `spend-cap-burst` | 120 contenders → **6 granted, 114 refused** (`KS006`); reserved-while-open 81,600 µUSD == cap; **0 ledger violations**; 124 `cap_hit` audit rows, 124 alerts; 10 retries, 0 granted. |
-| `bench:cross-source-query-p95` | p50 5.6 ms, **p95 6.3 ms** (threshold < 1 s), n=20. |
-| `bench:detect-persist-reconcile` | **22.94 s** total over 360,400 records (threshold < 30 s). |
-| `bench:ingestion-rps` | **13,961 rec/s** sustained over 240,200 records (threshold ≥ 500). |
+| `bench:cross-source-query-p95` | p50 6.6 ms, **p95 9.1 ms** (threshold < 1 s), n=20. |
+| `bench:detect-persist-reconcile` | **24.22 s** = invariants 12.72 + persist 2.68 + reconcile 8.81, over 360,400 records (threshold < 30 s). **Excludes materialization**, which this run re-timed live at **14.22 s** — so the honest end-to-end figure is ~38 s and the row is named for what it measures rather than for the brief's row it would otherwise overclaim. |
+| `bench:ingestion-rps` | **14,468 rec/s** sustained over 240,200 records (threshold ≥ 500). |
 | `bench:conflict-accuracy` | **precision 1.000000, recall 1.000000** on 3,050 golden entries (threshold: EXACT). |
 | `bench:spend-cap-exact` | 6/6 of 120 granted, settled spend == 1,797 × 6, over-admitted **False** (threshold: EXACT). |
-| `bench:dashboard-api-p95` | **p95 75.2 ms** (threshold < 1 s) — **service-side only**: in-process ASGI, no network, no browser. A floor on a page load, not a page load. |
+| `bench:dashboard-api-p95` | **p95 115.6 ms** (threshold < 1 s), n=20, 15 server calls per Overview load — **service-side only**: in-process ASGI, no network, no browser. A floor on a page load, not a page load. |
 
 **Scope, stated with the numbers.** Every row except `manifest` and `determinism`'s dataset half
 grades the loaded database. **Not covered:** browser-side dashboard timing, a live Anthropic provider
