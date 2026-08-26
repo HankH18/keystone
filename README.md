@@ -49,8 +49,8 @@ Render appends a suffix when a service name is taken globally, which is why the 
 `-2rot` / `-bxs8` rather than the bare names the blueprint asks for.
 
 **The deployed instance carries the graded dataset.** It runs `--profile full`: 360,400 landed
-records across 3 generations, 43,375 entities, 120,000 `entity_links`, 1,279,575 `field_lineage`
-rows, 3,050 conflicts, 3,050 proposals (2,670 `pending` + 380 `sensitive_hold`). All 14 conflict
+records across 3 generations, 43,375 entities, 120,000 `entity_links`, 1,712,775 `field_lineage`
+rows (appdb 507,000 + crm 772,575 + payments 433,200), 3,050 conflicts, 3,050 proposals (2,670 `pending` + 380 `sensitive_hold`). All 14 conflict
 types sit at exactly their golden counts on the deployed database — C1 500, C2 200, C3 300, C4 250,
 C5 400, C6 500, C7 300, C8 150, C9 100, C10 50, C11 50, C12 100, C13 100, C14 50. Neon's free-tier
 512 MB cap is what forced the old `dev` fallback; that cap is gone — the project's branch limit is
@@ -76,7 +76,7 @@ dashboard show `Created on run: reconcile-20260826T042010Z`, which is that cron'
 
 **The one-time canonical build does not fit the 512 MB Render starter web plan.** Ingest is fine —
 all 9 source-generations landed cleanly in ~75 s with 0 rejected — but building 43,375 entities and
-1,279,575 `field_lineage` rows OOM-killed the web dyno (the service log shows uvicorn restarting
+1,712,775 `field_lineage` rows OOM-killed the web dyno (the service log shows uvicorn restarting
 mid-request). Run that build instead as a one-off Render job on a 4 GB plan, where it completed in
 39.5 s:
 
