@@ -107,8 +107,13 @@ def test_budget_reserve_refuses_at_the_cap_instead_of_overspending(
     because the previous ``UPDATE budget_ledger`` interface required the capped
     party to hold a privilege it used to zero its own spend.
 
-    "Zero rows" becomes "raise KS006". Both mean: halt the run. Neither can
-    overspend.
+    "Zero rows" becomes "raise KS006". Both mean: **the reservation is refused
+    and nothing is charged.** Neither can overspend. This docstring used to say
+    both meant "halt the run"; they do not, and neither does the message the
+    trigger raises any more -- ``python -m recon.incidents`` halts on ``KS006``,
+    the reconcile path continues with ``rationale NULL``, and migration 0017
+    stopped the database from instructing either one. See
+    ``tests/schema/test_cap_message.py``.
     """
     scope = f"run:{TEST_TAG}-reserve"
     with owner_engine.begin() as conn:

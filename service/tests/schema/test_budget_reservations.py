@@ -16,7 +16,12 @@ only under the triggers on ``budget_reservations``:
 
 * RESERVE is one atomic ``INSERT``. Its BEFORE trigger takes the ledger row
   lock, checks ``spent + reserve <= cap``, and either increments spend or
-  raises ``KS006``. A raise means: halt the run.
+  raises ``KS006``. A raise means: **this reservation is refused and nothing
+  was charged.** It does not mean "halt the run", which is what this docstring
+  and migration 0005's own message text used to say -- the batch job
+  (``python -m recon.incidents``) does halt, but the reconcile path continues
+  with ``rationale NULL``. Migration 0017 corrected the message; see
+  ``recon.budget``'s ``What "stop on cap" actually stops``.
 * SETTLE is ``open -> settled`` once, ``actual <= reserve``, releasing
   ``reserve - actual`` (``KS007`` otherwise).
 * ``open -> reclaimed`` -- the TTL sweeper, which releases the whole reservation

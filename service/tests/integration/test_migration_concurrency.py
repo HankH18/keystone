@@ -44,15 +44,18 @@ CONCURRENCY = 4
 #: lie -- is caught by a literal that does not move on its own.
 #: `test_the_pinned_head_is_alembics_head` keeps the literal honest.
 #:
-#: Bumped from `0015_escalation_reason_grant` when
-#: `0016_price_embedding_models` landed -- the migration that seeds
-#: `budget_model_prices` with the three embedding models `recon.incidents`
-#: reserves against, without which `build_embedding_provider` refuses even the
-#: offline default. That is exactly the event this literal exists to make loud:
+#: Bumped from `0016_price_embedding_models` when
+#: `0017_cap_message_states_refusal` landed -- the migration that restates
+#: `keystone_budget_charge` so the `KS006` cap message reports the refusal the
+#: trigger performs instead of ending with `-- halt the run`, an instruction the
+#: reconcile path does not follow and which `record_cap_hit` was persisting into
+#: `audit_log`. (It replaced `0015_escalation_reason_grant` one revision earlier,
+#: when `0016` gave the three embedding models `recon.incidents` reserves against
+#: a price.) That bump is exactly the event this literal exists to make loud:
 #: `test_the_pinned_head_is_alembics_head` went red on the commit that added the
 #: migration and the literal was moved deliberately, in the same commit, rather
 #: than being derived so that it could never disagree.
-EXPECTED_HEAD = "0016_price_embedding_models"
+EXPECTED_HEAD = "0017_cap_message_states_refusal"
 
 
 def _admin_dsn() -> str:
