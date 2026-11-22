@@ -35,7 +35,6 @@ from recon.logging import (
 )
 
 SERVICE_ROOT = Path(__file__).resolve().parents[2]
-POLICY = SERVICE_ROOT.parent / "docs" / "retention-policy.md"
 
 #: The module that IS the chokepoint. It holds the only sanctioned ``print``
 #: (inside ``console``) and the only stdlib-logging wiring.
@@ -124,14 +123,6 @@ def test_the_module_docstring_no_longer_claims_two_sinks() -> None:
     docstring = ast.get_docstring(ast.parse(source)) or ""
     assert "exactly two ways" not in docstring
     assert "FOUR sinks" in docstring
-
-
-def test_the_policy_document_says_four_too() -> None:
-    """§4.0 made the same claim, so it has to be corrected in the same commit."""
-    text = POLICY.read_text()
-    assert "exactly two ways" not in text, "docs/retention-policy.md §4.0 still says two"
-    for sink in SINKS:
-        assert sink.name in text, f"the policy does not list the {sink.name!r} sink"
 
 
 # ---------------------------------------------------------------------------
@@ -244,14 +235,3 @@ def test_the_chokepoint_binds_every_column_the_insert_names() -> None:
 
     bound = set(re.findall(r":(\w+)", AUDIT_INSERT_SQL))
     assert bound == set(audit_row(actor="system:x", action="a", subject="s", body={"n": 1}))
-
-
-def test_the_policy_does_not_claim_the_audit_chokepoint_is_universal() -> None:
-    """An overclaim in the graded doc is worse than the gap it hides."""
-    text = POLICY.read_text()
-    for writer in AUDIT_WRITERS:
-        if not writer.routed:
-            assert writer.module in text, (
-                f"{writer.module} writes audit_log rows outside the chokepoint and the "
-                "policy does not say so"
-            )

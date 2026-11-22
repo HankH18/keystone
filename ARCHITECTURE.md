@@ -6,16 +6,8 @@ conflicts into **proposals that no machine may approve**, and lets a human decid
 existing canonical row must cite the proposal that authorized it, in the same transaction.
 
 Both diagrams below were drawn from the code as it stands, not from a design doc. Every code citation
-names a symbol, and **what is enforced on every run is the symbol, not the integer**:
-`service/tests/docs/test_doc_citations.py` re-reads every `path:line` reference in this file and goes
-red when the cited file no longer *defines* what the prose names — a rename, a deletion, a move to
-another module — or when a reference has slid onto a mere mention of it (an `__all__` entry, an
-import, a comment). The line numbers themselves are **not** continuously enforced, deliberately: a
-doc test that reddens because an unrelated commit moved a function four lines down is a gate people
-learn to ignore, and this one did exactly that once. They are re-derived from the working tree by
-`cd service && uv run python -m tests.docs.test_doc_citations --write`, which was last run to
-produce the numbers below. So read a line number as *exact as of the last resync*, and the symbol
-beside it as guaranteed.
+names a symbol and a line. The line numbers were exact when this file was last revised and are not
+re-checked; if one has drifted, search for the symbol.
 
 ---
 

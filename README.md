@@ -1,5 +1,11 @@
 # Keystone — the reconciliation trust layer
 
+- **What it does:** reads three read-only sources (CRM, app DB, payments), resolves them into one identity layer, detects 14 kinds of cross-source conflict with 15 versioned SQL rules, and files each as a proposal a human approves before anything is written.
+- **Result:** 3,050 of 3,050 planted conflicts detected with 0 false positives over 360,400 synthetic records; 16/16 grading-harness checks pass; cross-source query p95 9.1 ms ([`docs/scorecard.txt`](docs/scorecard.txt), 2026-08-26).
+- **Run it locally in about a minute, no backend:** `pnpm --dir dashboard install && pnpm --dir dashboard run dev:mock`.
+- **Scope:** synthetic data; mock LLM by default (an Anthropic provider exists and is not used for the graded numbers).
+- **Stack:** Python 3.12, FastAPI, SQLAlchemy, Alembic, Postgres 16, React, TypeScript, Vite, Render, GitHub Actions.
+
 Keystone mirrors three **read-only** upstream sources, resolves them into one identity layer,
 detects cross-source conflicts against **versioned, committed SQL invariants**, and files each one
 as a **proposal a human approves before anything is written**. An LLM writes rationale text and
@@ -40,8 +46,8 @@ AI tooling disclosure: **[AI_USAGE.md](AI_USAGE.md)**.
 
 ## Deployed application
 
-- **Dashboard:** <https://keystone-dashboard-2rot.onrender.com>
-- **Service:** <https://keystone-service-bxs8.onrender.com> — `/health`, `/docs`, and the client API
+**The Render deployment is not running today.** This section records it as it stood on 2026-08-26 (dashboard host `keystone-dashboard-2rot.onrender.com`, service host `keystone-service-bxs8.onrender.com`); read its present-tense statements as past.
+
 - **Demo key:** send `X-Api-Key: keystone-demo-admin-8c25e0b71a94f36d` — committed on purpose and
   documented in [`.env.example`](.env.example); the dashboard already sends it
 
@@ -88,7 +94,7 @@ mid-request). Run that build instead as a one-off Render job on a 4 GB plan, whe
 # The job inherits the web service's environment, so the role password is already
 # there — but DATABASE_URL is composed in the service's startCommand rather than
 # stored, so a one-off job has to compose it too.
-render jobs create srv-da6iotou01pc7388s8qg --plan-id plan-srv-010 --start-command \
+render jobs create <service-id> --plan-id plan-srv-010 --start-command \
   'DATABASE_URL="postgresql://recon_writer@$KEYSTONE_DB_HOST:$KEYSTONE_DB_PORT/$KEYSTONE_DB_NAME?sslmode=require" \
    PGPASSWORD="$RECON_WRITER_PASSWORD" \
    uv run python -c "import json; from recon.api.internal import sync_job; print(json.dumps(sync_job(\"sync-bootstrap\"), default=str)[:3000])"'
@@ -505,7 +511,7 @@ cannot perturb conflict detection.
 
 | Check | Result |
 |---|---|
-| `coverage` | **93.1 %** combined over the 7 core modules (floor 80 %) — adapters 92.1, budget 90.7, confidence 89.2, er 93.2, invariants 94.4, normalize 100.0, reconciler 96.2. **4,771 passed, 2 skipped** in 1,949.13 s. |
+| `coverage` | **93.1 %** combined over the 7 core modules (floor 80 %) — adapters 92.1, budget 90.7, confidence 89.2, er 93.2, invariants 94.4, normalize 100.0, reconciler 96.2. **4,771 passed, 2 skipped** in 1,949.13 s (scorecard run of 2026-08-26; tests removed since are not reflected). |
 | `golden-diff` | **FN = 0, FP = 0**, field-mismatches 0, matched **3,050 / 3,050** across all 14 conflict types. |
 | `clean-sample` | 1,000 asserted-clean entities, **0 flagged**. |
 | `join-check` | **25 / 25** unified views from `GET /api/entities/{key}` match `golden/expected-views.json` across 14 view fields. |
@@ -656,7 +662,7 @@ and every metered call in the service starts being refused), and reservation row
 `tests/budget/test_ledger.py::test_a_test_process_cannot_touch_the_real_daily_scope` red on that
 database permanently — all three of which a bare `python -m recon.incidents` did before 2026-08-24.
 A deployment whose `daily` row is genuinely managed and rolled opts back in with
-`--charge-daily-cap`; `service/tests/incidents/test_reachability.py` pins both directions. **There is no dashboard panel for it**: `docs/TASKS.md`'s acceptance for this stretch lists
+`--charge-daily-cap`; `service/tests/incidents/test_reachability.py` pins both directions. **There is no dashboard panel for it**: the original task plan called for
 one, and nothing under `dashboard/src` mentions incidents. The UI half of stretch #8 is not built, and
 no scorecard *row* covers any of it — the pass reports the stage's outcome as a scorecard **note**
 instead, in both directions, so "38 incidents written" and "the stage refused, here is why" are never

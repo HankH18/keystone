@@ -15,8 +15,7 @@ golden-diff                    PASS   FN=0 FP=0 field-mismatches=0 matched=3050/
                                       C12:100/100 C13:100/100 C14:50/50 C2:200/200 C3:300/300
                                       C4:250/250 C5:400/400 C6:500/500 C7:300/300 C8:150/150
                                       C9:100/100]
-                                      dir=/Users/hankholcomb/Documents/code_parent_folders/gaunt
-                                      let_repos/keystone/golden
+                                      dir=golden
 clean-sample                   PASS   1000 asserted-clean entities, 0 flagged (SS8 intersection
                                       predicate over 3050 detected conflicts)
 join-check                     PASS   25/25 unified views fetched from GET /api/entities/{key}

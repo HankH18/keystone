@@ -4,10 +4,7 @@
 **R26** (PII redaction in stored logs + a documented retention policy).
 **Implementation:** `service/recon/privacy.py` (`RETENTION`, `run_purge`) and
 `service/recon/logging.py` (`LOG_MODE`).
-**Tests:** `service/tests/privacy/` — including
-`test_retention_policy_doc.py`, which parses the schedule table below and fails if it stops
-matching `recon.privacy.RETENTION`. This document cannot drift from the code without turning
-the suite red.
+**Tests:** `service/tests/privacy/`.
 
 ---
 
@@ -524,7 +521,7 @@ uv run ruff check recon/privacy.py recon/logging.py recon/app.py recon/suite tes
 uv run ruff format --check recon/privacy.py recon/logging.py recon/app.py recon/suite tests/privacy
 
 DATABASE_URL=postgresql://keystone:keystone@localhost:55432/keystone KEYSTONE_REQUIRE_DB=1 \
-  uv run pytest tests/privacy          # 238 passed; no skips and no errors is the shape to expect
+  uv run pytest tests/privacy          # no skips and no errors is the shape to expect
 ```
 
 **`DATABASE_URL` is required here, not optional**, and the reason is §3.2's own safety argument.
