@@ -726,7 +726,7 @@ CI does not run `make suite`; the scorecard is generated deliberately and commit
 |---|---|
 | [ARCHITECTURE.md](ARCHITECTURE.md) | System design, the two required diagrams, decisions and rationale |
 | [AI_USAGE.md](AI_USAGE.md) | AI tooling disclosure — tools, provider/model, price table, shaping prompts |
-| [docs/demo-script.md](docs/demo-script.md) | The video-demo walkthrough — every beat, its command, and the output it produced |
+| [docs/demo-script.md](docs/demo-script.md) | The 5-minute demo-video script, run in the browser against the Render deployment (historical: that deployment is not running today) |
 | [docs/SPEC.md](docs/SPEC.md) | Requirements R1–R26 |
 | [docs/DESIGN.md](docs/DESIGN.md) | Pinned interfaces, the endpoint contract, decisions and rationale |
 | [docs/invariant-contract.md](docs/invariant-contract.md) | Invariant semantics — the contract the SQL rules implement |

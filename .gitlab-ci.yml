@@ -1,9 +1,5 @@
-# Keystone CI for labs.gauntletai.com — the GRADED remote.
-#
-# `git remote -v` puts `origin` at https://labs.gauntletai.com/hankholcomb/keystone.git,
-# and that self-hosted GitLab is the submission target; GitHub is a mirror. Until this
-# file existed, "CI runs tests + linter on every push" was true only on the mirror, so
-# the remote that is actually read ran nothing at all.
+# Keystone CI in GitLab syntax — kept in step with .github/workflows/ci.yml, the
+# primary pipeline.
 #
 # This is a deliberate mirror of .github/workflows/ci.yml — same two jobs, same steps,
 # same order, same environment — expressed in GitLab syntax. The two files must be kept
@@ -35,7 +31,7 @@ service:
   # pytest alone, plus ~1-2 min for sync/migrate/seed. 90 minutes is ~1.4x headroom over
   # a 2-2.5x-slower shared runner, and still cuts off a hung job.
   #
-  # NOTE for whoever administers labs.gauntletai.com: a job timeout cannot exceed the
+  # NOTE for whoever administers the GitLab runner: a job timeout cannot exceed the
   # RUNNER's own timeout, so if the runner assigned to this project is capped lower than
   # this, that cap wins and the job is killed at the cap regardless of the line below.
   timeout: 90 minutes

@@ -1,15 +1,20 @@
 # Keystone — 5 minute demo
 
+> **Historical snapshot.** This script was last revised on 2026-08-26 for a recording against the
+> dashboard on the Render deployment. That deployment is not running today; read the script's
+> present-tense statements as past. To run the dashboard yourself, see
+> [Three ways in, by time budget](../README.md#three-ways-in-by-time-budget) in the README.
+
 Everything happens in the browser. Five tabs, no terminal, no setup.
 
 **Open these and load each one once before you record** (the host sleeps when idle, and you don't
 want a page waking up on camera):
 
 1. `https://github.com/HankH18/keystone/blob/main/ARCHITECTURE.md`
-2. `https://keystone-dashboard-2rot.onrender.com/`
-3. `https://keystone-dashboard-2rot.onrender.com/proposals/2`
-4. `https://keystone-dashboard-2rot.onrender.com/proposals/206`
-5. `https://keystone-dashboard-2rot.onrender.com/audit`
+2. dashboard `/`
+3. dashboard `/proposals/2`
+4. dashboard `/proposals/206`
+5. dashboard `/audit`
 
 **Never click Approve or Reject.** You don't need to, and it can't be undone.
 

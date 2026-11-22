@@ -656,8 +656,8 @@ services:
       - key: LOG_MODE
         value: safe
 
-# There is deliberately NO `databases:` block. The database is Neon (project
-# green-wave-67653806, branch production, PostgreSQL 18.6). Migrations 0001-0014
+# There is deliberately NO `databases:` block. The database is Neon (branch
+# production, PostgreSQL 18.6). Migrations 0001-0014
 # were applied there by hand and verified; 0015_escalation_reason_grant,
 # 0016_price_embedding_models and 0017_cap_message_states_refusal landed
 # afterwards and are applied by the `preDeployCommand` above like any other.

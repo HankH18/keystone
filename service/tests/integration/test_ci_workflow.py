@@ -20,7 +20,7 @@ directions and the pipeline has to satisfy both:
 So the pipelines seed into a scratch tree with `--out`, stage ONLY `fixtures/` back
 into the workspace, and leave `golden/` exactly as checked out. Nothing enforced any
 of that: no test asserted the seed step existed, none asserted its shape, and
-`.gitlab-ci.yml` -- the file for the GRADED remote -- was not referenced by any test
+`.gitlab-ci.yml` -- the kept-in-step GitLab copy -- was not referenced by any test
 at all, so deleting the whole repair kept every suite green.
 
 This module is that enforcement. It parses both files as YAML (never regex) and
@@ -74,8 +74,8 @@ COPY_COMMANDS = frozenset({"cp", "rsync", "mv", "install", "ditto"})
 def _load(path: Path) -> dict[str, Any]:
     assert path.is_file(), (
         f"{path.relative_to(REPO_ROOT)} is missing. Both pipelines are deliverables: "
-        "GitHub is the mirror, labs.gauntletai.com is the graded remote, and a repair "
-        "made to only one of them is a repair the graded remote never runs."
+        "GitHub is the primary pipeline, GitLab is a kept-in-step copy, and a repair "
+        "made to only one of them leaves the two out of step."
     )
     document = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert isinstance(document, dict), f"{path} did not parse as a YAML mapping"

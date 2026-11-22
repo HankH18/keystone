@@ -571,9 +571,9 @@ gap:
   from a base backup, from WAL, or from a copy-on-write history the storage layer keeps on its own.
   Locally that residue really is empty: `infra/docker-compose.yml` configures no backups. The
   **deployed** database is not that one, though — `infra/render.yaml` declares no `databases:` block
-  and names Neon (project `green-wave-67653806`, branch `production`, PostgreSQL 18.6), and Neon
+  and names Neon (branch `production`, PostgreSQL 18.6), and Neon
   keeps an instant-restore history whether this policy asks for one or not. Read off the project
-  today that window is `history_retention_seconds: 21600` — **six hours**. So a row §2's schedule
+  on 2026-08-26, that window was `history_retention_seconds: 21600` — **six hours**. So a row §2's schedule
   deletes in the deployed instance stays restorable for six hours afterwards, through a mechanism no
   code in this repository sets, shortens or sweeps. Bounded and small, but it is a property of the
   provider rather than of this document; closing it would mean owning the branch-retention setting
